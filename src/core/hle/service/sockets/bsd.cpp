@@ -1444,9 +1444,9 @@ std::pair<s32, Errno> BSD::SelectImpl(s32 nfds, s32 timeout, std::span<const u8>
                                       std::span<const u8> write_in, std::span<const u8> error_in,
                                       std::vector<u8>& read_out, std::vector<u8>& write_out,
                                       std::vector<u8>& error_out) {
-    std::ranges::fill(read_out, 0);
-    std::ranges::fill(write_out, 0);
-    std::ranges::fill(error_out, 0);
+    std::ranges::fill(read_out, u8{0});
+    std::ranges::fill(write_out, u8{0});
+    std::ranges::fill(error_out, u8{0});
 
     std::vector<s32> read_fds;
     std::vector<s32> write_fds;
@@ -1785,7 +1785,7 @@ Errno BSD::GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8>& o
         // EOPNOTSUPP mismatch made it close before connect." Echo back zeroed bytes of the
         // requested size rather than failing outright.
         LOG_WARNING(Service, "(STUBBED) Unknown getsockopt level={}, echoing zeroed value", level);
-        std::ranges::fill(optval, 0);
+        std::ranges::fill(optval, u8{0});
         return Errno::SUCCESS;
     }
 
@@ -1816,7 +1816,7 @@ Errno BSD::GetSockOptImpl(s32 fd, u32 level, OptName optname, std::vector<u8>& o
         if (descriptor.vendor_linger_feigned) {
             std::memcpy(optval.data(), descriptor.vendor_linger_feigned->data(), 8);
         } else {
-            std::ranges::fill(optval, 0);
+            std::ranges::fill(optval, u8{0});
         }
         return Errno::SUCCESS;
     }

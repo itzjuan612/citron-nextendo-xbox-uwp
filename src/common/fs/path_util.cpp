@@ -14,7 +14,11 @@
 #include "common/logging.h"
 
 #ifdef _WIN32
-#include <shlobj.h> // Used in GetExeDirectory()
+#ifndef CITRON_UWP
+#include <shlobj.h> // Used in GetExeDirectory() (desktop only)
+#else
+#include <cstdlib> // UWP: no shell / known-folder APIs available
+#endif
 #else
 #include <cstdlib>     // Used in Get(Home/Data)Directory()
 #include <pwd.h>       // Used in GetHomeDirectory()
@@ -88,10 +92,19 @@ public:
         fs::path citron_path_config;
 
 #ifdef _WIN32
+#ifndef CITRON_UWP
         citron_path = GetExeDirectory() / PORTABLE_DIR;
         if (!IsDir(citron_path)) {
             citron_path = GetAppDataRoamingDirectory() / CITRON_DIR;
         }
+#else
+        // UWP: there is no portable/APPDATA concept inside the AppContainer. The frontend
+        // injects ApplicationData.LocalFolder.Path via SetAppDirectory() before initialization.
+        if (citron_path.empty()) {
+            LOG_ERROR(Common_Filesystem,
+                      "UWP: application directory not set; call SetAppDirectory() first");
+        }
+#endif
 
         citron_path_cache = citron_path / CACHE_DIR;
         citron_path_config = citron_path / CONFIG_DIR;
@@ -246,6 +259,7 @@ void SetCitronPath(CitronPath citron_path, const fs::path& new_path) {
 
 #ifdef _WIN32
 
+#ifndef CITRON_UWP
 fs::path GetExeDirectory() {
     wchar_t exe_path[MAX_PATH];
 
@@ -272,6 +286,8 @@ fs::path GetAppDataRoamingDirectory() {
 
     return fs_appdata_roaming_path;
 }
+
+#endif // !CITRON_UWP
 
 #else
 

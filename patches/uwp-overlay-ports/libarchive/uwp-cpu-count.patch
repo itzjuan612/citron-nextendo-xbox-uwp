@@ -1,0 +1,47 @@
+diff --git a/libarchive/archive_write_add_filter_zstd.c b/libarchive/archive_write_add_filter_zstd.c
+index d4752c2..797bd28 100644
+--- a/libarchive/archive_write_add_filter_zstd.c
++++ b/libarchive/archive_write_add_filter_zstd.c
+@@ -280,8 +280,9 @@ archive_compressor_zstd_options(struct archive_write_filter *f, const char *key,
+ #elif !defined(__CYGWIN__) && defined(_WIN32_WINNT) && \
+     _WIN32_WINNT >= 0x0601 /* _WIN32_WINNT_WIN7 */
+ 		if (threads == 0) {
+-			DWORD winCores = GetActiveProcessorCount(
+-			    ALL_PROCESSOR_GROUPS);
++			SYSTEM_INFO siW;
++			GetSystemInfo(&siW);
++			DWORD winCores = siW.dwNumberOfProcessors;
+ 			threads = (intmax_t)winCores;
+ 		}
+ #endif
+diff --git a/libarchive/archive_write_set_format_7zip.c b/libarchive/archive_write_set_format_7zip.c
+index ebdb16e..98fc0fd 100644
+--- a/libarchive/archive_write_set_format_7zip.c
++++ b/libarchive/archive_write_set_format_7zip.c
+@@ -533,8 +533,9 @@ _7z_options(struct archive_write *a, const char *key, const char *value)
+ 			threads = sysconf(_SC_NPROCESSORS_ONLN);
+ #elif !defined(__CYGWIN__) && defined(_WIN32_WINNT) && \
+ 	_WIN32_WINNT >= 0x0601 /* _WIN32_WINNT_WIN7 */
+-			DWORD winCores = GetActiveProcessorCount(
+-				ALL_PROCESSOR_GROUPS);
++			SYSTEM_INFO siW;
++			GetSystemInfo(&siW);
++			DWORD winCores = siW.dwNumberOfProcessors;
+ 			threads = (intmax_t)winCores;
+ #else
+ 			threads = 1;
+diff --git a/libarchive/archive_write_set_format_zip.c b/libarchive/archive_write_set_format_zip.c
+index f74922a..ae07252 100644
+--- a/libarchive/archive_write_set_format_zip.c
++++ b/libarchive/archive_write_set_format_zip.c
+@@ -453,7 +453,9 @@ archive_write_zip_options(struct archive_write *a, const char *key,
+ 			zip->threads = sysconf(_SC_NPROCESSORS_ONLN);
+ #elif !defined(__CYGWIN__) && defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x0601
+ 			/* Windows 7 and up */
+-			DWORD activeProcs = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
++			SYSTEM_INFO siW;
++			GetSystemInfo(&siW);
++			DWORD activeProcs = siW.dwNumberOfProcessors;
+ 			zip->threads = activeProcs <= SHRT_MAX ? (short)activeProcs : SHRT_MAX;
+ #else
+ 			zip->threads = 1;

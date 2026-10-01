@@ -18,11 +18,14 @@
     "boost-mpl",
     {
       "name": "boost-process",
-      "platform": "!android"
+      "platform": "!android & !uwp"
     },
     "boost-range",
     "boost-spirit",
-    "boost-test",
+    {
+      "name": "boost-test",
+      "platform": "!uwp"
+    },
     "boost-timer",
     "boost-variant",
     {

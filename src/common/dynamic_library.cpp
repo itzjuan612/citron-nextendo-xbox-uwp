@@ -77,7 +77,18 @@ std::string DynamicLibrary::GetVersionedFilename(const char* libname, int major,
 
 bool DynamicLibrary::Open(const char* filename) {
 #ifdef _WIN32
+#if defined(CITRON_UWP)
+    // UWP: arbitrary paths cannot be loaded; only DLLs shipped inside the package
+    // (LoadPackagedLibrary searches the app package directory).
+    const int wide_len = MultiByteToWideChar(CP_UTF8, 0, filename, -1, nullptr, 0);
+    std::wstring wide(static_cast<size_t>(wide_len > 0 ? wide_len - 1 : 0), L'\0');
+    if (wide_len > 0) {
+        MultiByteToWideChar(CP_UTF8, 0, filename, -1, wide.data(), wide_len);
+    }
+    handle = reinterpret_cast<void*>(LoadPackagedLibrary(wide.c_str(), 0));
+#else
     handle = reinterpret_cast<void*>(LoadLibraryA(filename));
+#endif
 #else
     handle = dlopen(filename, RTLD_NOW);
 #endif

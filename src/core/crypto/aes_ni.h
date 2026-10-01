@@ -55,6 +55,15 @@
 #  include <immintrin.h>  // AVX2, AVX-512F, VAES intrinsics
 #endif
 
+// Per-function ISA targeting. GCC/Clang support it; MSVC has no equivalent, so the
+// hardware paths compile against the MSVC baseline and rely on runtime CPUID gating
+// (the AVX2/VAES/AVX-512 tiers are stubbed out below for MSVC).
+#if defined(__GNUC__) || defined(__clang__)
+#define CITRON_AESNI_TARGET(...) __attribute__((target(__VA_ARGS__)))
+#else
+#define CITRON_AESNI_TARGET(...)
+#endif
+
 // OpenSSL fallback — pulled in only for the non-AES-NI scalar path.
 #include <openssl/evp.h>
 
@@ -80,7 +89,7 @@ static constexpr std::size_t kXtsOsslThreshold = 4096;
 // Used to convert Nintendo big-endian counter ↔ little-endian arithmetic.
 // SSSE3 has been present on every CPU that also has AES-NI (Sandy Bridge+).
 
-__attribute__((target("ssse3")))
+CITRON_AESNI_TARGET("ssse3")
 static inline __m128i Bswap128(__m128i x) {
     const __m128i kShuffle =
         _mm_set_epi8(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
@@ -89,7 +98,7 @@ static inline __m128i Bswap128(__m128i x) {
 
 // ── Internal: single-block AES-128 encrypt (SSE/AES-NI) ──────────────────────
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 static inline __m128i EncBlock128(const __m128i* ks, __m128i b) {
     b = _mm_xor_si128(b, ks[0]);
     b = _mm_aesenc_si128(b, ks[1]);  b = _mm_aesenc_si128(b, ks[2]);
@@ -102,7 +111,7 @@ static inline __m128i EncBlock128(const __m128i* ks, __m128i b) {
 
 // ── Key expansion ─────────────────────────────────────────────────────────────
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void KeyExpand128Enc(const uint8_t* key, __m128i* out_ks) {
     out_ks[0] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key));
 #define KE128(i, rcon)                                                   \
@@ -120,7 +129,7 @@ inline void KeyExpand128Enc(const uint8_t* key, __m128i* out_ks) {
 #undef KE128
 }
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void KeyExpand128Dec(const __m128i* enc_ks, __m128i* out_ks) {
     out_ks[0]  = enc_ks[10];
     for (int i = 1; i < 10; ++i)
@@ -128,7 +137,7 @@ inline void KeyExpand128Dec(const __m128i* enc_ks, __m128i* out_ks) {
     out_ks[10] = enc_ks[0];
 }
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void KeyExpand256Enc(const uint8_t* key, __m128i* out_ks) {
     out_ks[0] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key));
     out_ks[1] = _mm_loadu_si128(reinterpret_cast<const __m128i*>(key + 16));
@@ -160,7 +169,7 @@ inline void KeyExpand256Enc(const uint8_t* key, __m128i* out_ks) {
 #undef KE256B
 }
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void KeyExpand256Dec(const __m128i* enc_ks, __m128i* out_ks) {
     out_ks[0] = enc_ks[14];
     for (int i = 1; i < 14; ++i)
@@ -170,7 +179,7 @@ inline void KeyExpand256Dec(const __m128i* enc_ks, __m128i* out_ks) {
 
 // ── ECB ──────────────────────────────────────────────────────────────────────
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void EcbEncBlock(const __m128i* ks, int rounds,
                         const uint8_t* in, uint8_t* out) {
     __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in));
@@ -181,7 +190,7 @@ inline void EcbEncBlock(const __m128i* ks, int rounds,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(out), b);
 }
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void EcbDecBlock(const __m128i* ks, int rounds,
                         const uint8_t* in, uint8_t* out) {
     __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(in));
@@ -198,7 +207,7 @@ inline void EcbDecBlock(const __m128i* ks, int rounds,
 //   XTS  (IEEE 1619): LE polynomial, carry byte[i]→byte[i+1], reduce byte[0]
 //   CMAC (SP800-38B): BE polynomial, carry byte[i]→byte[i-1], reduce byte[15]
 
-__attribute__((target("sse2")))
+CITRON_AESNI_TARGET("sse2")
 inline __m128i Gf128MulXle(__m128i a) {
     const __m128i carry = _mm_srli_epi64(a, 63);
     __m128i shifted = _mm_or_si128(
@@ -211,7 +220,7 @@ inline __m128i Gf128MulXle(__m128i a) {
     return _mm_xor_si128(shifted, red);
 }
 
-__attribute__((target("sse2")))
+CITRON_AESNI_TARGET("sse2")
 inline __m128i Gf128MulXbe(__m128i a) {
     // Scalar: called only during cold-path CMAC subkey generation.
     uint8_t in[kBlockSize], out[kBlockSize];
@@ -259,7 +268,7 @@ inline void Ctr128_openssl(const uint8_t* raw_key_16, const uint8_t* in,
 // a scalar byte loop. Four blocks are encrypted in parallel per iteration to
 // hide the 4-cycle AES-NI instruction latency (~9 GB/s on AES-NI-only CPUs).
 
-__attribute__((target("aes,ssse3")))
+CITRON_AESNI_TARGET("aes,ssse3")
 inline void Ctr128_sse4(const __m128i* ks, const uint8_t* in, uint8_t* out,
                          std::size_t len, uint8_t ctr[kBlockSize]) {
     const __m128i ONE  = _mm_set_epi64x(0, 1);
@@ -314,13 +323,15 @@ inline void Ctr128_sse4(const __m128i* ks, const uint8_t* in, uint8_t* out,
     _mm_storeu_si128(reinterpret_cast<__m128i*>(ctr), Bswap128(cle));
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+
 // ── CTR implementation: VAES + AVX2 (256-bit, 4 blocks/iter) ─────────────────
 //
 // _mm256_aesenc_epi128 processes two 128-bit lanes simultaneously in a 256-bit
 // register. Two ymm registers per loop = 4 blocks per iteration; each AES
 // instruction does twice the work of the SSE4 path (~15 GB/s on Zen 3-4).
 
-__attribute__((target("avx2,vaes,ssse3")))
+CITRON_AESNI_TARGET("avx2,vaes,ssse3")
 inline void Ctr128_vaes256(const __m128i* ks128, const uint8_t* in, uint8_t* out,
                             std::size_t len, uint8_t ctr[kBlockSize]) {
     // Broadcast each 128-bit round key into a 256-bit register.
@@ -384,7 +395,7 @@ inline void Ctr128_vaes256(const __m128i* ks128, const uint8_t* in, uint8_t* out
 // Two zmm registers per loop = 8 blocks per iteration.
 // On Zen 4 (Ryzen 7940HS): ~19 GB/s sustained at 128KB+ buffers.
 
-__attribute__((target("avx512f,vaes,ssse3")))
+CITRON_AESNI_TARGET("avx512f,vaes,ssse3")
 inline void Ctr128_vaes512(const __m128i* ks128, const uint8_t* in, uint8_t* out,
                             std::size_t len, uint8_t ctr[kBlockSize]) {
     // Broadcast each round key into a 512-bit register.
@@ -458,6 +469,20 @@ inline void Ctr128_vaes512(const __m128i* ks128, const uint8_t* in, uint8_t* out
     _mm_storeu_si128(reinterpret_cast<__m128i*>(ctr), Bswap128(cle));
 }
 
+#else  // MSVC: no AVX2/AVX-512 target attributes — use the AES-NI tier instead.
+
+inline void Ctr128_vaes256(const __m128i* ks128, const uint8_t* in, uint8_t* out,
+                           std::size_t len, uint8_t ctr[kBlockSize]) {
+    Ctr128_sse4(ks128, in, out, len, ctr);
+}
+
+inline void Ctr128_vaes512(const __m128i* ks128, const uint8_t* in, uint8_t* out,
+                           std::size_t len, uint8_t ctr[kBlockSize]) {
+    Ctr128_sse4(ks128, in, out, len, ctr);
+}
+
+#endif
+
 } // namespace detail
 
 // ── CPU feature detection ─────────────────────────────────────────────────────
@@ -478,7 +503,11 @@ inline void Ctr128_vaes512(const __m128i* ks128, const uint8_t* in, uint8_t* out
 // but mask bit 9 of CPUID leaf 7 ECX. The dispatcher therefore also checks
 // for avx2/avx512f before attempting a VAES path.
 
+#if defined(__GNUC__) || defined(__clang__)
 #include <cpuid.h>
+#else
+#include <intrin.h>
+#endif
 
 namespace detail {
 
@@ -497,6 +526,7 @@ struct CpuFeatures {
 private:
     static CpuFeatures detect() {
         CpuFeatures f;
+#if defined(__GNUC__) || defined(__clang__)
         unsigned int eax, ebx, ecx, edx;
         if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
             f.aes_ni = (ecx >> 25) & 1;
@@ -507,6 +537,19 @@ private:
             f.avx512f = (ebx >> 16) & 1;
             f.vaes    = (ecx >>  9) & 1;
         }
+#else
+        // MSVC: same CPUID bits via <intrin.h>. The AVX2/VAES/AVX-512 tiers have no
+        // per-function target support under MSVC, so they stay disabled and the
+        // dispatch falls through to the AES-NI (SSE) path.
+        int regs[4] = {};
+        __cpuid(regs, 1);
+        f.aes_ni = (regs[2] >> 25) & 1;  // ECX
+        f.ssse3  = (regs[2] >>  9) & 1;
+        __cpuidex(regs, 7, 0);
+        f.avx2    = (regs[1] >>  5) & 1;  // EBX (detected but unused on MSVC)
+        f.avx512f = false;
+        f.vaes    = false;
+#endif
         return f;
     }
 };
@@ -563,8 +606,8 @@ inline void Ctr128(const __m128i* ks, const uint8_t* in, uint8_t* out,
 //   size <= kXtsOsslThreshold  ->  Xts128Enc / Xts128Dec  (intrinsics)
 //   size >  kXtsOsslThreshold  ->  EVP_aes_128_xts         (OpenSSL)
 
-__attribute__((target("aes,sse2")))
-__attribute__((target("aes,ssse3")))
+CITRON_AESNI_TARGET("aes,sse2")
+CITRON_AESNI_TARGET("aes,ssse3")
 inline void Xts128Enc(const __m128i* data_ks, const __m128i* tweak_ks,
                       const uint8_t* tweak_val,
                       const uint8_t* in, uint8_t* out, std::size_t len) {
@@ -581,7 +624,7 @@ inline void Xts128Enc(const __m128i* data_ks, const __m128i* tweak_ks,
 // DecBlock128: AES-128 decrypt using a 11-entry key schedule produced by
 // KeyExpand128Dec. XTS data keys are always AES-128 regardless of whether
 // the combined key material is 256-bit.
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 static inline __m128i DecBlock128(const __m128i* ks, __m128i b) {
     b = _mm_xor_si128(b, ks[0]);
     b = _mm_aesdec_si128(b, ks[1]);  b = _mm_aesdec_si128(b, ks[2]);
@@ -592,7 +635,7 @@ static inline __m128i DecBlock128(const __m128i* ks, __m128i b) {
     return _mm_aesdeclast_si128(b, ks[10]);
 }
 
-__attribute__((target("aes,ssse3")))
+CITRON_AESNI_TARGET("aes,ssse3")
 inline void Xts128Dec(const __m128i* data_dec_ks, const __m128i* tweak_ks,
                       const uint8_t* tweak_val,
                       const uint8_t* in, uint8_t* out, std::size_t len) {
@@ -610,7 +653,7 @@ inline void Xts128Dec(const __m128i* data_dec_ks, const __m128i* tweak_ks,
 //
 // Cold-path only (key loading and verification). AES-NI SSE2 is sufficient.
 
-__attribute__((target("aes,sse2")))
+CITRON_AESNI_TARGET("aes,sse2")
 inline void Cmac128(const __m128i* ks, const uint8_t* msg, std::size_t len,
                     uint8_t* out_tag) {
     __m128i L  = EncBlock128(ks, _mm_setzero_si128());

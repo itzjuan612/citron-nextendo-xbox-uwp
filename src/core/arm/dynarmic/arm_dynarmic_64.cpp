@@ -249,14 +249,17 @@ public:
     u64 last_code_addr = kNoCachedCodePage;
 };
 
-std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* page_table,
-                                                           std::size_t address_space_bits) const {
+std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(
+    [[maybe_unused]] Common::PageTable* page_table, std::size_t address_space_bits) const {
     Dynarmic::A64::UserConfig config;
 
     // Callbacks
     config.callbacks = m_cb.get();
 
     // Memory
+#if !defined(CITRON_UWP)
+    // UWP keeps the host page table lazily committed, so it must not be dereferenced directly;
+    // Dynarmic's callbacks translate through the page table instead (fastmem is off on Xbox).
     if (page_table) {
         config.page_table = reinterpret_cast<void**>(page_table->entries.data());
         config.page_table_log2_stride = 5;
@@ -274,6 +277,7 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(Common::PageTable* pa
         config.fastmem_exclusive_access = config.fastmem_pointer.has_value();
         config.recompile_on_exclusive_fastmem_failure = true;
     }
+#endif
 
     // Multi-process state
     config.processor_id = uint8_t(m_core_index);

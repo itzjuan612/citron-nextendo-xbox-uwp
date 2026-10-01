@@ -6,6 +6,11 @@ include_directories(.)
 
 include(CheckCXXCompilerFlag)
 
+# UWP (Xbox / Windows Store) build: the sandbox guards are keyed off this macro.
+if (CITRON_UWP)
+    add_compile_definitions(CITRON_UWP=1)
+endif()
+
 if (ENABLE_UNITY_BUILD)
     set(CMAKE_UNITY_BUILD ON)
     set(CMAKE_UNITY_BUILD_BATCH_SIZE 9999)
@@ -267,7 +272,7 @@ if (ENABLE_SDL2)
     add_subdirectory_without_clangcl_pgo(citron_cmd)
 endif()
 
-if (WIN32)
+if (WIN32 AND NOT CITRON_UWP)
     add_subdirectory_without_clangcl_pgo(citron_updater_helper)
 endif()
 
@@ -282,4 +287,8 @@ endif()
 if (ANDROID)
     add_subdirectory(android/app/src/main/jni)
     target_include_directories(citron-android PRIVATE android/app/src/main)
+endif()
+
+if (CITRON_UWP)
+    add_subdirectory(citron_uwp)
 endif()

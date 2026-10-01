@@ -68,11 +68,21 @@ std::vector<NetworkInterface> GetAvailableNetworkInterfaces() {
                                  .sin_addr;
 
         ULONG mask = 0;
+#if defined(CITRON_UWP)
+        // UWP: ConvertLengthToIpv4Mask (netioapi) is not available in the sandbox.
+        const ULONG prefix = current_address->FirstUnicastAddress->OnLinkPrefixLength;
+        if (prefix > 32) {
+            LOG_ERROR(Network, "Invalid IPv4 prefix length {}", prefix);
+            continue;
+        }
+        mask = prefix == 0 ? 0u : htonl(~0u << (32 - prefix));
+#else
         if (ConvertLengthToIpv4Mask(current_address->FirstUnicastAddress->OnLinkPrefixLength,
                                     &mask) != NO_ERROR) {
             LOG_ERROR(Network, "Failed to convert IPv4 prefix length to subnet mask");
             continue;
         }
+#endif
 
         struct in_addr gateway = {.S_un{.S_addr{0}}};
         if (current_address->FirstGatewayAddress != nullptr &&

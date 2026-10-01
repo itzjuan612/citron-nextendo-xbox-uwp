@@ -685,8 +685,10 @@ std::optional<Key128> KeyManager::ParseTicketTitleKey(const Ticket& ticket) {
     return key_temp;
 }
 
-KeyManager::KeyManager() {
-    ReloadKeys();
+KeyManager::KeyManager() : dev_mode{false} {
+    // Keys are loaded by the frontends through an explicit ReloadKeys() call once the app
+    // directory is known. Loading here would run during static initialization (RegisteredCache
+    // holds a KeyManager reference), before Settings::values is dynamically initialized.
 }
 
 void KeyManager::ReloadKeys() {

@@ -336,6 +336,41 @@ if (ARCHITECTURE_x86_64)
     target_link_libraries(video_core PUBLIC xbyak::xbyak)
 endif()
 
+# D3D12 renderer backend (Xbox/UWP target and desktop development builds).
+if (CITRON_ENABLE_D3D12)
+    target_sources(video_core PRIVATE
+        renderer_d3d12/d3d12_command_list.cpp
+        renderer_d3d12/d3d12_command_list.h
+        renderer_d3d12/d3d12_descriptor_heap.cpp
+        renderer_d3d12/d3d12_descriptor_heap.h
+        renderer_d3d12/d3d12_device.cpp
+        renderer_d3d12/d3d12_device.h
+        renderer_d3d12/d3d12_fixed_pipeline_state.cpp
+        renderer_d3d12/d3d12_fixed_pipeline_state.h
+        renderer_d3d12/d3d12_graphics_pipeline.cpp
+        renderer_d3d12/d3d12_graphics_pipeline.h
+        renderer_d3d12/d3d12_rasterizer.cpp
+        renderer_d3d12/d3d12_rasterizer.h
+        renderer_d3d12/d3d12_root_signature.cpp
+        renderer_d3d12/d3d12_root_signature.h
+        renderer_d3d12/d3d12_shader_compiler.cpp
+        renderer_d3d12/d3d12_shader_compiler.h
+        renderer_d3d12/d3d12_swapchain.cpp
+        renderer_d3d12/d3d12_swapchain.h
+        renderer_d3d12/mesa/dxil_versions.h
+        renderer_d3d12/mesa/spirv_to_dxil.h
+        renderer_d3d12/renderer_d3d12.cpp
+        renderer_d3d12/renderer_d3d12.h
+    )
+    target_compile_definitions(video_core PRIVATE CITRON_ENABLE_D3D12=1)
+    target_link_libraries(video_core PRIVATE d3d12 dxgi dxguid)
+endif()
+
+# ffmpeg's MF code references IID_ICodecAPI, which the UWP SDK surface does not export.
+if (WIN32)
+    target_sources(video_core PRIVATE host1x/ffmpeg/ffmpeg_windows_guids.cpp)
+endif()
+
 if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64)
     target_link_libraries(video_core PRIVATE dynarmic::dynarmic)
 endif()

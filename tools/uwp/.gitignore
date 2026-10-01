@@ -1,0 +1,5 @@
+# Build outputs: the signed package and the packaging layout contain binaries.
+layout/
+*.appx
+*.msix
+*.cer

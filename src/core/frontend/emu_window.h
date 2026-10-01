@@ -65,6 +65,10 @@ public:
         // set to nullptr, the video backend will run in headless mode.
         void* render_surface = nullptr;
 
+        // UWP only: the ICoreWindow as an IUnknown*. DXGI on Xbox requires
+        // CreateSwapChainForCoreWindow instead of CreateSwapChainForHwnd.
+        void* core_window = nullptr;
+
         // Scale of the render surface. For hidpi systems, this will be >1.
         float render_surface_scale = 1.0f;
     };

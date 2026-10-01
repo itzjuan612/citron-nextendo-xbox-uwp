@@ -51,8 +51,8 @@ endif()
 
 # Set bundled sdl2/qt as dependent options.
 option(ENABLE_SDL2 "Enable the SDL2 frontend" ON)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_BUNDLED_SDL2 "Download bundled SDL2 binaries" ON "ENABLE_SDL2;MSVC;NOT CITRON_CLANGCL" OFF)
-CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Compile external SDL2" ON "ENABLE_SDL2;NOT MSVC OR CITRON_CLANGCL" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_BUNDLED_SDL2 "Download bundled SDL2 binaries" OFF "ENABLE_SDL2;MSVC;NOT CITRON_CLANGCL" OFF)
+CMAKE_DEPENDENT_OPTION(CITRON_USE_EXTERNAL_SDL2 "Compile external SDL3 (submodule)" ON "ENABLE_SDL2;NOT CITRON_USE_BUNDLED_SDL2" OFF)
 
 cmake_dependent_option(ENABLE_LIBUSB "Enable the use of LibUSB" ON "NOT ANDROID" OFF)
 
@@ -143,6 +143,44 @@ if (WIN32 OR APPLE)
     set(DEFAULT_ENABLE_OPENSSL OFF)
 endif()
 option(ENABLE_OPENSSL "Enable OpenSSL backend for ISslConnection" ${DEFAULT_ENABLE_OPENSSL})
+
+# D3D12 renderer backend (Xbox/UWP target; also buildable on desktop for development).
+if (WIN32)
+    option(CITRON_ENABLE_D3D12 "Build the D3D12 renderer backend" ON)
+else()
+    set(CITRON_ENABLE_D3D12 OFF CACHE BOOL "Build the D3D12 renderer backend" FORCE)
+endif()
+
+# ── UWP (Xbox / Windows Store) ────────────────────────────────────────────────
+# Auto-enabled when targeting WindowsStore. Forces off components that cannot work
+# in the sandbox and pins the vcpkg triplet to the static UWP triplet.
+if (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    set(CITRON_UWP ON CACHE BOOL "Build for the Universal Windows Platform (Xbox)" FORCE)
+else()
+    set(CITRON_UWP OFF CACHE BOOL "Build for the Universal Windows Platform (Xbox)")
+endif()
+
+if (CITRON_UWP)
+    set(ENABLE_QT OFF CACHE BOOL "" FORCE)
+    set(ENABLE_SDL2 OFF CACHE BOOL "" FORCE)
+    set(ENABLE_LIBUSB OFF CACHE BOOL "" FORCE)
+    set(ENABLE_CUBEB OFF CACHE BOOL "" FORCE)  # cubeb's winmm backend is not UWP-allowed
+    set(CITRON_ROOM OFF CACHE BOOL "" FORCE)
+    set(CITRON_TESTS OFF CACHE BOOL "" FORCE)
+    set(CITRON_CRASH_DUMPS OFF CACHE BOOL "" FORCE)
+    set(CITRON_USE_AUTO_UPDATER OFF CACHE BOOL "" FORCE)
+    set(CITRON_SHADER_TOOL OFF CACHE BOOL "" FORCE)
+    set(ENABLE_WEB_SERVICE OFF CACHE BOOL "" FORCE)
+    set(CITRON_USE_BUNDLED_FFMPEG OFF CACHE BOOL "" FORCE)
+    # The Schannel backend needs schannel.h (SCHANNEL_CRED), which is not available
+    # under WINAPI_FAMILY_APP; use OpenSSL from the UWP triplet instead.
+    set(ENABLE_OPENSSL ON CACHE BOOL "" FORCE)
+    set(CITRON_USE_CPM OFF CACHE BOOL "" FORCE)
+    set(CITRON_USE_BUNDLED_VCPKG ON CACHE BOOL "" FORCE)
+    set(VCPKG_TARGET_TRIPLET "x64-uwp-static" CACHE STRING "" FORCE)
+    set(VCPKG_OVERLAY_PORTS "${PROJECT_SOURCE_DIR}/patches/uwp-overlay-ports" CACHE STRING "" FORCE)
+    set(VCPKG_OVERLAY_TRIPLETS "${PROJECT_SOURCE_DIR}/CMakeModules/triplets" CACHE STRING "" FORCE)
+endif()
 
 if (CITRON_USE_BUNDLED_VCPKG)
     if (ANDROID)
@@ -778,6 +816,11 @@ if (APPLE)
     # Umbrella framework for everything GUI-related
     find_library(COCOA_LIBRARY Cocoa)
     set(PLATFORM_LIBRARIES ${COCOA_LIBRARY} ${IOKIT_LIBRARY} ${COREVIDEO_LIBRARY})
+elseif (CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+    # UWP / Xbox: only the sandbox-allowed subset (ws2_32 needs internetClient;
+    # WindowsApp.lib provides the AppContainer-safe import surface).
+    add_definitions(-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00)
+    set(PLATFORM_LIBRARIES ws2_32 WindowsApp)
 elseif (WIN32)
     # Target Windows 10
     add_definitions(-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00)

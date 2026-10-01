@@ -448,6 +448,8 @@ Result KPageTableBase::InitializeForProcess(Svc::CreateProcessFlag as_type, bool
     // Initialize our implementation.
     m_impl = std::make_unique<Common::PageTable>();
     m_impl->Resize(m_address_space_width, PageBits);
+    LOG_INFO(Kernel, "InitializeForProcess: page table ready (width={}, entries={})",
+             m_address_space_width, m_impl->entries.size());
 
     // Set the tracking memory.
     m_memory = std::addressof(memory);

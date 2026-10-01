@@ -73,7 +73,10 @@ constexpr size_t HugePageSize = 0x200000;
     throw std::runtime_error("HostMemory invariant failed");
 }
 
-#ifdef _WIN32
+// UWP (Xbox): the placeholder/VirtualAlloc2 fastmem arena relies on desktop-only
+// Kernelbase entry points and FILE_MAP_2 mappings; use the generic (no-fastmem)
+// implementation for now — see the Phase 6 performance items.
+#if defined(_WIN32) && !defined(CITRON_UWP)
 
 // Manually imported for MinGW compatibility
 #ifndef MEM_RESERVE_PLACEHOLDER

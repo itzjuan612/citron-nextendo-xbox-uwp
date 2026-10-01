@@ -446,7 +446,7 @@ static void stb__OptimizeColorsAlphaBlock(unsigned char* block, unsigned short* 
 
     minp = maxp = NULL;
     mind = 0x7fffffff;
-    maxd = -0x80000000;
+    maxd = (int)0x80000000u; // INT_MIN without the unary-minus-on-unsigned warning
 
     // Pick colors at extreme points
     for (i = 0; i < 16; i++) {

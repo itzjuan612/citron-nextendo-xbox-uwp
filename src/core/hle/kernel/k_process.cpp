@@ -1240,8 +1240,10 @@ Result KProcess::LoadFromMetadata(const FileSys::ProgramMetadata& metadata, std:
     std::memcpy(params.name.data(), name.data(), sizeof(params.name));
 
     // Initialize for application process.
+    LOG_INFO(Kernel, "LoadFromMetadata: initializing process interface");
     R_TRY(this->Initialize(params, metadata.GetKernelCapabilities(), res_limit, pool,
                            aslr_space_start));
+    LOG_INFO(Kernel, "LoadFromMetadata: process interface initialized");
 
     // Assign remaining properties.
     m_is_hbl = is_hbl;
@@ -1249,6 +1251,7 @@ Result KProcess::LoadFromMetadata(const FileSys::ProgramMetadata& metadata, std:
 
     // Set up emulation context.
     this->InitializeInterfaces();
+    LOG_INFO(Kernel, "LoadFromMetadata: interfaces ready");
 
     // We succeeded.
     R_SUCCEED();

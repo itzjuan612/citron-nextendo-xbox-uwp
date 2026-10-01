@@ -43,7 +43,17 @@ endif()
 if ((ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64) AND NOT TARGET dynarmic::dynarmic)
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/dynarmic/CMakeLists.txt")
         set(DYNARMIC_IGNORE_ASSERTS ON)
+        if (CITRON_UWP)
+            # UWP/Xbox rejects PAGE_EXECUTE_READWRITE. Commit JIT pages read-write and flip them
+            # executable with VirtualProtect instead (W^X).
+            set(DYNARMIC_ENABLE_NO_EXECUTE_SUPPORT ON)
+        endif()
         add_subdirectory(dynarmic)
+        # Xbyak bakes its container types into class layouts, so every translation unit must
+        # see the same configuration. The embedder header provides it (see dynarmic's
+        # common/x64/xbyak.h); without the define, dynarmic's two xbyak wrappers disagree and
+        # the resulting ODR layout mismatch corrupts the JIT label maps.
+        target_compile_definitions(dynarmic PRIVATE DYNARMIC_XBYAK_CUSTOM_CONTAINERS=1)
         add_library(dynarmic::dynarmic ALIAS dynarmic)
     endif()
 endif()

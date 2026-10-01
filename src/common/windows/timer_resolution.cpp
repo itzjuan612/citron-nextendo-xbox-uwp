@@ -27,6 +27,43 @@ NTSYSAPI LONG NTAPI NtDelayExecution(BOOLEAN Alertable, PLARGE_INTEGER DelayInte
 #define PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION 0x4
 #endif
 
+#if defined(CITRON_UWP)
+
+// UWP: NtQueryTimerResolution / NtSetTimerResolution / NtDelayExecution and the power
+// throttling API are not available inside the AppContainer. Timing uses QPC, so these are
+// no-ops that report a fixed 1 ms granularity.
+namespace Common::Windows {
+
+using namespace std::chrono;
+
+nanoseconds GetMinimumTimerResolution() {
+    return nanoseconds{1'000'000};
+}
+
+nanoseconds GetMaximumTimerResolution() {
+    return nanoseconds{1'000'000};
+}
+
+nanoseconds GetCurrentTimerResolution() {
+    return nanoseconds{1'000'000};
+}
+
+nanoseconds SetCurrentTimerResolution(nanoseconds /*timer_resolution*/) {
+    return GetCurrentTimerResolution();
+}
+
+nanoseconds SetCurrentTimerResolutionToMaximum() {
+    return GetCurrentTimerResolution();
+}
+
+void SleepForOneTick() {
+    Sleep(1);
+}
+
+} // namespace Common::Windows
+
+#else
+
 namespace Common::Windows {
 
 namespace {
@@ -107,3 +144,5 @@ void SleepForOneTick() {
 }
 
 } // namespace Common::Windows
+
+#endif // !CITRON_UWP

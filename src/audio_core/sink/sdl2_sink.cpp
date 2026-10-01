@@ -40,8 +40,8 @@ public:
             SDL_AudioDeviceID* devices = capture ? SDL_GetAudioRecordingDevices(&count) : SDL_GetAudioPlaybackDevices(&count);
             if (devices) {
                 for (int i = 0; i < count; ++i) {
-                    if (const char* name = SDL_GetAudioDeviceName(devices[i])) {
-                        if (device_name == name) {
+                    if (const char* dev_name = SDL_GetAudioDeviceName(devices[i])) {
+                        if (device_name == dev_name) {
                             devid = devices[i];
                             break;
                         }

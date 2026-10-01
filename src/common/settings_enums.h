@@ -121,7 +121,7 @@ ENUM(AstcRecompression, Uncompressed, Bc1, Bc3);
 
 ENUM(VSyncMode, Immediate, Mailbox, Fifo, FifoRelaxed);
 
-ENUM(RendererBackend, Vulkan, Null);
+ENUM(RendererBackend, Vulkan, Null, D3D12);
 
 ENUM(GpuAccuracy, Low, Normal, High, Extreme);
 
