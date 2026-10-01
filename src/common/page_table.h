@@ -26,55 +26,6 @@ enum class PageType : u8 {
     RasterizerCachedMemory,
 };
 
-#ifdef CITRON_UWP
-/**
- * Lazily committed storage for the host page tables.
- *
- * A 39-bit address space needs 2^27 entries (32 bytes each, 4 GiB total). Committing that up
- * front (MEM_COMMIT, as VirtualBuffer does) blows the Xbox game memory budget once the 4 GiB
- * guest RAM backing buffer is allocated. This storage reserves the virtual range only and
- * commits 64 KiB chunks on first access, so the table costs ~0.8% of the guest memory that is
- * actually touched. The API mirrors VirtualBuffer for the members the page table uses.
- */
-template <typename T>
-class SparseLazyBuffer final {
-public:
-    SparseLazyBuffer() = default;
-    ~SparseLazyBuffer();
-
-    SparseLazyBuffer(const SparseLazyBuffer&) = delete;
-    SparseLazyBuffer& operator=(const SparseLazyBuffer&) = delete;
-
-    SparseLazyBuffer(SparseLazyBuffer&& other) noexcept;
-    SparseLazyBuffer& operator=(SparseLazyBuffer&& other) noexcept;
-
-    void resize(std::size_t count);
-
-    [[nodiscard]] std::size_t size() const {
-        return element_count;
-    }
-
-    [[nodiscard]] const T& operator[](std::size_t index) const {
-        return at(index);
-    }
-
-    [[nodiscard]] T& operator[](std::size_t index) {
-        return at(index);
-    }
-
-private:
-    T& at(std::size_t index) const;
-    void CommitChunk(std::size_t chunk) const;
-    void Release();
-
-    std::byte* base{};
-    std::atomic<u32>* chunk_states{};
-    std::size_t chunk_count{};
-    std::size_t total_bytes{};
-    std::size_t element_count{};
-};
-#endif
-
 /**
  * A (reasonably) fast way of allowing switchable and remappable process address spaces. It loosely
  * mimics the way a real CPU page table works.

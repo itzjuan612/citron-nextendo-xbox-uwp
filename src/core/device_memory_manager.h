@@ -174,7 +174,21 @@ private:
         u32 compressed_physical_ptr;
         u32 continuity_tracker;
     };
+#ifdef CITRON_UWP
+    /// Restores the non-zero default of lazily committed GpuCoalescedEntry chunks.
+    struct GpuCoalescedEntryInitializer {
+        void operator()(GpuCoalescedEntry* begin, GpuCoalescedEntry* end) const {
+            for (auto* entry = begin; entry != end; ++entry) {
+                entry->cpu_backing_address = 0;
+                entry->compressed_physical_ptr = 0;
+                entry->continuity_tracker = 1;
+            }
+        }
+    };
+    Common::SparseLazyBuffer<GpuCoalescedEntry, GpuCoalescedEntryInitializer> entries;
+#else
     Common::VirtualBuffer<GpuCoalescedEntry> entries;
+#endif
     Common::VirtualBuffer<u32> compressed_device_addr;
 
     // Process memory interfaces

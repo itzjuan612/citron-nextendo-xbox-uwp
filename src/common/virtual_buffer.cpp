@@ -39,4 +39,14 @@ void FreeMemoryPages(void* base, [[maybe_unused]] std::size_t size) noexcept {
 #endif
 }
 
+#ifdef CITRON_UWP
+void* ReserveMemoryPages(std::size_t size) noexcept {
+    return VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
+}
+
+void* CommitMemoryPages(void* base, std::size_t size) noexcept {
+    return VirtualAlloc(base, size, MEM_COMMIT, PAGE_READWRITE);
+}
+#endif
+
 } // namespace Common

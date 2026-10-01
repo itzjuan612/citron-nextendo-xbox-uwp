@@ -169,12 +169,16 @@ DeviceMemoryManager<Traits>::DeviceMemoryManager(const DeviceMemory& device_memo
     impl = std::make_unique<DeviceMemoryManagerAllocator<Traits>>();
     cached_pages.resize(num_counter_entries);
 
+#ifndef CITRON_UWP
     const size_t total_virtual = device_as_size >> Memory::CITRON_PAGEBITS;
     for (size_t i = 0; i < total_virtual; i++) {
         entries[i].compressed_physical_ptr = 0;
         entries[i].continuity_tracker = 1;
         entries[i].cpu_backing_address = 0;
     }
+#endif
+    // UWP: the entries table is lazily committed; GpuCoalescedEntryInitializer restores the
+    // {0, 0, 1} default per chunk on first touch instead of materializing all 2^28 entries.
     const size_t total_phys = 1ULL << ((Settings::values.memory_layout_mode.GetValue() ==
                                                 Settings::MemoryLayout::Memory_4Gb
                                             ? physical_min_bits
