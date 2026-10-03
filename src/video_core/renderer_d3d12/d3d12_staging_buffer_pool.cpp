@@ -78,6 +78,15 @@ u64 StagingBufferPool::GetMemoryUsage() const {
     return total_bytes;
 }
 
+std::span<u8> StagingBufferPool::MappedSpan(ID3D12Resource* resource) const {
+    for (const Entry& entry : entries) {
+        if (entry.resource.Get() == resource) {
+            return entry.mapped_span;
+        }
+    }
+    return {};
+}
+
 StagingBufferPool::Entry& StagingBufferPool::CreateEntry(u64 size, StagingUsage usage) {
     ID3D12Device* d3d = device.GetDevice();
     Entry entry;

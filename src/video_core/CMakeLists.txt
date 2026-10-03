@@ -361,6 +361,8 @@ if (CITRON_ENABLE_D3D12)
         renderer_d3d12/d3d12_staging_buffer_pool.h
         renderer_d3d12/d3d12_swapchain.cpp
         renderer_d3d12/d3d12_swapchain.h
+        renderer_d3d12/d3d12_texture_cache.cpp
+        renderer_d3d12/d3d12_texture_cache.h
         renderer_d3d12/mesa/dxil_versions.h
         renderer_d3d12/mesa/spirv_to_dxil.h
         renderer_d3d12/renderer_d3d12.cpp

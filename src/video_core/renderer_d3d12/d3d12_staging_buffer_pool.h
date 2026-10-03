@@ -64,6 +64,10 @@ public:
 
     [[nodiscard]] u64 GetMemoryUsage() const;
 
+    /// Returns the persistently-mapped span of a pool staging resource, or an empty span
+    /// when the resource is not from this pool.
+    [[nodiscard]] std::span<u8> MappedSpan(ID3D12Resource* resource) const;
+
 private:
     struct Entry {
         ComPtr<ID3D12Resource> resource;

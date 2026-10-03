@@ -185,8 +185,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE Buffer::View(u32 offset, u32 size, PixelFormat forma
     return handle;
 }
 
-BufferCacheRuntime::BufferCacheRuntime(Device& device_, CommandList& command_list_)
-    : device{device_}, command_list{command_list_}, staging_pool{device_},
+BufferCacheRuntime::BufferCacheRuntime(Device& device_, CommandList& command_list_,
+                                         StagingBufferPool& staging_pool_)
+    : device{device_}, command_list{command_list_}, staging_pool{staging_pool_},
       view_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, false} {
     ReserveNullBuffer();
 }

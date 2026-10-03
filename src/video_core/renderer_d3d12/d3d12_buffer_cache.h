@@ -108,7 +108,8 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE view{};
     };
 
-    explicit BufferCacheRuntime(Device& device, CommandList& command_list);
+    explicit BufferCacheRuntime(Device& device, CommandList& command_list,
+                                  StagingBufferPool& staging_pool);
 
     void TickFrame(Common::SlotVector<Buffer>& slot_buffers) noexcept;
 
@@ -198,7 +199,7 @@ private:
 
     Device& device;
     CommandList& command_list;
-    StagingBufferPool staging_pool;
+    StagingBufferPool& staging_pool;
     DescriptorHeap view_heap;
     ComPtr<ID3D12Resource> null_buffer;
 

@@ -24,9 +24,10 @@ bool AccelerateDMA::BufferClear(GPUVAddr dst_address, u64 amount, u32 value) {
 
 RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
                                  Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device)
-    : m_gpu{gpu}, m_device{device}, m_command_list{device.GetDevice()},
-      m_runtime{device, m_command_list}, m_buffer_cache{device_memory, m_runtime},
-      m_accelerate_dma{m_buffer_cache} {
+    : m_gpu{gpu}, m_device{device}, m_staging_pool{device}, m_command_list{device.GetDevice()},
+      m_runtime{device, m_command_list, m_staging_pool}, m_buffer_cache{device_memory, m_runtime},
+      m_texture_runtime{device, m_command_list, m_staging_pool},
+      m_texture_cache{m_texture_runtime, device_memory}, m_accelerate_dma{m_buffer_cache} {
     // CommandList is created closed; open it for recording. FlushCommands re-opens it
     // after each execute, so every record goes to a live list.
     m_command_list.Reset();
@@ -69,11 +70,23 @@ void RasterizerD3D12::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType w
         std::scoped_lock lock{m_buffer_cache.mutex};
         m_buffer_cache.DownloadMemory(addr, size);
     }
+    if (True(which & VideoCommon::CacheType::TextureCache)) {
+        std::scoped_lock lock{m_texture_cache.mutex};
+        m_texture_cache.DownloadMemory(addr, size);
+    }
 }
 bool RasterizerD3D12::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
     if (True(which & VideoCommon::CacheType::BufferCache)) {
         std::scoped_lock lock{m_buffer_cache.mutex};
-        return m_buffer_cache.IsRegionGpuModified(addr, size);
+        if (m_buffer_cache.IsRegionGpuModified(addr, size)) {
+            return true;
+        }
+    }
+    if (True(which & VideoCommon::CacheType::TextureCache)) {
+        std::scoped_lock lock{m_texture_cache.mutex};
+        if (m_texture_cache.IsRegionGpuModified(addr, size)) {
+            return true;
+        }
     }
     return false;
 }
@@ -85,6 +98,10 @@ void RasterizerD3D12::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheT
         std::scoped_lock lock{m_buffer_cache.mutex};
         m_buffer_cache.WriteMemory(addr, size);
     }
+    if (True(which & VideoCommon::CacheType::TextureCache)) {
+        std::scoped_lock lock{m_texture_cache.mutex};
+        m_texture_cache.WriteMemory(addr, size);
+    }
 }
 bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
     std::scoped_lock lock{m_buffer_cache.mutex};
@@ -94,8 +111,9 @@ void RasterizerD3D12::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return;
     }
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.WriteMemory(addr, size);
+    m_texture_cache.WriteMemory(addr, size);
 }
 VideoCore::RasterizerDownloadArea RasterizerD3D12::GetFlushArea(PAddr addr, u64 size) {
     VideoCore::RasterizerDownloadArea new_area{
@@ -107,8 +125,9 @@ VideoCore::RasterizerDownloadArea RasterizerD3D12::GetFlushArea(PAddr addr, u64 
 }
 void RasterizerD3D12::InvalidateGPUCache() {}
 void RasterizerD3D12::UnmapMemory(DAddr addr, u64 size) {
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.WriteMemory(addr, size);
+    m_texture_cache.WriteMemory(addr, size);
 }
 void RasterizerD3D12::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {}
 void RasterizerD3D12::SignalFence(std::function<void()>&& func) {
@@ -142,8 +161,9 @@ void RasterizerD3D12::FlushCommands() {
     m_command_list.Reset();
 }
 void RasterizerD3D12::TickFrame() {
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.TickFrame();
+    m_texture_cache.TickFrame();
 }
 Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() {
     return m_accelerate_dma;
@@ -168,19 +188,22 @@ void RasterizerD3D12::LoadDiskResources(u64 title_id, std::stop_token stop_loadi
                                         const VideoCore::DiskResourceLoadCallback& callback) {}
 void RasterizerD3D12::InitializeChannel(Tegra::Control::ChannelState& channel) {
     CreateChannel(channel);
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.CreateChannel(channel);
+    m_texture_cache.CreateChannel(channel);
 }
 void RasterizerD3D12::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
     BindToChannel(channel_id);
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.BindToChannel(channel_id);
+    m_texture_cache.BindToChannel(channel_id);
 }
 void RasterizerD3D12::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.EraseChannel(channel_id);
+    m_texture_cache.EraseChannel(channel_id);
 }
 
 } // namespace D3D12
