@@ -285,6 +285,20 @@ void EmulationSession::Shutdown() {
     }
 }
 
+void EmulationSession::PresentFrame() {
+    // Called from the UI thread. The renderer's Present only works on the thread that
+    // owns the CoreWindow (Xbox), so the GPU thread hands the present off here.
+    if (!is_running) {
+        return;
+    }
+    try {
+        if (system.IsPoweredOn()) {
+            system.Renderer().PresentPending();
+        }
+    } catch (...) {
+    }
+}
+
 void EmulationSession::RunEmulation() {
     if (Settings::values.use_disk_shader_cache.GetValue()) {
         LoadDiskCacheProgress(VideoCore::LoadCallbackStage::Prepare, 0, 0);

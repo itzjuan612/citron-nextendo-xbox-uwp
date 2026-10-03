@@ -53,6 +53,10 @@ public:
 
     [[nodiscard]] virtual RasterizerInterface* ReadRasterizer() = 0;
 
+    /// Present any frame the renderer has queued. Must be called from the UI/present thread:
+    /// Xbox CoreWindow presentation only works from that thread. Default does nothing.
+    virtual void PresentPending() {}
+
     [[nodiscard]] virtual std::string GetDeviceVendor() const = 0;
 
     // Getter/setter functions:

@@ -41,6 +41,10 @@ public:
     void Stop();
     void Shutdown();
 
+    /// Pump the renderer's pending Present. Must be called from the UI thread that owns
+    /// the CoreWindow — Xbox CoreWindow presentation only works from that thread.
+    void PresentFrame();
+
     void SetButtonState(std::size_t player_index, int button_id, bool pressed);
     void SetStickPosition(std::size_t player_index, int stick_id, float x, float y);
 

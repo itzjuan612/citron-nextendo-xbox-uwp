@@ -10,16 +10,27 @@ Swapchain::Swapchain(Device& device_,
                      const Core::Frontend::EmuWindow::WindowSystemInfo& window_info, u32 width_,
                      u32 height_)
     : device{device_}, width{width_ != 0 ? width_ : 1280}, height{height_ != 0 ? height_ : 720} {
+    // Store the window info; the actual DXGI swapchain is created in Init() on the UI thread.
+    saved_window_info = window_info;
+}
+
+Swapchain::~Swapchain() = default;
+
+void Swapchain::Init() {
     if (!device.IsValid()) {
         return;
     }
 
+    const auto& window_info = saved_window_info;
     IDXGIFactory4* factory = device.GetFactory();
     ID3D12CommandQueue* queue = device.GetQueue();
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
-    desc.Width = 0;   // use the surface size
-    desc.Height = 0;  // use the surface size
+    // Use the requested framebuffer size rather than 0 ("use window size"): at swapchain
+    // creation time the CoreWindow may not be laid out yet and DXGI would give us a tiny
+    // (8x8) buffer.
+    desc.Width = width;
+    desc.Height = height;
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.Stereo = FALSE;
     desc.SampleDesc.Count = 1;
@@ -66,8 +77,6 @@ Swapchain::Swapchain(Device& device_,
     LOG_INFO(Render_D3D12, "Swapchain created ({}x{}, {})", width, height,
              window_info.core_window ? "CoreWindow" : "HWND");
 }
-
-Swapchain::~Swapchain() = default;
 
 void Swapchain::CreateBackBuffers() {
     ID3D12Device* d3d_device = device.GetDevice();
@@ -152,7 +161,10 @@ void Swapchain::Present() {
     if (!swapchain) {
         return;
     }
-    swapchain->Present(1, 0);
+    const HRESULT hr = swapchain->Present(1, 0);
+    if (FAILED(hr)) {
+        LOG_ERROR(Render_D3D12, "Present failed: {:#x}", static_cast<u32>(hr));
+    }
 }
 
 u32 Swapchain::GetCurrentBackBufferIndex() const {

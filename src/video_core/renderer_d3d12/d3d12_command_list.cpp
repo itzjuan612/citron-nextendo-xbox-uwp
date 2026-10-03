@@ -36,12 +36,16 @@ void CommandList::Reset() {
 
 void CommandList::Close() {
     if (list) {
-        list->Close();
+        const HRESULT hr = list->Close();
+        if (FAILED(hr)) {
+            LOG_ERROR(Render_D3D12, "CommandList::Close failed: {:#x}", static_cast<u32>(hr));
+        }
     }
 }
 
 void CommandList::Execute(Device& device) {
     if (!IsValid()) {
+        LOG_ERROR(Render_D3D12, "CommandList::Execute: invalid list/allocator");
         return;
     }
     Close();

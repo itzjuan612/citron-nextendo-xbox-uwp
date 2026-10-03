@@ -209,6 +209,14 @@ public:
     void Run() {
         auto& session = CitronUWP::EmulationSession::GetInstance();
 
+        // Activate the CoreWindow before anything presents to it. Without this the
+        // compositor never shows swapchain content: Present() returns S_OK and frames
+        // flow, but the screen stays black (this cost a whole bring-up cycle).
+        try {
+            window_.Activate();
+        } catch (...) {
+        }
+
         // Resolve the app data directory and boot content once the window exists.
         try {
             const auto folder = winrt::Windows::Storage::ApplicationData::Current().LocalFolder();
@@ -254,6 +262,8 @@ public:
 
         while (!closed_) {
             window_.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+            // Presents the renderer's pending frame. Must run on this thread (CoreWindow owner).
+            session.PresentFrame();
             if (session.IsRunning()) {
                 try {
                     PollGamepads();

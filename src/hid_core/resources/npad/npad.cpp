@@ -160,6 +160,9 @@ void NPad::ControllerUpdate(Core::HID::ControllerTriggerType type, std::size_t c
                 return;
             }
             auto* shared_memory = controller.shared_memory;
+            if (!shared_memory) {
+                return;
+            }
             const auto& battery_level = controller.device->GetBattery();
             shared_memory->battery_level_dual = battery_level.dual.battery_level;
             shared_memory->battery_level_left = battery_level.left.battery_level;
@@ -182,6 +185,12 @@ void NPad::InitNewlyAddedController(u64 aruid, Core::HID::NpadIdType npad_id) {
     const auto& body_colors = controller.device->GetColors();
     const auto& battery_level = controller.device->GetBattery();
     auto* shared_memory = controller.shared_memory;
+    if (!shared_memory) {
+        // The guest has not activated NPad resources yet; shared memory is assigned in
+        // Activate()/OnUpdate(). Connection will be picked up by the next OnUpdate().
+        LOG_ERROR(Service_HID, "NULL shared memory npad_id:{}", npad_id);
+        return;
+    }
     if (controller_type == Core::HID::NpadStyleIndex::None) {
         npad_resource.SignalStyleSetUpdateEvent(aruid, npad_id);
         return;
