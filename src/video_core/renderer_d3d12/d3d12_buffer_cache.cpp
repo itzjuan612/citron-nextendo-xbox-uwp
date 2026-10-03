@@ -244,19 +244,38 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
         return;
     }
     const bool same_resource = dst_buffer == src_buffer;
-    command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COMMON,
-                            D3D12_RESOURCE_STATE_COPY_DEST);
+    // DEFAULT-heap buffers live in COMMON and need explicit copy-state transitions.
+    // UPLOAD staging is created GENERIC_READ (usable as a copy source as-is) and READBACK
+    // staging is created COPY_DEST (usable as a copy destination as-is), so those skip
+    // transitions — claiming COMMON for them fails command-list validation.
+    D3D12_HEAP_PROPERTIES dst_heap{};
+    D3D12_HEAP_PROPERTIES src_heap{};
+    dst_buffer->GetHeapProperties(&dst_heap, nullptr);
     if (!same_resource) {
+        src_buffer->GetHeapProperties(&src_heap, nullptr);
+    }
+    const bool transition_dst = dst_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
+    const bool transition_src = !same_resource && src_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
+    if (transition_dst) {
+        command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+    }
+    if (transition_src) {
         command_list.Transition(src_buffer, D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_STATE_COPY_SOURCE);
     }
     for (const VideoCommon::BufferCopy& copy : copies) {
+        if (copy.size == 0) {
+            continue;
+        }
         command_list.CopyBufferRegion(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset,
                                       copy.size);
     }
-    command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_COMMON);
-    if (!same_resource) {
+    if (transition_dst) {
+        command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_COMMON);
+    }
+    if (transition_src) {
         command_list.Transition(src_buffer, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                 D3D12_RESOURCE_STATE_COMMON);
     }

@@ -26,7 +26,11 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
                                  Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device)
     : m_gpu{gpu}, m_device{device}, m_command_list{device.GetDevice()},
       m_runtime{device, m_command_list}, m_buffer_cache{device_memory, m_runtime},
-      m_accelerate_dma{m_buffer_cache} {}
+      m_accelerate_dma{m_buffer_cache} {
+    // CommandList is created closed; open it for recording. FlushCommands re-opens it
+    // after each execute, so every record goes to a live list.
+    m_command_list.Reset();
+}
 RasterizerD3D12::~RasterizerD3D12() = default;
 
 void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {}
@@ -49,9 +53,11 @@ void RasterizerD3D12::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
 }
 void RasterizerD3D12::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                 u32 size) {
+    std::scoped_lock lock{m_buffer_cache.mutex};
     m_buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
 }
 void RasterizerD3D12::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+    std::scoped_lock lock{m_buffer_cache.mutex};
     m_buffer_cache.DisableGraphicsUniformBuffer(stage, index);
 }
 void RasterizerD3D12::FlushAll() {}
@@ -128,7 +134,11 @@ void RasterizerD3D12::WaitForIdle() {
 void RasterizerD3D12::FragmentBarrier() {}
 void RasterizerD3D12::TiledCacheBarrier() {}
 void RasterizerD3D12::FlushCommands() {
+    // Serializes with the cache's recorders (the DMA pusher calls this from channel threads)
+    // and waits out the GPU before recycling the allocator, as CommandList requires.
+    std::scoped_lock lock{m_buffer_cache.mutex};
     m_command_list.Execute(m_device);
+    m_device.WaitForIdle();
     m_command_list.Reset();
 }
 void RasterizerD3D12::TickFrame() {
@@ -158,12 +168,19 @@ void RasterizerD3D12::LoadDiskResources(u64 title_id, std::stop_token stop_loadi
                                         const VideoCore::DiskResourceLoadCallback& callback) {}
 void RasterizerD3D12::InitializeChannel(Tegra::Control::ChannelState& channel) {
     CreateChannel(channel);
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.CreateChannel(channel);
 }
 void RasterizerD3D12::BindChannel(Tegra::Control::ChannelState& channel) {
-    BindToChannel(channel.bind_id);
+    const s32 channel_id = channel.bind_id;
+    BindToChannel(channel_id);
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.BindToChannel(channel_id);
 }
 void RasterizerD3D12::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.EraseChannel(channel_id);
 }
 
 } // namespace D3D12
