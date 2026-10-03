@@ -27,7 +27,10 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
     : m_gpu{gpu}, m_device{device}, m_staging_pool{device}, m_command_list{device.GetDevice()},
       m_runtime{device, m_command_list, m_staging_pool}, m_buffer_cache{device_memory, m_runtime},
       m_texture_runtime{device, m_command_list, m_staging_pool},
-      m_texture_cache{m_texture_runtime, device_memory}, m_accelerate_dma{m_buffer_cache} {
+      m_texture_cache{m_texture_runtime, device_memory},
+      m_query_runtime{device, m_command_list, device_memory},
+      m_query_cache{gpu, *this, device_memory, m_query_runtime},
+      m_accelerate_dma{m_buffer_cache} {
     // CommandList is created closed; open it for recording. FlushCommands re-opens it
     // after each execute, so every record goes to a live list.
     m_command_list.Reset();
@@ -38,19 +41,18 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {}
 void RasterizerD3D12::DrawTexture() {}
 void RasterizerD3D12::Clear(u32 layer_count) {}
 void RasterizerD3D12::DispatchCompute() {}
-void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {}
+void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {
+    if (type != VideoCommon::QueryType::ZPassPixelCount64) {
+        return;
+    }
+    m_query_cache.CounterReset(type);
+}
 void RasterizerD3D12::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                             VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
     if (!gpu_memory) {
         return;
     }
-    if (True(flags & VideoCommon::QueryPropertiesFlags::HasTimeout)) {
-        const u64 ticks = m_gpu.GetTicks();
-        gpu_memory->Write<u64>(gpu_addr + 8, ticks);
-        gpu_memory->Write<u64>(gpu_addr, static_cast<u64>(payload));
-    } else {
-        gpu_memory->Write<u32>(gpu_addr, payload);
-    }
+    m_query_cache.CounterReport(gpu_addr, type, flags, payload, subreport);
 }
 void RasterizerD3D12::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
                                                 u32 size) {
@@ -191,6 +193,7 @@ void RasterizerD3D12::InitializeChannel(Tegra::Control::ChannelState& channel) {
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.CreateChannel(channel);
     m_texture_cache.CreateChannel(channel);
+    m_query_cache.CreateChannel(channel);
 }
 void RasterizerD3D12::BindChannel(Tegra::Control::ChannelState& channel) {
     const s32 channel_id = channel.bind_id;
@@ -198,12 +201,14 @@ void RasterizerD3D12::BindChannel(Tegra::Control::ChannelState& channel) {
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.BindToChannel(channel_id);
     m_texture_cache.BindToChannel(channel_id);
+    m_query_cache.BindToChannel(channel_id);
 }
 void RasterizerD3D12::ReleaseChannel(s32 channel_id) {
     EraseChannel(channel_id);
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.EraseChannel(channel_id);
     m_texture_cache.EraseChannel(channel_id);
+    m_query_cache.EraseChannel(channel_id);
 }
 
 } // namespace D3D12

@@ -9,6 +9,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
 #include "video_core/renderer_d3d12/d3d12_command_list.h"
+#include "video_core/renderer_d3d12/d3d12_query_cache.h"
 #include "video_core/renderer_d3d12/d3d12_staging_buffer_pool.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 
@@ -110,6 +111,8 @@ private:
     BufferCache m_buffer_cache;
     TextureCacheRuntime m_texture_runtime;
     TextureCache m_texture_cache;
+    QueryCacheRuntime m_query_runtime;
+    QueryCache m_query_cache;
     AccelerateDMA m_accelerate_dma;
 };
 
