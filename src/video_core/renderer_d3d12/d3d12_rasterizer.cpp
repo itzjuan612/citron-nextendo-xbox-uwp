@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 Citron Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstring>
 
 #include "common/alignment.h"
@@ -74,11 +75,16 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     if (!stored || !stored->pipeline || !stored->pipeline->IsValid()) {
         return;
     }
+    static std::atomic<u32> draw_count{0};
+    const u32 draw_id = draw_count.fetch_add(1, std::memory_order_relaxed);
+    if (draw_id < 16) {
+        LOG_INFO(Render_D3D12, "Draw#{} indexed={} instances={}", draw_id, is_indexed,
+                 instance_count);
+    }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     ConfigureDraw(is_indexed, *stored, instance_count);
     m_gpu.TickWork();
 }
-
 namespace {
 
 struct DrawParams {
@@ -295,6 +301,31 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     m_texture_cache.UpdateRenderTargets(false);
     Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
 
+    const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
+    const DrawParams params = MakeDrawParams(draw_state, instance_count, is_indexed);
+    const auto& index_binding = m_runtime.GetIndexBinding();
+    // Guard rails: never submit draws the backend cannot represent yet. An unbound
+    // render target, an unexpanded index format, or an empty draw would otherwise go
+    // to the GPU as undefined commands.
+    ImageView* depth_view = framebuffer ? framebuffer->DepthBuffer() : nullptr;
+    u32 num_rtvs = 0;
+    for (size_t i = 0; i < VideoCommon::NUM_RT; ++i) {
+        const auto format =
+            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
+        if (format != Tegra::RenderTargetFormat::NONE) {
+            num_rtvs = static_cast<u32>(i) + 1;
+        }
+    }
+    if (params.num_vertices == 0 || params.num_instances == 0) {
+        return;
+    }
+    if (params.is_indexed && (!index_binding.valid || !index_binding.supported)) {
+        return;
+    }
+    if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
+        return;
+    }
+
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
     m_command_list.SetPipelineState(pipeline->Get());
     ID3D12DescriptorHeap* heaps[] = {m_res_heap.Get(), m_sampler_heap.Get()};
@@ -443,14 +474,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 
     // Render targets from the texture cache's current framebuffer.
     D3D12_CPU_DESCRIPTOR_HANDLE rtvs[VideoCommon::NUM_RT]{};
-    u32 num_rtvs = 0;
-    for (size_t i = 0; i < VideoCommon::NUM_RT; ++i) {
-        const auto format =
-            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
-        if (format == Tegra::RenderTargetFormat::NONE) {
-            continue;
-        }
-        num_rtvs = static_cast<u32>(i) + 1;
+    for (size_t i = 0; i < num_rtvs; ++i) {
         ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
         rtvs[i] = view ? view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
         if (view && view->Resource()) {
@@ -458,7 +482,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
         }
     }
-    ImageView* depth_view = framebuffer ? framebuffer->DepthBuffer() : nullptr;
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
         depth_view ? depth_view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
     if (depth_view && depth_view->Resource()) {
@@ -486,9 +509,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         m_command_list.Get()->IASetVertexBuffers(
             0, vertex_count, m_runtime.GetVertexBindings().data());
     }
-    const auto& index_binding = m_runtime.GetIndexBinding();
-    const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
-    const DrawParams params = MakeDrawParams(draw_state, instance_count, is_indexed);
     if (params.is_indexed && index_binding.valid) {
         D3D12_INDEX_BUFFER_VIEW ib_view{};
         ib_view.BufferLocation = index_binding.address;

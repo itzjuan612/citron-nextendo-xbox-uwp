@@ -318,12 +318,14 @@ void BufferCacheRuntime::ClearBuffer(ID3D12Resource* dest_buffer, u32 offset, si
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 base_vertex, u32 num_indices, ID3D12Resource* buffer,
                                          u32 offset, u32 size) {
+    bool supported = true;
     if (topology == PrimitiveTopology::Quads || topology == PrimitiveTopology::QuadStrip) {
         if (!logged_quad_index) {
             logged_quad_index = true;
             LOG_ERROR(Render_D3D12, "Quad index expansion not implemented yet (topology={})",
                       static_cast<u32>(topology));
         }
+        supported = false;
     }
     DXGI_FORMAT dxgi_format = DXGI_FORMAT_R32_UINT;
     switch (index_format) {
@@ -332,6 +334,9 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
             logged_u8_index = true;
             LOG_ERROR(Render_D3D12, "8-bit index expansion not implemented yet");
         }
+        // Recorded as R16 below would over-read the buffer; mark unsupported so the
+        // draw is skipped until the expansion pass exists.
+        supported = false;
         dxgi_format = DXGI_FORMAT_R16_UINT;
         break;
     case IndexFormat::UnsignedShort:
@@ -351,6 +356,7 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         .num_indices = num_indices,
         .format = dxgi_format,
         .valid = buffer != nullptr,
+        .supported = supported,
     };
 }
 

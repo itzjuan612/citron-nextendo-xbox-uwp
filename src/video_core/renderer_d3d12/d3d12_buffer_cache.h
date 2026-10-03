@@ -99,6 +99,7 @@ public:
         u32 num_indices{};
         DXGI_FORMAT format{DXGI_FORMAT_R32_UINT};
         bool valid{};
+        bool supported{true};
     };
 
     enum class BindingKind : u8 {
