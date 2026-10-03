@@ -679,6 +679,11 @@ void RasterizerD3D12::FlushCommands() {
     // and waits out the GPU before recycling the allocator, as CommandList requires.
     // Descriptor tables only live as long as the flushed work, so the per-draw heaps and
     // the sampler slot map reset here too.
+    static std::atomic<u32> flush_count{0};
+    const u32 flush_id = flush_count.fetch_add(1, std::memory_order_relaxed);
+    if (flush_id < 8) {
+        LOG_INFO(Render_D3D12, "FlushCommands#{} begin", flush_id);
+    }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_command_list.Execute(m_device);
     m_device.WaitForIdle();
@@ -686,6 +691,9 @@ void RasterizerD3D12::FlushCommands() {
     m_res_heap.Reset();
     m_sampler_heap.Reset();
     m_sampler_heap_indices.clear();
+    if (flush_id < 8) {
+        LOG_INFO(Render_D3D12, "FlushCommands#{} end", flush_id);
+    }
 }
 void RasterizerD3D12::TickFrame() {
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
