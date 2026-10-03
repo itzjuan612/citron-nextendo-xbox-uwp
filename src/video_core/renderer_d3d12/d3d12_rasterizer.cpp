@@ -83,7 +83,8 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     ConfigureDraw(is_indexed, *stored, instance_count);
-    m_gpu.TickWork();
+    // NOTE: no m_gpu.TickWork() here. The GPU worker ticks independently, and TickWork
+    // from inside Draw hung the boot on console right after the first draw (TBD why).
 }
 namespace {
 
