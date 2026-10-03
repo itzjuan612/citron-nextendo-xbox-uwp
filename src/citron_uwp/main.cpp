@@ -179,6 +179,15 @@ public:
                 window_.Activate();
             }
         });
+        // Lifecycle markers: distinguish an OS suspend/resume from a silent kill.
+        CoreApplication::Suspending([](IInspectable const&,
+                                       Windows::ApplicationModel::SuspendingEventArgs const&) {
+            LOG_INFO(Frontend, "OS suspending the app");
+            Common::Log::Stop();
+        });
+        CoreApplication::Resuming([](IInspectable const&, IInspectable const&) {
+            LOG_INFO(Frontend, "OS resuming the app");
+        });
     }
 
     void SetWindow(CoreWindow const& window) {
@@ -283,6 +292,21 @@ public:
         } catch (const hresult_error& e) {
             LOG_ERROR(Frontend, "Failed to resolve LocalFolder: {}", winrt::to_string(e.message()));
         }
+
+        // Temporary heartbeat: proves whether the process is alive-but-quiet or dead.
+        // Remove once the first-draw freeze is root-caused.
+        const ULONGLONG start_tick = GetTickCount64();
+        std::thread heartbeat_thread([this, start_tick] {
+            while (!closed_) {
+                Sleep(15000);
+                if (closed_) {
+                    break;
+                }
+                const ULONGLONG uptime = (GetTickCount64() - start_tick) / 1000;
+                LOG_INFO(Frontend, "Heartbeat T+{}s", uptime);
+            }
+        });
+        heartbeat_thread.detach();
 
         while (!closed_) {
             window_.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
