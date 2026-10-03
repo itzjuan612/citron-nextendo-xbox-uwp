@@ -184,6 +184,7 @@ struct BufferCacheParams {
     static constexpr bool USE_MEMORY_MAPS = true;
     static constexpr bool SEPARATE_IMAGE_BUFFER_BINDINGS = false;
     static constexpr bool USE_MEMORY_MAPS_FOR_UPLOADS = true;
+    static constexpr bool NEEDS_INDEX_FORMAT_EXPANSION = false;
 };
 
 using BufferCache = VideoCommon::BufferCache<BufferCacheParams>;

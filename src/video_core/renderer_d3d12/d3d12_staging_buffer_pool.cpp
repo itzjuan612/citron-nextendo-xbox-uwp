@@ -40,6 +40,12 @@ StagingBufferRef StagingBufferPool::Request(u64 size, StagingUsage usage, bool d
         chosen = &CreateEntry(size_class, usage);
         chosen_index = entries.size() - 1;
     }
+    if (!chosen->resource || chosen->mapped_span.size() < size) {
+        // Allocation failed (memory pressure) or the entry is short: hand back an empty
+        // ref so callers can no-op instead of dereferencing a null mapping.
+        chosen->in_use = false;
+        return StagingBufferRef{};
+    }
     chosen->in_use = true;
     chosen->deferred = deferred;
     chosen->last_used_tick = tick;

@@ -92,6 +92,10 @@ public:
 
     static constexpr u32 MAX_VERTEX_BUFFERS = 32;
 
+    /// Size of the shared null buffer. Copies into/out of it are dropped and
+    /// views clamped, so it only exists to keep unbound bindings non-fatal.
+    static constexpr u64 NULL_BUFFER_SIZE = 64 * 1024;
+
     struct IndexBinding {
         D3D12_GPU_VIRTUAL_ADDRESS address{};
         u32 size{};
@@ -204,6 +208,16 @@ public:
         return max_vertex_slot;
     }
 
+    /// True when the resource is the shared null buffer (unbound binding).
+    [[nodiscard]] bool IsNullResource(ID3D12Resource* resource) const noexcept {
+        return resource == nullptr || resource == null_buffer.Get();
+    }
+
+    /// GPU address of the shared null buffer (zero-filled, safe to read).
+    [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS NullBufferGpuAddr() const noexcept {
+        return null_buffer ? null_buffer->GetGPUVirtualAddress() : D3D12_GPU_VIRTUAL_ADDRESS{0};
+    }
+
     void ClearDrawBindings() noexcept;
 
 private:
@@ -243,6 +257,7 @@ struct BufferCacheParams {
     static constexpr bool USE_MEMORY_MAPS = true;
     static constexpr bool SEPARATE_IMAGE_BUFFER_BINDINGS = false;
     static constexpr bool USE_MEMORY_MAPS_FOR_UPLOADS = true;
+    static constexpr bool NEEDS_INDEX_FORMAT_EXPANSION = true;
 };
 
 using BufferCache = VideoCommon::BufferCache<BufferCacheParams>;

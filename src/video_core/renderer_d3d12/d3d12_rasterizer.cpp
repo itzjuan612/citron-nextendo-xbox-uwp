@@ -38,11 +38,29 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
       m_query_cache{gpu, *this, device_memory, m_query_runtime},
       m_pipeline_cache{device_memory, device, shader_compiler},
       m_res_heap{device.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, true},
-      m_sampler_heap{device.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 64, true},
+      m_sampler_heap{device.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1024, true},
       m_accelerate_dma{m_buffer_cache} {
     // CommandList is created closed; open it for recording. FlushCommands re-opens it
     // after each execute, so every record goes to a live list.
     m_command_list.Reset();
+    // DEFAULT-heap scratch for unaligned uniform realigns (see CBV_SCRATCH_SIZE).
+    D3D12_HEAP_PROPERTIES scratch_heap{};
+    scratch_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    scratch_heap.CreationNodeMask = 1;
+    scratch_heap.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC scratch_desc{};
+    scratch_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    scratch_desc.Width = CBV_SCRATCH_SIZE;
+    scratch_desc.Height = 1;
+    scratch_desc.DepthOrArraySize = 1;
+    scratch_desc.MipLevels = 1;
+    scratch_desc.SampleDesc.Count = 1;
+    scratch_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(device.GetDevice()->CreateCommittedResource(
+            &scratch_heap, D3D12_HEAP_FLAG_NONE, &scratch_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&m_cbv_scratch)))) {
+        LOG_ERROR(Render_D3D12, "CBV scratch creation failed");
+    }
     // Zero page for unbound push-constant / runtime-data root CBVs.
     D3D12_HEAP_PROPERTIES zero_heap{};
     zero_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -74,12 +92,6 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     PipelineCache::StoredPipeline* stored = m_pipeline_cache.CurrentStoredPipeline();
     if (!stored || !stored->pipeline || !stored->pipeline->IsValid()) {
         return;
-    }
-    static std::atomic<u32> draw_count{0};
-    const u32 draw_id = draw_count.fetch_add(1, std::memory_order_relaxed);
-    if (draw_id < 16) {
-        LOG_INFO(Render_D3D12, "Draw#{} indexed={} instances={}", draw_id, is_indexed,
-                 instance_count);
     }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     ConfigureDraw(is_indexed, *stored, instance_count);
@@ -210,10 +222,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     const auto& regs = maxwell3d->regs;
 
     m_runtime.ClearDrawBindings();
-    m_buffer_cache.UpdateGraphicsBuffers(is_indexed);
-    m_buffer_cache.BindHostGeometryBuffers(is_indexed);
-    m_texture_cache.SynchronizeGraphicsDescriptors();
-
+    // The enabled-uniform/storage masks must be registered BEFORE UpdateGraphicsBuffers
+    // resolves binding buffer ids (matching vk's Configure: SetUniformBuffersState, then
+    // UpdateGraphicsBuffers). With the old order the first draw resolved nothing and the
+    // bind step dereferenced slot_buffers[BufferId{}] (an invalid slot id) — the silent
+    // wedge behind the first-draw freeze; later draws only recovered because the masks
+    // leaked in from the previous call.
     std::array<u32, VideoCommon::NUM_STAGES> masks{};
     VideoCommon::UniformBufferSizes sizes{};
     for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
@@ -225,20 +239,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         sizes[stage] = info->constant_buffer_used_sizes;
     }
     m_buffer_cache.SetUniformBuffersState(masks, &sizes);
-
-    struct SampledSlot {
-        VideoCommon::ImageViewId view{};
-        VideoCommon::SamplerId sampler{};
-    };
-    std::array<std::vector<SampledSlot>, VideoCommon::NUM_STAGES> sampled_slots;
-    std::array<std::pair<size_t, size_t>, VideoCommon::NUM_STAGES> res_ranges{};
-    const bool via_header = regs.sampler_binding ==
-                            Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
     for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
         const Shader::Info* info = stored.infos[stage];
-        res_ranges[stage].first = m_runtime.GetResourceBindings().size();
         if (!info) {
-            res_ranges[stage].second = res_ranges[stage].first;
             continue;
         }
         m_buffer_cache.UnbindGraphicsStorageBuffers(stage);
@@ -249,17 +252,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                      desc.cbuf_offset, desc.is_written);
             ++ssbo_index;
         }
+    }
+    m_buffer_cache.UpdateGraphicsBuffers(is_indexed);
+    m_buffer_cache.BindHostGeometryBuffers(is_indexed);
+    m_texture_cache.SynchronizeGraphicsDescriptors();
+
+    // Descriptor slots in shader-register order. The shader_recompiler SPIR-V backend
+    // allocates set-0 CBV bindings and set-1 SRV/UAV/sampler bindings from counters
+    // that accumulate across the pipeline's stages (per stage: SSBO -> texture buffer
+    // -> image buffer -> sampled texture -> image), and Mesa maps those to DXIL
+    // space 0/1 registers with sampled images split into SRV tN + sampler sN. The
+    // tables are therefore filled by global binding index: CBVs at heap [0, num_cbv),
+    // SRVs at [num_cbv, +num_res), UAVs at [num_cbv + num_res, +num_res), samplers at
+    // [0, num_res) of the sampler heap. Every table position gets a valid descriptor
+    // (null descriptors / default sampler where a slot has no host binding yet).
+    enum class SlotKind : u8 {
+        Storage,     // SSBO: SRV when read-only, UAV when written
+        TexelBuffer, // texture buffer (null placeholder for now)
+        ImageBuffer, // image buffer (null placeholder for now)
+        Sampled,     // sampled texture from the TIC walk
+        Image,       // storage image (null placeholder for now)
+    };
+    struct DrawSlot {
+        SlotKind kind{};
+        bool is_written{};
+        u32 record{};                     // index into GetResourceBindings()
+        VideoCommon::ImageViewId view{};  // Sampled
+        VideoCommon::SamplerId sampler{}; // Sampled
+    };
+    std::vector<u32> cbv_records;    // global CBV binding -> record index
+    std::vector<DrawSlot> res_slots; // global set-1 binding -> slot
+    const bool via_header = regs.sampler_binding ==
+                            Tegra::Engines::Maxwell3D::Regs::SamplerBinding::ViaHeaderBinding;
+    for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
+        const Shader::Info* info = stored.infos[stage];
+        if (!info) {
+            continue;
+        }
         // Texel/image/image-buffer descriptors have no host path yet; keep null slots so
         // the table order still matches the shader's binding allocation.
-        const u32 skipped =
-            Shader::NumDescriptors(info->texture_buffer_descriptors) +
-            Shader::NumDescriptors(info->image_buffer_descriptors) +
-            Shader::NumDescriptors(info->image_descriptors);
-        for (u32 i = 0; i < skipped; ++i) {
-            sampled_slots[stage].push_back(
-                SampledSlot{VideoCommon::NULL_IMAGE_VIEW_ID, VideoCommon::NULL_SAMPLER_ID});
-        }
-        if (skipped != 0 && !logged_texel_buffers) {
+        const u32 texel_count = Shader::NumDescriptors(info->texture_buffer_descriptors);
+        if ((texel_count != 0 || !info->image_buffer_descriptors.empty() ||
+             !info->image_descriptors.empty()) &&
+            !logged_texel_buffers) {
             logged_texel_buffers = true;
             LOG_ERROR(Render_D3D12, "Texel/image-buffer/image bindings bind as null for now");
         }
@@ -292,13 +327,54 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         m_texture_cache.FillGraphicsImageViews<false>(
             std::span(views.data(), views.size()));
-        for (size_t i = 0; i < views.size(); ++i) {
-            sampled_slots[stage].push_back(SampledSlot{views[i].id, sampler_ids[i]});
-        }
+        const size_t rec_begin = m_runtime.GetResourceBindings().size();
         m_buffer_cache.BindHostStageBuffers(stage);
-        res_ranges[stage].second = m_runtime.GetResourceBindings().size();
+        const auto& records = m_runtime.GetResourceBindings();
+        std::vector<u32> texel_records;
+        for (size_t i = rec_begin; i < records.size(); ++i) {
+            const auto& record = records[i];
+            if (record.kind == BufferCacheRuntime::BindingKind::Uniform) {
+                cbv_records.push_back(static_cast<u32>(i));
+            } else if (record.kind == BufferCacheRuntime::BindingKind::Storage) {
+                res_slots.push_back(DrawSlot{
+                    .kind = SlotKind::Storage,
+                    .is_written = record.is_written,
+                    .record = static_cast<u32>(i),
+                });
+            } else {
+                texel_records.push_back(static_cast<u32>(i));
+            }
+        }
+        for (u32 i = 0; i < texel_count; ++i) {
+            res_slots.push_back(DrawSlot{
+                .kind = SlotKind::TexelBuffer,
+                .record = i < texel_records.size() ? texel_records[i] : ~u32{0},
+            });
+        }
+        for (const auto& desc : info->image_buffer_descriptors) {
+            for (u32 i = 0; i < desc.count; ++i) {
+                res_slots.push_back(DrawSlot{
+                    .kind = SlotKind::ImageBuffer,
+                    .is_written = desc.is_written,
+                });
+            }
+        }
+        for (size_t i = 0; i < views.size(); ++i) {
+            res_slots.push_back(DrawSlot{
+                .kind = SlotKind::Sampled,
+                .view = views[i].id,
+                .sampler = sampler_ids[i],
+            });
+        }
+        for (const auto& desc : info->image_descriptors) {
+            for (u32 i = 0; i < desc.count; ++i) {
+                res_slots.push_back(DrawSlot{
+                    .kind = SlotKind::Image,
+                    .is_written = desc.is_written,
+                });
+            }
+        }
     }
-
     m_texture_cache.UpdateRenderTargets(false);
     Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
 
@@ -326,6 +402,22 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
         return;
     }
+    for (size_t i = 0; i < num_rtvs; ++i) {
+        const auto format =
+            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
+        if (format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+        if (!view || !view->RenderTarget().ptr) {
+            // OMSetRenderTargets with a null RTV handle is a device-removing error.
+            if (!logged_rt_hole) {
+                logged_rt_hole = true;
+                LOG_ERROR(Render_D3D12, "Draw with unbound render target slot {} skipped", i);
+            }
+            return;
+        }
+    }
 
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
     m_command_list.SetPipelineState(pipeline->Get());
@@ -334,135 +426,181 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 
     const RootSignature& root_sig = pipeline->GetRootSignature();
     const auto& bindings = m_runtime.GetResourceBindings();
-    u32 cbv_count = 0, srv_count = 0, uav_count = 0, sampler_count = 0;
-    u32 sampler_table_start = DescriptorHeap::INVALID_INDEX;
-    for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
-        for (size_t i = res_ranges[stage].first; i < res_ranges[stage].second; ++i) {
-            const auto& record = bindings[i];
-            if (record.kind == BufferCacheRuntime::BindingKind::Uniform) {
-                D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
-                if ((address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) != 0) {
-                    // Root/table CBVs require 256-byte aligned addresses; copy the range
-                    // through staging.
-                    const u64 aligned_size =
-                        Common::AlignUp<u64>(record.size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
-                    StagingBufferRef staging =
-                        m_staging_pool.Request(aligned_size, StagingUsage::Upload);
-                    if (staging.buffer) {
-                        m_command_list.CopyBufferRegion(staging.buffer, staging.offset,
-                                                        record.resource, record.offset,
-                                                        record.size);
-                        address = staging.buffer->GetGPUVirtualAddress() + staging.offset;
-                    } else if (!logged_unaligned_uniform) {
-                        logged_unaligned_uniform = true;
-                        LOG_ERROR(Render_D3D12, "Unaligned uniform bind skipped");
-                        continue;
-                    } else {
-                        continue;
-                    }
-                }
-                const u32 slot = m_res_heap.Allocate();
-                if (slot == DescriptorHeap::INVALID_INDEX) {
-                    continue;
-                }
-                D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
-                cbv.BufferLocation = address;
-                cbv.SizeInBytes =
-                    static_cast<UINT>(Common::AlignUp<u64>(record.size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT));
-                m_device.GetDevice()->CreateConstantBufferView(
-                    &cbv, m_res_heap.CpuHandle(slot));
-                ++cbv_count;
-            } else if (record.kind == BufferCacheRuntime::BindingKind::Storage) {
-                if (!record.resource || (record.offset % 4) != 0 || record.size < 4) {
-                    continue;
-                }
-                const u32 slot = m_res_heap.Allocate();
-                if (slot == DescriptorHeap::INVALID_INDEX) {
-                    continue;
-                }
-                if (record.is_written) {
-                    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
-                    uav.Format = DXGI_FORMAT_R32_TYPELESS;
-                    uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
-                    uav.Buffer.FirstElement = record.offset / 4;
-                    uav.Buffer.NumElements =
-                        static_cast<UINT>((record.size / 4) == 0 ? 1 : record.size / 4);
-                    uav.Buffer.StructureByteStride = 0;
-                    uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
-                    m_device.GetDevice()->CreateUnorderedAccessView(
-                        record.resource, nullptr, &uav, m_res_heap.CpuHandle(slot));
-                    ++uav_count;
-                } else {
-                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                    srv.Format = DXGI_FORMAT_R32_TYPELESS;
-                    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                    srv.Buffer.FirstElement = record.offset / 4;
-                    srv.Buffer.NumElements =
-                        static_cast<UINT>((record.size / 4) == 0 ? 1 : record.size / 4);
-                    srv.Buffer.StructureByteStride = 0;
-                    srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
-                    m_device.GetDevice()->CreateShaderResourceView(
-                        record.resource, &srv, m_res_heap.CpuHandle(slot));
-                    ++srv_count;
-                }
-            }
+    const u32 num_cbv = static_cast<u32>(cbv_records.size());
+    const u32 num_res = static_cast<u32>(res_slots.size());
+    // Contiguous table regions: [0, num_cbv) CBV, [num_cbv, +num_res) SRV,
+    // [num_cbv + num_res, +num_res) UAV. The sampler table is [0, num_res).
+    const u32 heap_total = num_cbv + num_res * 2;
+    const u32 heap_base = heap_total != 0 ? m_res_heap.Allocate(heap_total) : 0;
+    const u32 sampler_base = num_res != 0 ? m_sampler_heap.Allocate(num_res) : 0;
+    if ((heap_total != 0 && heap_base == DescriptorHeap::INVALID_INDEX) ||
+        (num_res != 0 && sampler_base == DescriptorHeap::INVALID_INDEX)) {
+        if (!logged_heap_exhausted) {
+            logged_heap_exhausted = true;
+            LOG_ERROR(Render_D3D12, "Descriptor heap exhausted (cbv={} res={}); draw skipped",
+                      num_cbv, num_res);
         }
-        for (const SampledSlot& slot_info : sampled_slots[stage]) {
-            const u32 slot = m_res_heap.Allocate();
-            if (slot == DescriptorHeap::INVALID_INDEX) {
-                continue;
-            }
-            if (slot_info.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
-                D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
-                null_srv.Format = DXGI_FORMAT_R32_UINT;
-                null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
-                null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                null_srv.Buffer.FirstElement = 0;
-                null_srv.Buffer.NumElements = 1;
-                m_device.GetDevice()->CreateShaderResourceView(
-                    nullptr, &null_srv, m_res_heap.CpuHandle(slot));
+        return;
+    }
+    const u32 cbv_slot_base = heap_base;
+    const u32 srv_slot_base = heap_base + num_cbv;
+    const u32 uav_slot_base = heap_base + num_cbv + num_res;
+    ID3D12Device* const d3d = m_device.GetDevice();
+
+    for (u32 slot = 0; slot < num_cbv; ++slot) {
+        const auto& record = bindings[cbv_records[slot]];
+        D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
+        u64 cbv_size = record.size != 0 ? record.size : u64{256};
+        if (m_runtime.IsNullResource(record.resource) || record.size == 0) {
+            // Unbound/disabled uniform: read zeros.
+            address = m_zero_address;
+            cbv_size = 256;
+        } else if ((address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) != 0) {
+            // Root/table CBVs require 256-byte aligned addresses; copy the range into
+            // the aligned DEFAULT-heap scratch. (The old UPLOAD staging target was
+            // illegal: UPLOAD heap can never be a copy destination.)
+            const u64 aligned_size =
+                Common::AlignUp<u64>(record.size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            const u64 scratch_offset =
+                Common::AlignUp<u64>(m_cbv_scratch_used,
+                                     D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            if (!m_cbv_scratch || scratch_offset + aligned_size > CBV_SCRATCH_SIZE) {
+                if (!logged_unaligned_uniform) {
+                    logged_unaligned_uniform = true;
+                    LOG_ERROR(Render_D3D12, "CBV scratch exhausted; uniform reads as zero");
+                }
+                address = m_zero_address;
+                cbv_size = 256;
             } else {
-                ImageView& view = m_texture_cache.GetImageView(slot_info.view);
-                m_device.GetDevice()->CopyDescriptorsSimple(
-                    1, m_res_heap.CpuHandle(slot), view.Sampled(),
-                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-            }
-            ++srv_count;
-            if (slot_info.sampler != VideoCommon::NULL_SAMPLER_ID) {
-                // The sampler heap deduplicates identical samplers, so table slots are
-                // filled by copying into a dedicated contiguous range.
-                const u32 heap_slot = SamplerHeapIndex(slot_info.sampler);
-                const u32 table_slot = m_sampler_heap.Allocate();
-                if (table_slot == DescriptorHeap::INVALID_INDEX) {
-                    continue;
-                }
-                if (sampler_table_start == DescriptorHeap::INVALID_INDEX) {
-                    sampler_table_start = table_slot;
-                }
-                m_device.GetDevice()->CopyDescriptorsSimple(
-                    1, m_sampler_heap.CpuHandle(table_slot),
-                    m_sampler_heap.CpuHandle(heap_slot), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
-                ++sampler_count;
+                const std::array copies{VideoCommon::BufferCopy{
+                    .src_offset = record.offset,
+                    .dst_offset = scratch_offset,
+                    .size = record.size,
+                }};
+                m_runtime.CopyBuffer(m_cbv_scratch.Get(), record.resource, copies, true);
+                address = m_cbv_scratch->GetGPUVirtualAddress() + scratch_offset;
+                m_cbv_scratch_used = scratch_offset + aligned_size;
             }
         }
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+        cbv.BufferLocation = address;
+        cbv.SizeInBytes = static_cast<UINT>(Common::AlignUp<u64>(
+            std::min<u64>(cbv_size, 64 * 1024), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT));
+        d3d->CreateConstantBufferView(&cbv, m_res_heap.CpuHandle(cbv_slot_base + slot));
     }
-    if (cbv_count > 0 && root_sig.GetCbvTableIndex() != RootSignature::INVALID_PARAMETER) {
+
+    for (u32 k = 0; k < num_res; ++k) {
+        const DrawSlot& slot = res_slots[k];
+        ID3D12Resource* resource = nullptr;
+        u64 offset = 0;
+        u64 size = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE prebuilt{};
+        bool have_prebuilt = false;
+        bool want_uav = false;
+        switch (slot.kind) {
+        case SlotKind::Storage: {
+            const auto& record = bindings[slot.record];
+            if (!m_runtime.IsNullResource(record.resource) && (record.offset % 4) == 0 &&
+                record.size >= 4) {
+                resource = record.resource;
+                offset = record.offset;
+                size = record.size;
+            }
+            want_uav = slot.is_written;
+            break;
+        }
+        case SlotKind::TexelBuffer:
+            if (slot.record < bindings.size() && slot.record != ~u32{0} &&
+                bindings[slot.record].kind == BufferCacheRuntime::BindingKind::Texel &&
+                bindings[slot.record].view.ptr != 0) {
+                prebuilt = bindings[slot.record].view;
+                have_prebuilt = true;
+            }
+            break;
+        case SlotKind::ImageBuffer:
+        case SlotKind::Image:
+            // No host path yet: null descriptors below.
+            want_uav = slot.is_written;
+            break;
+        case SlotKind::Sampled:
+            if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                prebuilt = m_texture_cache.GetImageView(slot.view).Sampled();
+                have_prebuilt = prebuilt.ptr != 0;
+            }
+            break;
+        }
+        if (have_prebuilt) {
+            d3d->CopyDescriptorsSimple(1, m_res_heap.CpuHandle(srv_slot_base + k), prebuilt,
+                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else if (resource) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.FirstElement = offset / 4;
+            srv.Buffer.NumElements = static_cast<UINT>(std::max<u64>(size / 4, 1));
+            srv.Buffer.StructureByteStride = 0;
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            d3d->CreateShaderResourceView(resource, &srv, m_res_heap.CpuHandle(srv_slot_base + k));
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
+            null_srv.Format = DXGI_FORMAT_R32_UINT;
+            null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            null_srv.Buffer.FirstElement = 0;
+            null_srv.Buffer.NumElements = 1;
+            d3d->CreateShaderResourceView(nullptr, &null_srv, m_res_heap.CpuHandle(srv_slot_base + k));
+        }
+        if (want_uav && resource) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer.FirstElement = offset / 4;
+            uav.Buffer.NumElements = static_cast<UINT>(std::max<u64>(size / 4, 1));
+            uav.Buffer.StructureByteStride = 0;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            d3d->CreateUnorderedAccessView(resource, nullptr, &uav,
+                                           m_res_heap.CpuHandle(uav_slot_base + k));
+        } else {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
+            null_uav.Format = DXGI_FORMAT_R32_UINT;
+            null_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            null_uav.Buffer.FirstElement = 0;
+            null_uav.Buffer.NumElements = 1;
+            d3d->CreateUnorderedAccessView(nullptr, nullptr, &null_uav,
+                                           m_res_heap.CpuHandle(uav_slot_base + k));
+        }
+        // Samplers: one per set-1 binding so sN always pairs with tN. Unbound
+        // textures and non-texture slots get a default sampler instead of leaving
+        // garbage in the table.
+        if (slot.kind == SlotKind::Sampled && slot.sampler != VideoCommon::NULL_SAMPLER_ID) {
+            const Sampler& sampler = m_texture_cache.GetSampler(slot.sampler);
+            d3d->CreateSampler(&sampler.Desc(), m_sampler_heap.CpuHandle(sampler_base + k));
+        } else {
+            D3D12_SAMPLER_DESC default_sampler{};
+            default_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            default_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            default_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            default_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            default_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            d3d->CreateSampler(&default_sampler, m_sampler_heap.CpuHandle(sampler_base + k));
+        }
+    }
+    if (num_cbv > 0 && root_sig.GetCbvTableIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootDescriptorTable(root_sig.GetCbvTableIndex(),
-                                                      m_res_heap.GpuHandle(0));
+                                                      m_res_heap.GpuHandle(cbv_slot_base));
     }
-    if (srv_count > 0 && root_sig.GetSrvTableIndex() != RootSignature::INVALID_PARAMETER) {
-        // SRV table starts after the CBV range in the shared heap.
+    if (num_res > 0 && root_sig.GetSrvTableIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootDescriptorTable(root_sig.GetSrvTableIndex(),
-                                                      m_res_heap.GpuHandle(cbv_count));
+                                                      m_res_heap.GpuHandle(srv_slot_base));
     }
-    if (uav_count > 0 && root_sig.GetUavTableIndex() != RootSignature::INVALID_PARAMETER) {
+    if (num_res > 0 && root_sig.GetUavTableIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootDescriptorTable(root_sig.GetUavTableIndex(),
-                                                      m_res_heap.GpuHandle(cbv_count + srv_count));
+                                                      m_res_heap.GpuHandle(uav_slot_base));
     }
-    if (sampler_count > 0 && root_sig.GetSamplerTableIndex() != RootSignature::INVALID_PARAMETER) {
+    if (num_res > 0 && root_sig.GetSamplerTableIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootDescriptorTable(root_sig.GetSamplerTableIndex(),
-                                                      m_sampler_heap.GpuHandle(sampler_table_start));
+                                                      m_sampler_heap.GpuHandle(sampler_base));
     }
     if (root_sig.GetPushConstantIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootConstantBufferView(root_sig.GetPushConstantIndex(),
@@ -473,22 +611,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                          m_zero_address);
     }
 
-    // Render targets from the texture cache's current framebuffer.
+    // Render targets from the texture cache's current framebuffer. Transitions are
+    // deduplicated: one resource may back several slots and a second COMMON->RT
+    // barrier on it would claim the wrong before-state.
     D3D12_CPU_DESCRIPTOR_HANDLE rtvs[VideoCommon::NUM_RT]{};
+    std::array<ID3D12Resource*, VideoCommon::NUM_RT + 1> rt_resources{};
+    std::array<D3D12_RESOURCE_STATES, VideoCommon::NUM_RT + 1> rt_states{};
+    u32 rt_resource_count = 0;
+    const auto transition_rt = [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES state) {
+        if (!resource) {
+            return;
+        }
+        for (u32 i = 0; i < rt_resource_count; ++i) {
+            if (rt_resources[i] == resource) {
+                return;
+            }
+        }
+        rt_resources[rt_resource_count] = resource;
+        rt_states[rt_resource_count] = state;
+        ++rt_resource_count;
+        m_command_list.Transition(resource, D3D12_RESOURCE_STATE_COMMON, state);
+    };
     for (size_t i = 0; i < num_rtvs; ++i) {
         ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
         rtvs[i] = view ? view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
-        if (view && view->Resource()) {
-            m_command_list.Transition(view->Resource(), D3D12_RESOURCE_STATE_COMMON,
-                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
-        }
+        transition_rt(view ? view->Resource() : nullptr, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
         depth_view ? depth_view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
-    if (depth_view && depth_view->Resource()) {
-        m_command_list.Transition(depth_view->Resource(), D3D12_RESOURCE_STATE_COMMON,
-                                  D3D12_RESOURCE_STATE_DEPTH_WRITE);
-    }
+    transition_rt(depth_view ? depth_view->Resource() : nullptr,
+                  D3D12_RESOURCE_STATE_DEPTH_WRITE);
     if (num_rtvs > 0 || dsv.ptr != 0) {
         m_command_list.Get()->OMSetRenderTargets(num_rtvs, num_rtvs > 0 ? rtvs : nullptr,
                                                  FALSE, dsv.ptr != 0 ? &dsv : nullptr);
@@ -532,33 +684,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     }
 
     // Restore render targets to the home state for later copies/blits.
-    for (size_t i = 0; i < num_rtvs; ++i) {
-        ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
-        if (view && view->Resource()) {
-            m_command_list.Transition(view->Resource(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                      D3D12_RESOURCE_STATE_COMMON);
-        }
-    }
-    if (depth_view && depth_view->Resource()) {
-        m_command_list.Transition(depth_view->Resource(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
-                                  D3D12_RESOURCE_STATE_COMMON);
+    for (u32 i = 0; i < rt_resource_count; ++i) {
+        m_command_list.Transition(rt_resources[i], rt_states[i], D3D12_RESOURCE_STATE_COMMON);
     }
 }
 
-u32 RasterizerD3D12::SamplerHeapIndex(VideoCommon::SamplerId sampler_id) {
-    const auto it = m_sampler_heap_indices.find(sampler_id.index);
-    if (it != m_sampler_heap_indices.end()) {
-        return it->second;
-    }
-    const u32 slot = m_sampler_heap.Allocate();
-    if (slot == DescriptorHeap::INVALID_INDEX) {
-        return 0;
-    }
-    const Sampler& sampler = m_texture_cache.GetSampler(sampler_id);
-    m_device.GetDevice()->CreateSampler(&sampler.Desc(), m_sampler_heap.CpuHandle(slot));
-    m_sampler_heap_indices[sampler_id.index] = slot;
-    return slot;
-}
 void RasterizerD3D12::DrawTexture() {}
 void RasterizerD3D12::Clear(u32 layer_count) {}
 void RasterizerD3D12::DispatchCompute() {}
@@ -679,22 +809,14 @@ void RasterizerD3D12::FlushCommands() {
     // Serializes with the cache's recorders (the DMA pusher calls this from channel threads)
     // and waits out the GPU before recycling the allocator, as CommandList requires.
     // Descriptor tables only live as long as the flushed work, so the per-draw heaps and
-    // the sampler slot map reset here too.
-    static std::atomic<u32> flush_count{0};
-    const u32 flush_id = flush_count.fetch_add(1, std::memory_order_relaxed);
-    if (flush_id < 8) {
-        LOG_INFO(Render_D3D12, "FlushCommands#{} begin", flush_id);
-    }
+    // the CBV scratch ring reset here too.
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_command_list.Execute(m_device);
     m_device.WaitForIdle();
     m_command_list.Reset();
     m_res_heap.Reset();
     m_sampler_heap.Reset();
-    m_sampler_heap_indices.clear();
-    if (flush_id < 8) {
-        LOG_INFO(Render_D3D12, "FlushCommands#{} end", flush_id);
-    }
+    m_cbv_scratch_used = 0;
 }
 void RasterizerD3D12::TickFrame() {
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};

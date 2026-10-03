@@ -446,7 +446,13 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
     if (rows == 0 || copy.image_extent.width == 0 || copy.image_extent.depth == 0) {
         return;
     }
+    const u32 layers = std::max<u32>(copy.image_subresource.num_layers, 1);
+    const u64 layer_src_stride = copy.buffer_size / layers;
 
+    // The guest buffer holds only the copy region (Vulkan layout: `rows` rows of
+    // `src_pitch` per layer). Model it as a placed footprint of exactly the copy
+    // extent and map image_offset onto the destination coordinates — a footprint
+    // spanning the whole mip would read past the guest rows for sub-region copies.
     u64 copy_src_pitch = src_pitch;
     D3D12_TEXTURE_COPY_LOCATION src{};
     src.pResource = src_buffer;
@@ -458,15 +464,20 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         if (staging_span.empty()) {
             return;
         }
-        const u64 padded_size = canonical_pitch * rows;
+        const u64 padded_size = canonical_pitch * rows * layers;
         repack = runtime->staging_pool.Request(padded_size, StagingUsage::Upload);
         if (!repack.buffer || repack.mapped_span.size() < padded_size) {
             return;
         }
-        for (u32 r = 0; r < rows; ++r) {
-            const u8* src_row = staging_span.data() + src_offset + static_cast<u64>(r) * src_pitch;
-            u8* dst_row = repack.mapped_span.data() + static_cast<u64>(r) * canonical_pitch;
-            std::memcpy(dst_row, src_row, tight_pitch);
+        for (u32 l = 0; l < layers; ++l) {
+            for (u32 r = 0; r < rows; ++r) {
+                const u8* src_row = staging_span.data() + src_offset +
+                                    static_cast<u64>(l) * layer_src_stride +
+                                    static_cast<u64>(r) * src_pitch;
+                u8* dst_row = repack.mapped_span.data() +
+                              (static_cast<u64>(l) * rows + r) * canonical_pitch;
+                std::memcpy(dst_row, src_row, tight_pitch);
+            }
         }
         src.pResource = repack.buffer;
         src.PlacedFootprint.Offset = repack.offset;
@@ -475,10 +486,11 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         src.PlacedFootprint.Offset = src_offset;
     }
     src.PlacedFootprint.Footprint = footprint.Footprint;
+    src.PlacedFootprint.Footprint.Width = copy.image_extent.width;
+    src.PlacedFootprint.Footprint.Height = copy.image_extent.height;
+    src.PlacedFootprint.Footprint.Depth = copy.image_extent.depth;
     src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(copy_src_pitch);
 
-    const u32 layers = static_cast<u32>(copy.image_subresource.num_layers);
-    const u64 layer_src_stride = copy.buffer_size / (layers == 0 ? 1 : layers);
     for (u32 l = 0; l < layers; ++l) {
         const u32 layer = static_cast<u32>(copy.image_subresource.base_layer) + l;
         const u32 layer_sub =
@@ -488,12 +500,12 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst.SubresourceIndex = layer_sub;
         D3D12_BOX box{};
-        box.left = static_cast<UINT>(copy.image_offset.x);
-        box.top = static_cast<UINT>(copy.image_offset.y);
-        box.front = static_cast<UINT>(copy.image_offset.z);
-        box.right = box.left + copy.image_extent.width;
-        box.bottom = box.top + copy.image_extent.height;
-        box.back = box.front + (copy.image_extent.depth == 0 ? 1 : copy.image_extent.depth);
+        box.left = 0;
+        box.top = 0;
+        box.front = 0;
+        box.right = copy.image_extent.width;
+        box.bottom = copy.image_extent.height;
+        box.back = copy.image_extent.depth;
         D3D12_TEXTURE_COPY_LOCATION layer_src = src;
         if (!repack.buffer) {
             layer_src.PlacedFootprint.Offset = src.PlacedFootprint.Offset + l * layer_src_stride;
@@ -501,7 +513,9 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
             layer_src.PlacedFootprint.Offset =
                 repack.offset + static_cast<u64>(l) * canonical_pitch * rows;
         }
-        runtime->command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &layer_src, &box);
+        runtime->command_list.Get()->CopyTextureRegion(
+            &dst, static_cast<UINT>(copy.image_offset.x), static_cast<UINT>(copy.image_offset.y),
+            static_cast<UINT>(copy.image_offset.z), &layer_src, &box);
     }
 }
 
@@ -531,11 +545,13 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         copy.buffer_row_length != 0 ? static_cast<u64>(copy.buffer_row_length) * elem_bytes
                                     : tight_pitch;
     const u64 canonical_pitch = footprint.Footprint.RowPitch;
-    const u32 layers = static_cast<u32>(copy.image_subresource.num_layers);
+    const u32 layers = std::max<u32>(copy.image_subresource.num_layers, 1);
     if (rows == 0 || copy.image_extent.width == 0 || copy.image_extent.depth == 0) {
         return;
     }
 
+    // The destination footprint describes only the copy region (the guest expects
+    // `rows` rows of `src_pitch` per layer), matching the upload path.
     StagingBufferRef repack{};
     D3D12_TEXTURE_COPY_LOCATION gpu_dst{};
     u64 layer_dst_stride = 0;
@@ -545,7 +561,7 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         if (staging_span.empty()) {
             return;
         }
-        const u64 padded_size = canonical_pitch * rows * (layers == 0 ? 1 : layers);
+        const u64 padded_size = canonical_pitch * rows * layers;
         repack = runtime->staging_pool.Request(padded_size, StagingUsage::Download);
         if (!repack.buffer || repack.mapped_span.size() < padded_size) {
             return;
@@ -560,9 +576,13 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         gpu_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         gpu_dst.PlacedFootprint.Offset = dst_offset;
         gpu_dst.PlacedFootprint.Footprint = footprint.Footprint;
-        gpu_dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(src_pitch);
-        layer_dst_stride = (copy.buffer_size / (layers == 0 ? 1 : layers));
+        layer_dst_stride = copy.buffer_size / layers;
     }
+    gpu_dst.PlacedFootprint.Footprint.Width = copy.image_extent.width;
+    gpu_dst.PlacedFootprint.Footprint.Height = copy.image_extent.height;
+    gpu_dst.PlacedFootprint.Footprint.Depth = copy.image_extent.depth;
+    gpu_dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(
+        src_pitch != canonical_pitch ? canonical_pitch : src_pitch);
 
     for (u32 l = 0; l < layers; ++l) {
         const u32 layer = static_cast<u32>(copy.image_subresource.base_layer) + l;

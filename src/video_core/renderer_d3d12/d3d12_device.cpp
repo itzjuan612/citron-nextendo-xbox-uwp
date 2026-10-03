@@ -92,6 +92,11 @@ void Device::WaitForIdle() {
     if (!queue || !fence) {
         return;
     }
+    // Serialize: `queue->Signal` values must increase monotonically and the shared
+    // `fence_event` may only have one SetEventOnCompletion registration at a time.
+    // Without this, concurrent waiters (channel threads flushing + the GPU thread
+    // compositing) can issue non-monotonic signals or strand a waiter forever.
+    std::scoped_lock lock{idle_mutex};
     const UINT64 value = ++fence_value;
     if (FAILED(queue->Signal(fence.Get(), value))) {
         return;

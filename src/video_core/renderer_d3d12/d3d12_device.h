@@ -7,6 +7,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 
+#include <mutex>
 #include <string>
 
 namespace D3D12 {
@@ -47,6 +48,9 @@ public:
     }
 
     /// Blocks until the GPU has finished the currently submitted work.
+    /// Thread-safe: concurrent waiters serialize on `idle_mutex` so the shared
+    /// fence always receives monotonically increasing signals and only one
+    /// waiter is registered on `fence_event` at a time.
     void WaitForIdle();
 
 private:
@@ -55,6 +59,7 @@ private:
     ComPtr<ID3D12Device> device;
     ComPtr<ID3D12CommandQueue> queue;
     ComPtr<ID3D12Fence> fence;
+    std::mutex idle_mutex;
     UINT64 fence_value{};
     HANDLE fence_event{};
     D3D_FEATURE_LEVEL feature_level{D3D_FEATURE_LEVEL_11_0};

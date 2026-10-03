@@ -394,8 +394,10 @@ RootSignatureParams GraphicsPipeline::BuildRootSignatureParams(
         }
         params.num_cbv += Shader::NumDescriptors(info->constant_buffer_descriptors);
         params.num_resources += Shader::NumDescriptors(info->storage_buffers_descriptors);
-        params.num_resources += static_cast<u32>(info->texture_descriptors.size());
-        params.num_resources += static_cast<u32>(info->image_descriptors.size());
+        params.num_resources += Shader::NumDescriptors(info->texture_buffer_descriptors);
+        params.num_resources += Shader::NumDescriptors(info->image_buffer_descriptors);
+        params.num_resources += Shader::NumDescriptors(info->texture_descriptors);
+        params.num_resources += Shader::NumDescriptors(info->image_descriptors);
         params.needs_push_constants |= info->uses_render_area || info->uses_rescaling_uniform;
         params.needs_runtime_data |= needs_runtime_data[i];
     }

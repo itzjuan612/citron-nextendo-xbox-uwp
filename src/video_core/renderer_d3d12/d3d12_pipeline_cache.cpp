@@ -329,12 +329,6 @@ PipelineCache::StoredPipeline* PipelineCache::CurrentPipelineSlowPath() {
     if (it != cache.end()) {
         return it->second.get();
     }
-    static std::atomic<u64> slow_path_count{0};
-    const u64 slow_id = slow_path_count.fetch_add(1, std::memory_order_relaxed);
-    if (slow_id < 8) {
-        LOG_INFO(Render_D3D12, "Pipeline slow path#{} key={:016x}", slow_id,
-                 current_key.Hash());
-    }
     auto stored = CreatePipeline(current_key);
     if (!stored) {
         return nullptr;

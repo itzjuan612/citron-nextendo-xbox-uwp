@@ -692,6 +692,39 @@ void BufferCache<P>::BindHostIndexBuffer() {
     const u32 offset = buffer.Offset(channel_state->index_buffer.device_addr);
     const u32 size = channel_state->index_buffer.size;
     const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
+    if constexpr (NEEDS_INDEX_FORMAT_EXPANSION) {
+        // The host has no 8-bit index type: expand u8 indices to u16 in an upload
+        // staging buffer and bind that. `first`/`count` keep element semantics, so
+        // the expanded range covers elements [0, first + count).
+        if (draw_state.index_buffer.format ==
+                Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedByte &&
+            draw_state.inline_index_draw_indexes.empty() &&
+            draw_state.index_buffer.count != 0) {
+            const u32 elements =
+                draw_state.index_buffer.first + draw_state.index_buffer.count;
+            auto upload_staging = runtime.UploadStagingBuffer(
+                static_cast<size_t>(elements) * sizeof(u16));
+            if (upload_staging.buffer &&
+                upload_staging.mapped_span.size() >= static_cast<size_t>(elements) * sizeof(u16)) {
+                std::vector<u8> tmp(elements);
+                device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
+                                              tmp.data(), elements,
+                                              "BufferCache.BindHostIndexBuffer.u8expand");
+                u16* dst = reinterpret_cast<u16*>(upload_staging.mapped_span.data());
+                for (u32 i = 0; i < elements; ++i) {
+                    dst[i] = static_cast<u16>(tmp[i]);
+                }
+                buffer.MarkUsage(offset, size);
+                runtime.BindIndexBuffer(
+                    draw_state.topology,
+                    Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedShort,
+                    draw_state.index_buffer.first, draw_state.index_buffer.count,
+                    upload_staging.buffer, static_cast<u32>(upload_staging.offset),
+                    static_cast<u32>(static_cast<size_t>(elements) * sizeof(u16)));
+                return;
+            }
+        }
+    }
     if (!draw_state.inline_index_draw_indexes.empty()) [[unlikely]] {
         if constexpr (USE_MEMORY_MAPS_FOR_UPLOADS) {
             auto upload_staging = runtime.UploadStagingBuffer(size);
@@ -823,18 +856,21 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
-        const auto read_result = device_memory.ReadBlockUnsafe(
-            device_addr, span.data(), size, "BufferCache.BindMappedUniformBuffer", false);
-        if (!read_result.fully_mapped) {
-            static std::atomic<u64> mapping_hole_count{0};
-            const u64 count = mapping_hole_count.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (count <= 8 || (count % 256) == 0) {
-                LOG_WARNING(HW_Memory,
-                            "BufferCache mapped uniform contains unmapped pages: stage={} "
-                            "index={} binding_index={} buffer_id={} d_address=0x{:016X} size={} "
-                            "first_unmapped=0x{:016X} unmapped_bytes={} sample_count={}",
-                            stage, index, binding_index, binding.buffer_id.index, device_addr, size,
-                            read_result.first_unmapped_address, read_result.unmapped_bytes, count);
+        if (!span.empty()) {
+            const auto read_result = device_memory.ReadBlockUnsafe(
+                device_addr, span.data(), size, "BufferCache.BindMappedUniformBuffer", false);
+            if (!read_result.fully_mapped) {
+                static std::atomic<u64> mapping_hole_count{0};
+                const u64 count = mapping_hole_count.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (count <= 8 || (count % 256) == 0) {
+                    LOG_WARNING(HW_Memory,
+                                "BufferCache mapped uniform contains unmapped pages: stage={} "
+                                "index={} binding_index={} buffer_id={} d_address=0x{:016X} size={} "
+                                "first_unmapped=0x{:016X} unmapped_bytes={} sample_count={}",
+                                stage, index, binding_index, binding.buffer_id.index, device_addr,
+                                size, read_result.first_unmapped_address, read_result.unmapped_bytes,
+                                count);
+                }
             }
         }
         return;

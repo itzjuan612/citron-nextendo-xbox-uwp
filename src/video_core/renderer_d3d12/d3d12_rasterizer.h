@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <unordered_map>
-
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
@@ -109,7 +107,10 @@ public:
 private:
     /// Resolves TIC handles for one draw and fills the shader-visible descriptor tables.
     void ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeline& stored, u32 instance_count);
-    [[nodiscard]] u32 SamplerHeapIndex(VideoCommon::SamplerId sampler_id);
+
+    /// DEFAULT-heap ring used to realign unaligned uniform ranges for root/table CBVs
+    /// (a CBV address must be 256-byte aligned; UPLOAD staging cannot be a copy target).
+    static constexpr u64 CBV_SCRATCH_SIZE = 1024 * 1024;
 
     Tegra::GPU& m_gpu;
     Device& m_device;
@@ -124,13 +125,16 @@ private:
     PipelineCache m_pipeline_cache;
     DescriptorHeap m_res_heap;
     DescriptorHeap m_sampler_heap;
-    std::unordered_map<u32, u32> m_sampler_heap_indices;
     ComPtr<ID3D12Resource> m_zero_buffer;
     D3D12_GPU_VIRTUAL_ADDRESS m_zero_address{};
+    ComPtr<ID3D12Resource> m_cbv_scratch;
+    u64 m_cbv_scratch_used{};
     AccelerateDMA m_accelerate_dma;
     bool logged_topology{};
     bool logged_texel_buffers{};
     bool logged_unaligned_uniform{};
+    bool logged_rt_hole{};
+    bool logged_heap_exhausted{};
 };
 
 } // namespace D3D12

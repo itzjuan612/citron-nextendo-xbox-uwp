@@ -108,23 +108,9 @@ Buffer::Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_p
     : VideoCommon::BufferBase{null_params}, device{&runtime.device}, view_heap{&runtime.view_heap},
       tracker{0} {
     is_null = true;
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-    heap.CreationNodeMask = 1;
-    heap.VisibleNodeMask = 1;
-    D3D12_RESOURCE_DESC desc{};
-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = 256;
-    desc.Height = 1;
-    desc.DepthOrArraySize = 1;
-    desc.MipLevels = 1;
-    desc.SampleDesc.Count = 1;
-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(device->GetDevice()->CreateCommittedResource(
-            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-            IID_PPV_ARGS(&buffer)))) {
-        LOG_CRITICAL(Render_D3D12, "Null buffer creation failed");
-    }
+    // Share the runtime's null resource so every null buffer is recognisable by
+    // pointer in CopyBuffer/ClearBuffer/descriptor creation (see ReserveNullBuffer).
+    buffer = runtime.ReserveNullBuffer();
 }
 
 Buffer::Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_)
@@ -244,6 +230,12 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
     if (!command_list.IsValid() || !dst_buffer || !src_buffer) {
         return;
     }
+    // Copies touching the null resource would run past its end (guest sizes are
+    // arbitrary), so they are dropped: the CPU-side state is still updated and
+    // unbound reads fall back to zero-filled descriptors.
+    if (dst_buffer == null_buffer.Get() || src_buffer == null_buffer.Get()) {
+        return;
+    }
     const bool same_resource = dst_buffer == src_buffer;
     // DEFAULT-heap buffers live in COMMON and need explicit copy-state transitions.
     // UPLOAD staging is created GENERIC_READ (usable as a copy source as-is) and READBACK
@@ -257,6 +249,26 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
     }
     const bool transition_dst = dst_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
     const bool transition_src = !same_resource && src_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
+    if (same_resource) {
+        // A self-copy reads and writes the same resource in one operation, so it
+        // must be in COPY_SOURCE|COPY_DEST simultaneously.
+        if (!transition_dst) {
+            return;
+        }
+        command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE);
+        for (const VideoCommon::BufferCopy& copy : copies) {
+            if (copy.size == 0) {
+                continue;
+            }
+            command_list.CopyBufferRegion(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset,
+                                          copy.size);
+        }
+        command_list.Transition(dst_buffer,
+                                D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_COMMON);
+        return;
+    }
     if (transition_dst) {
         command_list.Transition(dst_buffer, D3D12_RESOURCE_STATE_COMMON,
                                 D3D12_RESOURCE_STATE_COPY_DEST);
@@ -287,6 +299,9 @@ void BufferCacheRuntime::PostCopyBarrier() {}
 void BufferCacheRuntime::ClearBuffer(ID3D12Resource* dest_buffer, u32 offset, size_t size,
                                      u32 value) {
     if (!command_list.IsValid() || !dest_buffer || size == 0) {
+        return;
+    }
+    if (dest_buffer == null_buffer.Get()) {
         return;
     }
     // Fill an upload buffer with the pattern and copy it over. A UAV clear would avoid the
@@ -348,10 +363,14 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         break;
     }
     const D3D12_GPU_VIRTUAL_ADDRESS address =
-        buffer ? buffer->GetGPUVirtualAddress() + offset : D3D12_GPU_VIRTUAL_ADDRESS{0};
+        IsNullResource(buffer) ? NullBufferGpuAddr() + std::min<u64>(offset, NULL_BUFFER_SIZE / 2)
+        : buffer               ? buffer->GetGPUVirtualAddress() + offset
+                               : D3D12_GPU_VIRTUAL_ADDRESS{0};
+    const u32 clamped_size =
+        IsNullResource(buffer) ? static_cast<u32>(std::min<u64>(size, NULL_BUFFER_SIZE / 2)) : size;
     index_binding = IndexBinding{
         .address = address,
-        .size = size,
+        .size = clamped_size,
         .first_index = base_vertex,
         .num_indices = num_indices,
         .format = dxgi_format,
@@ -374,10 +393,13 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, ID3D12Resource* buffer, u32
     if (index >= MAX_VERTEX_BUFFERS) {
         return;
     }
+    const bool is_null = IsNullResource(buffer);
     vertex_bindings[index] = D3D12_VERTEX_BUFFER_VIEW{
-        .BufferLocation = buffer ? buffer->GetGPUVirtualAddress() + offset
-                                 : D3D12_GPU_VIRTUAL_ADDRESS{0},
-        .SizeInBytes = size,
+        .BufferLocation = is_null ? NullBufferGpuAddr() + std::min<u64>(offset, NULL_BUFFER_SIZE / 2)
+                          : buffer ? buffer->GetGPUVirtualAddress() + offset
+                                   : D3D12_GPU_VIRTUAL_ADDRESS{0},
+        .SizeInBytes =
+            is_null ? static_cast<u32>(std::min<u64>(size, NULL_BUFFER_SIZE / 2)) : size,
         .StrideInBytes = stride,
     };
     max_vertex_slot = std::max(max_vertex_slot, index + 1);
@@ -390,9 +412,14 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
             break;
         }
         const Buffer* buffer = bindings.buffers[i];
+        const bool is_null = IsNullResource(buffer ? buffer->Handle() : nullptr);
         vertex_bindings[index] = D3D12_VERTEX_BUFFER_VIEW{
-            .BufferLocation = buffer->GpuAddr() + bindings.offsets[i],
-            .SizeInBytes = static_cast<u32>(bindings.sizes[i]),
+            .BufferLocation =
+                is_null ? NullBufferGpuAddr() +
+                              std::min<u64>(bindings.offsets[i], NULL_BUFFER_SIZE / 2)
+                        : buffer->GpuAddr() + bindings.offsets[i],
+            .SizeInBytes = static_cast<u32>(
+                is_null ? std::min<u64>(bindings.sizes[i], NULL_BUFFER_SIZE / 2) : bindings.sizes[i]),
             .StrideInBytes = static_cast<u32>(bindings.strides[i]),
         };
         max_vertex_slot = std::max(max_vertex_slot, index + 1);
@@ -457,7 +484,10 @@ ID3D12Resource* BufferCacheRuntime::ReserveNullBuffer() {
     heap.VisibleNodeMask = 1;
     D3D12_RESOURCE_DESC desc{};
     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    desc.Width = 256;
+    // Large enough to absorb the unbound-buffer views (index/vertex/CBV/SRV) the
+    // draw translation may point at it without reading past the end of the
+    // resource and faulting the GPU. Copies into/out of it are skipped entirely.
+    desc.Width = NULL_BUFFER_SIZE;
     desc.Height = 1;
     desc.DepthOrArraySize = 1;
     desc.MipLevels = 1;

@@ -411,7 +411,15 @@ void DeviceMemoryManager<Traits>::WalkBlock(DAddr addr, std::size_t size, auto o
     std::size_t page_offset = addr & Memory::CITRON_PAGEMASK;
 
     while (remaining_size) {
-        const size_t next_pages = static_cast<std::size_t>(entries[page_index].continuity_tracker);
+        // A continuity_tracker of 0 must advance a single page. On UWP the entries table
+        // starts zero-filled (the lazy per-chunk default initializer was never implemented),
+        // so never-mapped pages carry tracker 0; treating that as a zero-length run made
+        // this loop spin forever (the first-draw freeze: a uniform ReadBlockUnsafe whose
+        // range spanned an unmapped page wedged the GPU channel thread).
+        size_t next_pages = static_cast<std::size_t>(entries[page_index].continuity_tracker);
+        if (next_pages == 0) {
+            next_pages = 1;
+        }
         const std::size_t copy_amount =
             std::min((next_pages << Memory::CITRON_PAGEBITS) - page_offset, remaining_size);
         const auto current_vaddr =
