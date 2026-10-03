@@ -101,11 +101,21 @@ public:
         bool valid{};
     };
 
+    enum class BindingKind : u8 {
+        Uniform,
+        Storage,
+        Texel,
+    };
+
     struct ResourceBinding {
+        ID3D12Resource* resource{};
         D3D12_GPU_VIRTUAL_ADDRESS address{};
         u64 offset{};
         u64 size{};
         D3D12_CPU_DESCRIPTOR_HANDLE view{};
+        DXGI_FORMAT texel_format{DXGI_FORMAT_UNKNOWN};
+        BindingKind kind{BindingKind::Uniform};
+        bool is_written{};
     };
 
     explicit BufferCacheRuntime(Device& device, CommandList& command_list,
@@ -159,17 +169,16 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index, u32 size) {
         const StagingBufferRef ref = staging_pool.Request(size, StagingUsage::Upload);
-        BindBuffer(ref.buffer, static_cast<u32>(ref.offset), size);
+        BindBuffer(ref.buffer, static_cast<u32>(ref.offset), size, BindingKind::Uniform, false);
         return ref.mapped_span;
     }
 
     void BindUniformBuffer(ID3D12Resource* buffer, u32 offset, u32 size) {
-        BindBuffer(buffer, offset, size);
+        BindBuffer(buffer, offset, size, BindingKind::Uniform, false);
     }
 
-    void BindStorageBuffer(ID3D12Resource* buffer, u32 offset, u32 size,
-                           [[maybe_unused]] bool is_written) {
-        BindBuffer(buffer, offset, size);
+    void BindStorageBuffer(ID3D12Resource* buffer, u32 offset, u32 size, bool is_written) {
+        BindBuffer(buffer, offset, size, BindingKind::Storage, is_written);
     }
 
     void BindTextureBuffer(Buffer& buffer, u32 offset, u32 size,
@@ -190,10 +199,15 @@ public:
         return resource_bindings;
     }
 
+    [[nodiscard]] u32 MaxVertexSlot() const noexcept {
+        return max_vertex_slot;
+    }
+
     void ClearDrawBindings() noexcept;
 
 private:
-    void BindBuffer(ID3D12Resource* buffer, u32 offset, u32 size);
+    void BindBuffer(ID3D12Resource* buffer, u32 offset, u32 size, BindingKind kind,
+                    bool is_written);
     void BindView(D3D12_CPU_DESCRIPTOR_HANDLE view);
     ID3D12Resource* ReserveNullBuffer();
 
@@ -205,6 +219,7 @@ private:
 
     IndexBinding index_binding;
     std::array<D3D12_VERTEX_BUFFER_VIEW, MAX_VERTEX_BUFFERS> vertex_bindings{};
+    u32 max_vertex_slot{};
     std::vector<ResourceBinding> resource_bindings;
 
     u64 tick{};

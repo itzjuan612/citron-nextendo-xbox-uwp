@@ -3,12 +3,15 @@
 
 #pragma once
 
+#include <unordered_map>
+
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
 #include "video_core/renderer_d3d12/d3d12_command_list.h"
+#include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
 #include "video_core/renderer_d3d12/d3d12_query_cache.h"
 #include "video_core/renderer_d3d12/d3d12_staging_buffer_pool.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
@@ -25,6 +28,7 @@ namespace D3D12 {
 
 class Device;
 class RasterizerD3D12;
+class ShaderCompiler;
 
 /// DMA acceleration hooks. Buffer copies and clears run through the buffer cache; the
 /// image paths report "not handled" and use the generic guest-side implementation.
@@ -52,8 +56,8 @@ private:
 class RasterizerD3D12 final : public VideoCore::RasterizerInterface,
                               protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
-    explicit RasterizerD3D12(Tegra::GPU& gpu,
-                             Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device);
+    explicit RasterizerD3D12(Tegra::GPU& gpu, Tegra::MaxwellDeviceMemoryManager& device_memory,
+                             Device& device, ShaderCompiler& shader_compiler);
     ~RasterizerD3D12() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -103,6 +107,10 @@ public:
     void ReleaseChannel(s32 channel_id) override;
 
 private:
+    /// Resolves TIC handles for one draw and fills the shader-visible descriptor tables.
+    void ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeline& stored, u32 instance_count);
+    [[nodiscard]] u32 SamplerHeapIndex(VideoCommon::SamplerId sampler_id);
+
     Tegra::GPU& m_gpu;
     Device& m_device;
     StagingBufferPool m_staging_pool;
@@ -113,7 +121,16 @@ private:
     TextureCache m_texture_cache;
     QueryCacheRuntime m_query_runtime;
     QueryCache m_query_cache;
+    PipelineCache m_pipeline_cache;
+    DescriptorHeap m_res_heap;
+    DescriptorHeap m_sampler_heap;
+    std::unordered_map<u32, u32> m_sampler_heap_indices;
+    ComPtr<ID3D12Resource> m_zero_buffer;
+    D3D12_GPU_VIRTUAL_ADDRESS m_zero_address{};
     AccelerateDMA m_accelerate_dma;
+    bool logged_topology{};
+    bool logged_texel_buffers{};
+    bool logged_unaligned_uniform{};
 };
 
 } // namespace D3D12

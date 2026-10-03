@@ -165,9 +165,14 @@ public:
         return 0;
     }
 
+    [[nodiscard]] ID3D12Resource* Resource() const noexcept {
+        return resource;
+    }
+
 private:
     void CreateViews(Image& image, const VideoCommon::ImageViewInfo& view_info);
 
+    ID3D12Resource* resource{};
     D3D12_CPU_DESCRIPTOR_HANDLE sampled_view{};
     D3D12_CPU_DESCRIPTOR_HANDLE storage_view{};
     D3D12_CPU_DESCRIPTOR_HANDLE rt_view{};
@@ -262,15 +267,15 @@ public:
 
     bool CanImageBeCopied(Image& dst, Image& src);
 
-    bool CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    void CopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
-    bool EmulateCopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    void EmulateCopyImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
     bool ShouldReinterpret(Image& dst, Image& src);
 
-    bool ReinterpretImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    void ReinterpretImage(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
-    bool CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
+    void CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
     void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view, ImageView& src_view,
                    const VideoCommon::Region2D& dst_region, const VideoCommon::Region2D& src_region,

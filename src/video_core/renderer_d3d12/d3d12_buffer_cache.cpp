@@ -374,6 +374,7 @@ void BufferCacheRuntime::BindVertexBuffer(u32 index, ID3D12Resource* buffer, u32
         .SizeInBytes = size,
         .StrideInBytes = stride,
     };
+    max_vertex_slot = std::max(max_vertex_slot, index + 1);
 }
 
 void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
@@ -388,6 +389,7 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
             .SizeInBytes = static_cast<u32>(bindings.sizes[i]),
             .StrideInBytes = static_cast<u32>(bindings.strides[i]),
         };
+        max_vertex_slot = std::max(max_vertex_slot, index + 1);
     }
 }
 
@@ -409,17 +411,22 @@ void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<
     }
 }
 
-void BufferCacheRuntime::BindBuffer(ID3D12Resource* buffer, u32 offset, u32 size) {
+void BufferCacheRuntime::BindBuffer(ID3D12Resource* buffer, u32 offset, u32 size,
+                                      BindingKind kind, bool is_written) {
     ID3D12Resource* resource = buffer ? buffer : null_buffer.Get();
     const D3D12_GPU_VIRTUAL_ADDRESS base =
         resource ? resource->GetGPUVirtualAddress() : D3D12_GPU_VIRTUAL_ADDRESS{0};
     // Note: root CBVs require 256-byte aligned addresses; the draw translation copies
     // unaligned uniform ranges into an aligned staging region as needed.
     resource_bindings.push_back(ResourceBinding{
+        .resource = resource,
         .address = base + offset,
         .offset = offset,
         .size = size,
         .view = {},
+        .texel_format = DXGI_FORMAT_UNKNOWN,
+        .kind = kind,
+        .is_written = is_written,
     });
 }
 
@@ -429,6 +436,8 @@ void BufferCacheRuntime::BindView(D3D12_CPU_DESCRIPTOR_HANDLE view) {
         .offset = 0,
         .size = 0,
         .view = view,
+        .texel_format = DXGI_FORMAT_UNKNOWN,
+        .kind = BindingKind::Texel,
     });
 }
 
@@ -459,6 +468,7 @@ ID3D12Resource* BufferCacheRuntime::ReserveNullBuffer() {
 void BufferCacheRuntime::ClearDrawBindings() noexcept {
     index_binding = IndexBinding{};
     vertex_bindings = {};
+    max_vertex_slot = 0;
     resource_bindings.clear();
 }
 

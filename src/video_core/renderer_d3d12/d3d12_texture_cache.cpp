@@ -622,10 +622,11 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::NullImageViewParam
 ImageView::~ImageView() = default;
 
 void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view_info) {
-    ID3D12Resource* resource = image.Handle();
-    if (!resource) {
+    ID3D12Resource* resource_ = image.Handle();
+    if (!resource_) {
         return;
     }
+    resource = resource_;
     const DXGI_FORMAT sampled_format = SampledFormat(format);
     if (sampled_format == DXGI_FORMAT_UNKNOWN) {
         return;
@@ -840,10 +841,10 @@ bool TextureCacheRuntime::CanImageBeCopied(Image& dst, Image& src) {
            dst_desc.Dimension == src_desc.Dimension;
 }
 
-bool TextureCacheRuntime::CopyImage(Image& dst, Image& src,
+void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const ImageCopy> copies) {
     if (!command_list.IsValid() || !CanImageBeCopied(dst, src)) {
-        return false;
+        return;
     }
     Transition(dst.Handle(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(src.Handle(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -882,16 +883,14 @@ bool TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     }
     Transition(dst.Handle(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     Transition(src.Handle(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    return true;
 }
 
-bool TextureCacheRuntime::EmulateCopyImage(Image&, Image&,
+void TextureCacheRuntime::EmulateCopyImage(Image&, Image&,
                                             std::span<const ImageCopy>) {
     if (!logged_emulated_copy) {
         logged_emulated_copy = true;
         LOG_ERROR(Render_D3D12, "Emulated image copies not implemented yet");
     }
-    return false;
 }
 
 bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
@@ -899,21 +898,19 @@ bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
            dst.info.format != src.info.format;
 }
 
-bool TextureCacheRuntime::ReinterpretImage(Image&, Image&,
+void TextureCacheRuntime::ReinterpretImage(Image&, Image&,
                                            std::span<const ImageCopy>) {
     if (!logged_reinterpret) {
         logged_reinterpret = true;
         LOG_ERROR(Render_D3D12, "Reinterpret image copies not implemented yet");
     }
-    return false;
 }
 
-bool TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCopy>) {
+void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCopy>) {
     if (!logged_msaa) {
         logged_msaa = true;
         LOG_ERROR(Render_D3D12, "MSAA image copies not implemented yet");
     }
-    return false;
 }
 
 void TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst_view, ImageView& src_view,

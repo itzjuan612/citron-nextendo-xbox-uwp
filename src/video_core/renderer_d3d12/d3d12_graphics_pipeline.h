@@ -25,7 +25,7 @@ constexpr u32 MAX_SHADER_STAGES = Tegra::Engines::Maxwell3D::Regs::MaxShaderStag
 
 /// Cache key of a graphics pipeline: the guest shader hashes plus the packed fixed state.
 struct GraphicsPipelineCacheKey {
-    std::array<u64, MAX_SHADER_STAGES> unique_hashes{};
+    std::array<u64, Tegra::Engines::Maxwell3D::Regs::MaxShaderProgram> unique_hashes{};
     FixedPipelineState state{};
 
     [[nodiscard]] size_t Hash() const noexcept;

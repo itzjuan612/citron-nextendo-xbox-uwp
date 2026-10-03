@@ -23,7 +23,8 @@ RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
       device{}, swapchain{device, render_window.GetWindowInfo(),
                           render_window.GetFramebufferLayout().width,
                           render_window.GetFramebufferLayout().height},
-      command_list{device.GetDevice()}, shader_compiler{}, rasterizer{gpu, device_memory, device} {
+      command_list{device.GetDevice()}, shader_compiler{}, rasterizer{gpu, device_memory, device,
+                                                        shader_compiler} {
     if (!device.IsValid()) {
         LOG_ERROR(Render_D3D12, "D3D12 device initialization failed");
         throw std::runtime_error{"D3D12 device initialization failed"};
