@@ -5,21 +5,28 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 
 namespace D3D12 {
 
-AccelerateDMA::AccelerateDMA() = default;
+AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_) : buffer_cache{buffer_cache_} {}
 
-bool AccelerateDMA::BufferCopy(GPUVAddr start_address, GPUVAddr end_address, u64 amount) {
-    return false;
+bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.DMACopy(src_address, dest_address, amount);
 }
 
-bool AccelerateDMA::BufferClear(GPUVAddr src_address, u64 amount, u32 value) {
-    return false;
+bool AccelerateDMA::BufferClear(GPUVAddr dst_address, u64 amount, u32 value) {
+    std::scoped_lock lock{buffer_cache.mutex};
+    return buffer_cache.DMAClear(dst_address, amount, value);
 }
 
-RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu) : m_gpu{gpu} {}
+RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
+                                 Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device)
+    : m_gpu{gpu}, m_device{device}, m_command_list{device.GetDevice()},
+      m_runtime{device, m_command_list}, m_buffer_cache{device_memory, m_runtime},
+      m_accelerate_dma{m_buffer_cache} {}
 RasterizerD3D12::~RasterizerD3D12() = default;
 
 void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {}
@@ -41,18 +48,49 @@ void RasterizerD3D12::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
     }
 }
 void RasterizerD3D12::BindGraphicsUniformBuffer(size_t stage, u32 index, GPUVAddr gpu_addr,
-                                                u32 size) {}
-void RasterizerD3D12::DisableGraphicsUniformBuffer(size_t stage, u32 index) {}
+                                                u32 size) {
+    m_buffer_cache.BindGraphicsUniformBuffer(stage, index, gpu_addr, size);
+}
+void RasterizerD3D12::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
+    m_buffer_cache.DisableGraphicsUniformBuffer(stage, index);
+}
 void RasterizerD3D12::FlushAll() {}
-void RasterizerD3D12::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {}
-bool RasterizerD3D12::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType) {
+void RasterizerD3D12::FlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    if (True(which & VideoCommon::CacheType::BufferCache)) {
+        std::scoped_lock lock{m_buffer_cache.mutex};
+        m_buffer_cache.DownloadMemory(addr, size);
+    }
+}
+bool RasterizerD3D12::MustFlushRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (True(which & VideoCommon::CacheType::BufferCache)) {
+        std::scoped_lock lock{m_buffer_cache.mutex};
+        return m_buffer_cache.IsRegionGpuModified(addr, size);
+    }
     return false;
 }
-void RasterizerD3D12::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {}
-bool RasterizerD3D12::OnCPUWrite(PAddr addr, u64 size) {
-    return false;
+void RasterizerD3D12::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    if (True(which & VideoCommon::CacheType::BufferCache)) {
+        std::scoped_lock lock{m_buffer_cache.mutex};
+        m_buffer_cache.WriteMemory(addr, size);
+    }
 }
-void RasterizerD3D12::OnCacheInvalidation(PAddr addr, u64 size) {}
+bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    return m_buffer_cache.OnCPUWrite(addr, size);
+}
+void RasterizerD3D12::OnCacheInvalidation(DAddr addr, u64 size) {
+    if (addr == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.WriteMemory(addr, size);
+}
 VideoCore::RasterizerDownloadArea RasterizerD3D12::GetFlushArea(PAddr addr, u64 size) {
     VideoCore::RasterizerDownloadArea new_area{
         .start_address = Common::AlignDown(addr, Core::DEVICE_PAGESIZE),
@@ -62,7 +100,10 @@ VideoCore::RasterizerDownloadArea RasterizerD3D12::GetFlushArea(PAddr addr, u64 
     return new_area;
 }
 void RasterizerD3D12::InvalidateGPUCache() {}
-void RasterizerD3D12::UnmapMemory(DAddr addr, u64 size) {}
+void RasterizerD3D12::UnmapMemory(DAddr addr, u64 size) {
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.WriteMemory(addr, size);
+}
 void RasterizerD3D12::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {}
 void RasterizerD3D12::SignalFence(std::function<void()>&& func) {
     func();
@@ -77,12 +118,23 @@ void RasterizerD3D12::SignalSyncPoint(u32 value) {
 }
 void RasterizerD3D12::SignalReference() {}
 void RasterizerD3D12::ReleaseFences(bool) {}
-void RasterizerD3D12::FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType) {}
-void RasterizerD3D12::WaitForIdle() {}
+void RasterizerD3D12::FlushAndInvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheType which) {
+    FlushRegion(addr, size, which);
+    InvalidateRegion(addr, size, which);
+}
+void RasterizerD3D12::WaitForIdle() {
+    m_runtime.Finish();
+}
 void RasterizerD3D12::FragmentBarrier() {}
 void RasterizerD3D12::TiledCacheBarrier() {}
-void RasterizerD3D12::FlushCommands() {}
-void RasterizerD3D12::TickFrame() {}
+void RasterizerD3D12::FlushCommands() {
+    m_command_list.Execute(m_device);
+    m_command_list.Reset();
+}
+void RasterizerD3D12::TickFrame() {
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    m_buffer_cache.TickFrame();
+}
 Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() {
     return m_accelerate_dma;
 }
@@ -92,7 +144,16 @@ bool RasterizerD3D12::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfa
     return false;
 }
 void RasterizerD3D12::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
-                                               std::span<const u8> memory) {}
+                                               std::span<const u8> memory) {
+    std::scoped_lock lock{m_buffer_cache.mutex};
+    const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(address);
+    if (!cpu_addr) {
+        return;
+    }
+    if (!m_buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
+        m_buffer_cache.WriteMemory(*cpu_addr, copy_size);
+    }
+}
 void RasterizerD3D12::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                         const VideoCore::DiskResourceLoadCallback& callback) {}
 void RasterizerD3D12::InitializeChannel(Tegra::Control::ChannelState& channel) {

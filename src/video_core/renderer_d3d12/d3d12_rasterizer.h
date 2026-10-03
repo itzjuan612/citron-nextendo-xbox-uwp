@@ -7,6 +7,8 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/rasterizer_interface.h"
+#include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
+#include "video_core/renderer_d3d12/d3d12_command_list.h"
 
 namespace Core {
 class System;
@@ -14,17 +16,18 @@ class System;
 
 namespace Tegra {
 class GPU;
-}
+} // namespace Tegra
 
 namespace D3D12 {
 
+class Device;
 class RasterizerD3D12;
 
-/// DMA acceleration hooks. No accelerated paths are implemented yet, so these report
-/// "not handled" and the generic guest-side paths are used.
+/// DMA acceleration hooks. Buffer copies and clears run through the buffer cache; the
+/// image paths report "not handled" and use the generic guest-side implementation.
 class AccelerateDMA : public Tegra::Engines::AccelerateDMAInterface {
 public:
-    explicit AccelerateDMA();
+    explicit AccelerateDMA(BufferCache& buffer_cache_);
 
     bool BufferCopy(GPUVAddr start_address, GPUVAddr end_address, u64 amount) override;
     bool BufferClear(GPUVAddr src_address, u64 amount, u32 value) override;
@@ -36,6 +39,9 @@ public:
                        const Tegra::DMA::ImageOperand& dst) override {
         return false;
     }
+
+private:
+    BufferCache& buffer_cache;
 };
 
 /// D3D12 rasterizer. Currently a functional skeleton: the command/state translation is
@@ -43,7 +49,8 @@ public:
 class RasterizerD3D12 final : public VideoCore::RasterizerInterface,
                               protected VideoCommon::ChannelSetupCaches<VideoCommon::ChannelInfo> {
 public:
-    explicit RasterizerD3D12(Tegra::GPU& gpu);
+    explicit RasterizerD3D12(Tegra::GPU& gpu,
+                             Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device);
     ~RasterizerD3D12() override;
 
     void Draw(bool is_indexed, u32 instance_count) override;
@@ -94,6 +101,10 @@ public:
 
 private:
     Tegra::GPU& m_gpu;
+    Device& m_device;
+    CommandList m_command_list;
+    BufferCacheRuntime m_runtime;
+    BufferCache m_buffer_cache;
     AccelerateDMA m_accelerate_dma;
 };
 

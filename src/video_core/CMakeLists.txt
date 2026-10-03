@@ -339,6 +339,8 @@ endif()
 # D3D12 renderer backend (Xbox/UWP target and desktop development builds).
 if (CITRON_ENABLE_D3D12)
     target_sources(video_core PRIVATE
+        renderer_d3d12/d3d12_buffer_cache.cpp
+        renderer_d3d12/d3d12_buffer_cache.h
         renderer_d3d12/d3d12_command_list.cpp
         renderer_d3d12/d3d12_command_list.h
         renderer_d3d12/d3d12_descriptor_heap.cpp
@@ -355,6 +357,8 @@ if (CITRON_ENABLE_D3D12)
         renderer_d3d12/d3d12_root_signature.h
         renderer_d3d12/d3d12_shader_compiler.cpp
         renderer_d3d12/d3d12_shader_compiler.h
+        renderer_d3d12/d3d12_staging_buffer_pool.cpp
+        renderer_d3d12/d3d12_staging_buffer_pool.h
         renderer_d3d12/d3d12_swapchain.cpp
         renderer_d3d12/d3d12_swapchain.h
         renderer_d3d12/mesa/dxil_versions.h
