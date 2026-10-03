@@ -56,9 +56,6 @@ private:
     /// Renders the bring-up triangle into the current swapchain back buffer.
     void RenderBringUpTriangle();
 
-    /// One-time D3D12 isolation probe (own texture vs swapchain back buffer).
-    void RunD3D12IsolationProbe(ID3D12Resource* back_buffer, D3D12_CPU_DESCRIPTOR_HANDLE rtv);
-
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Tegra::GPU& gpu;
     Device device;
@@ -68,8 +65,6 @@ private:
     std::optional<GraphicsPipeline> bringup_pipeline;
     bool bringup_attempted{};
     bool bringup_ready{};
-    bool logged_back_buffer{};
-    bool probe_done{};
     RasterizerD3D12 rasterizer;
 };
 

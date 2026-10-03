@@ -50,6 +50,10 @@ public:
 std::atomic<bool> g_boot_started{false};
 std::thread g_boot_thread;
 
+/// Number of poll cycles to hold an injected B press after the system Back button.
+constexpr int kBackPulseFrames = 8;
+std::atomic<int> g_back_pulse_frames{0};
+
 /// Logs unhandled exceptions (code, faulting module and offset) so crashes are symbolizable
 /// with the shipped PDB; the console exposes no crash dumps through Device Portal.
 LONG WINAPI CrashHandler(EXCEPTION_POINTERS* info) {
@@ -134,7 +138,12 @@ void PollGamepads() {
     };
 
     set(VirtualButton::ButtonA, button_state(winrt::Windows::Gaming::Input::GamepadButtons::A));
-    set(VirtualButton::ButtonB, button_state(winrt::Windows::Gaming::Input::GamepadButtons::B));
+    // B doubles as the Xbox system Back button. BackRequested is swallowed and injects a
+    // short pulse here so the guest sees the press even if the system demotes B out of the
+    // WGI reading while it handles the Back gesture.
+    set(VirtualButton::ButtonB,
+        button_state(winrt::Windows::Gaming::Input::GamepadButtons::B) ||
+            g_back_pulse_frames.load() > 0);
     set(VirtualButton::ButtonX, button_state(winrt::Windows::Gaming::Input::GamepadButtons::X));
     set(VirtualButton::ButtonY, button_state(winrt::Windows::Gaming::Input::GamepadButtons::Y));
     set(VirtualButton::TriggerL, button_state(winrt::Windows::Gaming::Input::GamepadButtons::LeftShoulder));
@@ -156,6 +165,9 @@ void PollGamepads() {
                              static_cast<float>(reading.RightThumbstickY));
 
     last_buttons = buttons;
+    if (g_back_pulse_frames.load() > 0) {
+        --g_back_pulse_frames;
+    }
 }
 
 class CitronUwpView : public implements<CitronUwpView, IFrameworkView> {
@@ -172,6 +184,18 @@ public:
     void SetWindow(CoreWindow const& window) {
         window_ = window;
         window_.Closed([this](CoreWindow const&, CoreWindowEventArgs const&) { closed_ = true; });
+
+        // On Xbox the B button is the system Back button: with no BackRequested handler
+        // the system terminates the app on every B press. Swallow the navigation and
+        // inject a short B pulse so the emulated game still sees the button.
+        try {
+            SystemNavigationManager::GetForCurrentView().BackRequested(
+                [](IInspectable const&, BackRequestedEventArgs const& e) {
+                    e.Handled(true);
+                    g_back_pulse_frames.store(kBackPulseFrames);
+                });
+        } catch (...) {
+        }
 
         float width = 1280.0f;
         float height = 720.0f;
