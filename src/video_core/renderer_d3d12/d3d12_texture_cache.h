@@ -162,7 +162,11 @@ public:
     }
 
     [[nodiscard]] u32 BufferSize() const noexcept {
-        return 0;
+        return type == VideoCommon::ImageViewType::Buffer ? size.width : 0;
+    }
+
+    [[nodiscard]] GPUVAddr GpuAddr() const noexcept {
+        return gpu_addr;
     }
 
     [[nodiscard]] ID3D12Resource* Resource() const noexcept {
@@ -211,9 +215,15 @@ public:
         return depth_buffer;
     }
 
+    /// Render area (key size clamped to the smallest bound view).
+    [[nodiscard]] VideoCommon::Extent2D RenderArea() const noexcept {
+        return render_area;
+    }
+
 private:
     std::array<ImageView*, VideoCommon::NUM_RT> color_buffers{};
     ImageView* depth_buffer{};
+    VideoCommon::Extent2D render_area{};
 };
 
 class TextureCacheRuntime {
@@ -239,6 +249,13 @@ public:
     u64 GetDeviceMemoryUsage() const;
 
     bool CanReportMemoryUsage() const;
+
+    /// Draw-guard helpers for ConfigureDraw: garbage guest render-target state must never
+    /// reach OMSetRenderTargets or PSO creation. IsDepthStencilFormat reports depth/stencil
+    /// pixel formats; IsRepresentableRenderTarget reports whether a color pixel format can
+    /// back an RTV (false for depth/stencil and for formats with no render-target mapping).
+    static bool IsDepthStencilFormat(VideoCore::Surface::PixelFormat format);
+    static bool IsRepresentableRenderTarget(VideoCore::Surface::PixelFormat format);
 
     bool HasBrokenTextureViewFormats() const noexcept {
         return false;

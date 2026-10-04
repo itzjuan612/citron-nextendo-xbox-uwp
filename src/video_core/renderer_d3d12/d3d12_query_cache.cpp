@@ -11,10 +11,17 @@ struct QueryCacheRuntimeImpl {
           needed_minus_succeeded_streamer(
               static_cast<size_t>(
                   VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded),
-              runtime, 0u) {}
+              runtime, 0u),
+          zpass_streamer(static_cast<size_t>(VideoCommon::QueryType::ZPassPixelCount64),
+                         runtime, 1u),
+          streaming_byte_streamer(
+              static_cast<size_t>(VideoCommon::QueryType::StreamingByteCount), runtime,
+              0u) {}
 
     VideoCommon::GuestStreamer<QueryCacheParams> payload_streamer;
     VideoCommon::StubStreamer<QueryCacheParams> needed_minus_succeeded_streamer;
+    VideoCommon::StubStreamer<QueryCacheParams> zpass_streamer;
+    VideoCommon::StubStreamer<QueryCacheParams> streaming_byte_streamer;
     Tegra::Engines::Maxwell3D* maxwell3d{};
 };
 
@@ -55,6 +62,10 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(
         return &impl->payload_streamer;
     case VideoCommon::QueryType::StreamingPrimitivesNeededMinusSucceeded:
         return &impl->needed_minus_succeeded_streamer;
+    case VideoCommon::QueryType::ZPassPixelCount64:
+        return &impl->zpass_streamer;
+    case VideoCommon::QueryType::StreamingByteCount:
+        return &impl->streaming_byte_streamer;
     default:
         // The template falls back to Payload with value 1 for unmapped types.
         return nullptr;

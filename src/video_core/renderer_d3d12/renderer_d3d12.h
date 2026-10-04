@@ -11,7 +11,10 @@
 
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/renderer_base.h"
+#include <wrl/client.h>
+
 #include "video_core/renderer_d3d12/d3d12_command_list.h"
+#include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
@@ -50,11 +53,13 @@ public:
     [[nodiscard]] std::string GetDeviceVendor() const override;
 
 private:
-    /// Compiles the embedded bring-up shaders and creates the test pipeline.
-    void PrepareBringUpTriangle();
+    /// Compiles the embedded blit shaders and creates the blit PSO.
+    void PrepareBlit();
 
-    /// Renders the bring-up triangle into the current swapchain back buffer.
-    void RenderBringUpTriangle();
+    /// Blits the guest framebuffer that `info` points at into the current
+    /// swapchain back buffer (aspect-correct full-viewport blit).
+    void RenderBlit(const Tegra::FramebufferConfig& framebuffer,
+                        const AccelerateDisplayInfo& info);
 
     Tegra::MaxwellDeviceMemoryManager& device_memory;
     Tegra::GPU& gpu;
@@ -62,9 +67,14 @@ private:
     Swapchain swapchain;
     CommandList command_list;
     ShaderCompiler shader_compiler;
-    std::optional<GraphicsPipeline> bringup_pipeline;
-    bool bringup_attempted{};
-    bool bringup_ready{};
+    /// Shader-visible SRV heap holding the guest framebuffer view for the blit.
+    DescriptorHeap blit_srv_heap;
+    /// Shader-visible sampler heap holding the blit sampler (recreated per frame).
+    DescriptorHeap blit_sampler_heap;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> blit_root_signature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> blit_pipeline;
+    bool blit_attempted{};
+    bool blit_ready{};
     RasterizerD3D12 rasterizer;
 };
 

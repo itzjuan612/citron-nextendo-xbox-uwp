@@ -263,6 +263,17 @@ u32 SampleCount(Tegra::Texture::MsaaMode mode) {
     }
 }
 
+// Maps a stage's compiled bytecode to D3D12_SHADER_BYTECODE. Unbound stages
+// yield an empty blob ({nullptr, 0}) so the pipeline description never hands
+// a dangling pointer to CreateGraphicsPipelineState.
+const auto StageBytecode = [](const std::vector<u8>& bytecode)
+    -> D3D12_SHADER_BYTECODE {
+    if (bytecode.empty()) {
+        return D3D12_SHADER_BYTECODE{nullptr, 0};
+    }
+    return D3D12_SHADER_BYTECODE{bytecode.data(), bytecode.size()};
+};
+
 } // Anonymous namespace
 
 size_t GraphicsPipelineCacheKey::Hash() const noexcept {
@@ -378,6 +389,14 @@ DXGI_FORMAT SurfaceFormat(VideoSurface::PixelFormat format) {
         return DXGI_FORMAT_D24_UNORM_S8_UINT;
     case VideoSurface::PixelFormat::D32_FLOAT_S8_UINT:
         return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    case VideoSurface::PixelFormat::R32G32B32_FLOAT:
+        return DXGI_FORMAT_R32G32B32_FLOAT;
+    case VideoSurface::PixelFormat::BC1_RGBA_SRGB:
+        return DXGI_FORMAT_BC1_UNORM_SRGB;
+    case VideoSurface::PixelFormat::BC2_SRGB:
+        return DXGI_FORMAT_BC2_UNORM_SRGB;
+    case VideoSurface::PixelFormat::BC3_SRGB:
+        return DXGI_FORMAT_BC3_UNORM_SRGB;
     default:
         return DXGI_FORMAT_UNKNOWN;
     }
@@ -520,16 +539,17 @@ GraphicsPipeline::GraphicsPipeline(
 
     D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = root_signature.Get();
-    desc.VS = {stages[0].data(), stages[0].size()};
-    desc.HS = {stages[1].data(), stages[1].size()};
-    desc.DS = {stages[2].data(), stages[2].size()};
-    desc.GS = {stages[3].data(), stages[3].size()};
-    desc.PS = {stages[4].data(), stages[4].size()};
+    desc.VS = StageBytecode(stages[0]);
+    desc.HS = StageBytecode(stages[1]);
+    desc.DS = StageBytecode(stages[2]);
+    desc.GS = StageBytecode(stages[3]);
+    desc.PS = StageBytecode(stages[4]);
     desc.BlendState = blend_desc;
     desc.SampleMask = UINT_MAX;
     desc.RasterizerState = rasterizer_desc;
     desc.DepthStencilState = depth_stencil_desc;
-    desc.InputLayout = {input_elements.data(), static_cast<UINT>(input_elements.size())};
+    desc.InputLayout = {input_elements.empty() ? nullptr : input_elements.data(),
+                        static_cast<UINT>(input_elements.size())};
     desc.IBStripCutValue = state.primitive_restart_enable != 0
                                ? D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF
                                : D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED;
@@ -543,6 +563,34 @@ GraphicsPipeline::GraphicsPipeline(
         const auto pixel_format = VideoSurface::PixelFormatFromRenderTargetFormat(
             static_cast<Tegra::RenderTargetFormat>(state.color_formats[i]));
         const DXGI_FORMAT format = SurfaceFormat(pixel_format);
+        // D3D12 cannot bind a depth/stencil format as a render target;
+        // the pipeline is unrepresentable, so skip creating the PSO
+        // (same philosophy as the no-vertex-program skip).
+        switch (format) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS: {
+            static bool logged_depth_as_rtv = false;
+            if (!logged_depth_as_rtv) {
+                logged_depth_as_rtv = true;
+                LOG_DEBUG(Render_D3D12,
+                          "Depth/stencil format as render target "
+                          "(slot {}, color_formats[{}]={}), "
+                          "aborting pipeline creation",
+                          i, i, state.color_formats[i]);
+            }
+            pipeline.Reset();
+            return;
+        }
+        default:
+            break;
+        }
         desc.RTVFormats[i] = format;
         if (format != DXGI_FORMAT_UNKNOWN) {
             render_target_count = i + 1;
@@ -566,7 +614,20 @@ GraphicsPipeline::GraphicsPipeline(
 
     const HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr)) {
-        LOG_ERROR(Render_D3D12, "CreateGraphicsPipelineState failed: {:#x}", static_cast<u32>(hr));
+        const auto rtv_hex = [&desc](u32 index) {
+            return index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
+                       ? static_cast<u32>(desc.RTVFormats[index])
+                       : 0u;
+        };
+        LOG_ERROR(Render_D3D12,
+                  "CreateGraphicsPipelineState failed: {:#x} (num_rt={}, "
+                  "rtv[0..3]=[{:#x}, {:#x}, {:#x}, {:#x}], dsv={:#x}, "
+                  "vs_size={}, ps_size={}, topology={}, samples={}, inputs={})",
+                  static_cast<u32>(hr), desc.NumRenderTargets, rtv_hex(0),
+                  rtv_hex(1), rtv_hex(2), rtv_hex(3),
+                  static_cast<u32>(desc.DSVFormat), desc.VS.BytecodeLength,
+                  desc.PS.BytecodeLength, static_cast<u32>(state.topology.Value()),
+                  desc.SampleDesc.Count, desc.InputLayout.NumElements);
         pipeline.Reset();
         return;
     }

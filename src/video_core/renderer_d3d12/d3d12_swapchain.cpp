@@ -153,7 +153,9 @@ void Swapchain::ClearAndPresent(f32 r, f32 g, f32 b) {
 
     const HRESULT hr = swapchain->Present(1, 0);
     if (FAILED(hr)) {
-        LOG_ERROR(Render_D3D12, "Present failed: {:#x}", static_cast<u32>(hr));
+        LOG_ERROR(Render_D3D12, "Present failed: {:#x}, removed reason: {:#x}",
+                  static_cast<u32>(hr),
+                  static_cast<u32>(device.GetDevice()->GetDeviceRemovedReason()));
     }
 }
 
@@ -163,7 +165,9 @@ void Swapchain::Present() {
     }
     const HRESULT hr = swapchain->Present(1, 0);
     if (FAILED(hr)) {
-        LOG_ERROR(Render_D3D12, "Present failed: {:#x}", static_cast<u32>(hr));
+        LOG_ERROR(Render_D3D12, "Present failed: {:#x}, removed reason: {:#x}",
+                  static_cast<u32>(hr),
+                  static_cast<u32>(device.GetDevice()->GetDeviceRemovedReason()));
     }
 }
 

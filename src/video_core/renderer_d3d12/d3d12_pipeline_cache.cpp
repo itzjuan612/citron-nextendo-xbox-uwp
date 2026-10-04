@@ -228,7 +228,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory, D
         .has_split_descriptor_sets = true,
         .support_descriptor_aliasing = true,
         .support_int8 = false,
-        .support_int16 = true,
+        .support_int16 = false,
         .support_int64 = true,
         .support_vertex_instance_id = false,
         .support_float_controls = false,
@@ -285,7 +285,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory, D
     };
     host_info = Shader::HostTranslateInfo{
         .support_float64 = true,
-        .support_float16 = true,
+        .support_float16 = false,
         .support_int64 = true,
         .needs_demote_reorder = false,
         .support_snorm_render_buffer = true,
@@ -306,6 +306,19 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
 PipelineCache::StoredPipeline* PipelineCache::CurrentStoredPipeline() {
     GraphicsPipelineCacheKey key{};
     if (!RefreshStages(key.unique_hashes)) {
+        current_pipeline = nullptr;
+        return nullptr;
+    }
+    if (key.unique_hashes[0] == 0 && key.unique_hashes[1] == 0) {
+        // No vertex program is bound, so a graphics pipeline is meaningless:
+        // both vertex stages would be empty and CreateGraphicsPipelineState
+        // would fail with E_INVALIDARG. A zero fragment hash alone is legal
+        // (depth-only prepasses), so only skip when both vertex slots unset.
+        static bool logged_no_vertex_program = false;
+        if (!logged_no_vertex_program) {
+            logged_no_vertex_program = true;
+            LOG_DEBUG(Render_D3D12, "Skipping pipeline with no vertex program");
+        }
         current_pipeline = nullptr;
         return nullptr;
     }

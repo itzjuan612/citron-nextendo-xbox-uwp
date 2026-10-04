@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <type_traits>
 
 #include "common/alignment.h"
 #include "video_core/control/channel_state.h"
@@ -12,6 +13,11 @@
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 
 namespace D3D12 {
+
+namespace {
+// Draws re-enabled, guards active (no-vertex skip, depth-RTV skip, all-slots-bound guard, RT-format and index/vertex range validation).
+constexpr bool kSkipDraws = false;
+} // namespace
 
 using Tegra::Texture::TexturePair;
 
@@ -88,6 +94,9 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
 RasterizerD3D12::~RasterizerD3D12() = default;
 
 void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
+    if (kSkipDraws) {
+        return;
+    }
     m_query_cache.NotifySegment(true);
     PipelineCache::StoredPipeline* stored = m_pipeline_cache.CurrentStoredPipeline();
     if (!stored || !stored->pipeline || !stored->pipeline->IsValid()) {
@@ -222,6 +231,89 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     const auto& regs = maxwell3d->regs;
 
     m_runtime.ClearDrawBindings();
+
+    // Validate BEFORE recording any uploads: draws the backend cannot represent must
+    // return here, before the buffer-binding section below records staging COPY commands
+    // for garbage draw state (those copies execute at flush and fault the GPU on console,
+    // removing the device even for draws every later guard would skip).
+    m_texture_cache.UpdateRenderTargets(false);
+    Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
+
+    const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
+    const DrawParams params = MakeDrawParams(draw_state, instance_count, is_indexed);
+    // Guard rails: never submit draws the backend cannot represent yet. An unbound
+    // render target, an unexpanded index format, or an empty draw would otherwise go
+    // to the GPU as undefined commands.
+    ImageView* depth_view = framebuffer ? framebuffer->DepthBuffer() : nullptr;
+    u32 num_rtvs = 0;
+    for (size_t i = 0; i < VideoCommon::NUM_RT; ++i) {
+        const auto format =
+            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
+        if (format != Tegra::RenderTargetFormat::NONE) {
+            num_rtvs = static_cast<u32>(i) + 1;
+        }
+    }
+    if (params.num_vertices == 0 || params.num_instances == 0) {
+        return;
+    }
+    if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
+        return;
+    }
+    for (size_t i = 0; i < num_rtvs; ++i) {
+        const auto format =
+            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
+        const bool is_none = (format == Tegra::RenderTargetFormat::NONE);
+        if (!is_none) {
+            // Garbage guest render-target state must never reach OMSetRenderTargets or PSO
+            // creation: an out-of-range, depth/stencil, or otherwise unrepresentable format
+            // builds a degenerate pipeline that removes the device at execute time.
+            const u32 raw_format = static_cast<u32>(format);
+            const VideoCore::Surface::PixelFormat pixel_format =
+                VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+            const char* skip_reason = nullptr;
+            if (raw_format <
+                    static_cast<u32>(Tegra::RenderTargetFormat::R32G32B32A32_FLOAT) ||
+                raw_format > static_cast<u32>(Tegra::RenderTargetFormat::X8B8G8R8_SRGB)) {
+                skip_reason = "out-of-range";
+            } else if (pixel_format == VideoCore::Surface::PixelFormat::Invalid) {
+                skip_reason = "Invalid mapping";
+            } else if (m_texture_runtime.IsDepthStencilFormat(pixel_format)) {
+                skip_reason = "depth-stencil";
+            } else if (!m_texture_runtime.IsRepresentableRenderTarget(pixel_format)) {
+                skip_reason = "unrepresentable";
+            }
+            if (skip_reason != nullptr) {
+                if (!logged_rt_hole) {
+                    logged_rt_hole = true;
+                    LOG_ERROR(Render_D3D12,
+                              "Draw with unrepresentable render target slot {} (color_formats "
+                              "value {}, reason: {}) skipped",
+                              i, raw_format, skip_reason);
+                }
+                return;
+            }
+        }
+        const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+        if (!view || !view->RenderTarget().ptr) {
+            // OMSetRenderTargets receives handles for all num_rtvs slots, and a null CPU
+            // handle anywhere in the array is an execution-time device-removal on Xbox
+            // that Close cannot catch.
+            if (!logged_rt_hole) {
+                logged_rt_hole = true;
+                LOG_ERROR(Render_D3D12,
+                          "Draw with unbound render target slot {} (pipeline format NONE={}) skipped",
+                          i, is_none ? 1 : 0);
+            }
+            return;
+        }
+    }
+
+    // NOTE: the index/vertex-range guards stay below, AFTER the buffer-binding section.
+    // ClearDrawBindings() above wipes the index/vertex bindings and only
+    // UpdateGraphicsBuffers/BindHostGeometryBuffers repopulate them, so those guards would
+    // read cleared state (and skip every indexed draw) if moved up here. They still run
+    // before any command_list recording below (descriptor tables, RT transitions, OMSet,
+    // input assembly, Draw).
     // The enabled-uniform/storage masks must be registered BEFORE UpdateGraphicsBuffers
     // resolves binding buffer ids (matching vk's Configure: SetUniformBuffersState, then
     // UpdateGraphicsBuffers). With the old order the first draw resolved nothing and the
@@ -257,6 +349,98 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     m_buffer_cache.BindHostGeometryBuffers(is_indexed);
     m_texture_cache.SynchronizeGraphicsDescriptors();
 
+    // Index/vertex-range guards. These read the index/vertex bindings populated by
+    // UpdateGraphicsBuffers/BindHostGeometryBuffers above, and they still precede every
+    // command_list recording below (descriptor tables, RT transitions, OMSet, input
+    // assembly, Draw).
+    const auto& index_binding = m_runtime.GetIndexBinding();
+    if (params.is_indexed && (!index_binding.valid || !index_binding.supported)) {
+        return;
+    }
+
+    // Out-of-bounds index/vertex ranges fault the GPU at execute time (device removal
+    // that Close cannot catch). Guest draw state can arrive uninitialized on console,
+    // so first_index/base_vertex may exceed the bound buffers; skip such draws here.
+    if (params.is_indexed) {
+        u32 index_elem_size = 0;
+        if (index_binding.format == DXGI_FORMAT_R16_UINT) {
+            index_elem_size = 2;
+        } else if (index_binding.format == DXGI_FORMAT_R32_UINT) {
+            index_elem_size = 4;
+        } else {
+            return;
+        }
+        const u64 index_required =
+            (static_cast<u64>(params.first_index) + static_cast<u64>(params.num_vertices)) *
+            static_cast<u64>(index_elem_size);
+        if (index_required > static_cast<u64>(index_binding.size)) {
+            static bool logged_index_range{};
+            if (!logged_index_range) {
+                logged_index_range = true;
+                LOG_ERROR(Render_D3D12,
+                          "Draw with out-of-bounds index range (first_index={} num_vertices={} "
+                          "index_size={}) skipped",
+                          params.first_index, params.num_vertices, index_binding.size);
+            }
+            return;
+        }
+    }
+    {
+        // Only slots the vertex shader actually reads can fault the GPU fetching
+        // attributes; unread slots are routinely left unbound and must be ignored.
+        // The pipeline input layout is built from the enabled fixed attributes
+        // (see GraphicsPipeline ctor), so the read set is the distinct
+        // State().attributes[i].buffer over enabled attributes.
+        const auto& vertex_bindings = m_runtime.GetVertexBindings();
+        const auto& pipe_state = stored.pipeline->State();
+        bool slot_read[32] = {};
+        u32 num_read_slots = 0;
+        for (u32 i = 0; i < pipe_state.attributes.size(); ++i) {
+            if (pipe_state.attributes[i].enabled == 0) {
+                continue;
+            }
+            const u32 read_slot = pipe_state.attributes[i].buffer.Value();
+            if (read_slot >= vertex_bindings.size() || slot_read[read_slot]) {
+                continue;
+            }
+            slot_read[read_slot] = true;
+            ++num_read_slots;
+        }
+        if (num_read_slots == 0) {
+            if (params.num_vertices > 0) {
+                static bool logged_empty_vs_input{};
+                if (!logged_empty_vs_input) {
+                    logged_empty_vs_input = true;
+                    LOG_ERROR(Render_D3D12,
+                              "Draw with empty vertex-shader input (num_vertices={}) skipped",
+                              params.num_vertices);
+                }
+                return;
+            }
+        }
+        for (u32 slot = 0; slot < vertex_bindings.size(); ++slot) {
+            if (!slot_read[slot]) {
+                continue;
+            }
+            const D3D12_VERTEX_BUFFER_VIEW& view = vertex_bindings[slot];
+            const u64 vertex_required =
+                (static_cast<u64>(params.base_vertex) + static_cast<u64>(params.num_vertices)) *
+                static_cast<u64>(view.StrideInBytes);
+            if (view.BufferLocation == 0 || view.SizeInBytes == 0 || view.StrideInBytes == 0 ||
+                vertex_required > static_cast<u64>(view.SizeInBytes)) {
+                static bool logged_vertex_range{};
+                if (!logged_vertex_range) {
+                    logged_vertex_range = true;
+                    LOG_ERROR(Render_D3D12,
+                              "Draw with degenerate vertex view on read slot={} stride={} "
+                              "vertex_size={} skipped",
+                              slot, view.StrideInBytes, view.SizeInBytes);
+                }
+                return;
+            }
+        }
+    }
+
     // Descriptor slots in shader-register order. The shader_recompiler SPIR-V backend
     // allocates set-0 CBV bindings and set-1 SRV/UAV/sampler bindings from counters
     // that accumulate across the pipeline's stages (per stage: SSBO -> texture buffer
@@ -289,44 +473,92 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         if (!info) {
             continue;
         }
-        // Texel/image/image-buffer descriptors have no host path yet; keep null slots so
-        // the table order still matches the shader's binding allocation.
+        // Texel buffers are bound through the buffer cache (see the BindGraphicsTextureBuffer
+        // walk below); image-buffer/image descriptors still bind as null placeholders so the
+        // table order matches the shader's binding allocation.
         const u32 texel_count = Shader::NumDescriptors(info->texture_buffer_descriptors);
-        if ((texel_count != 0 || !info->image_buffer_descriptors.empty() ||
-             !info->image_descriptors.empty()) &&
+        if ((!info->image_buffer_descriptors.empty() || !info->image_descriptors.empty()) &&
             !logged_texel_buffers) {
             logged_texel_buffers = true;
-            LOG_ERROR(Render_D3D12, "Texel/image-buffer/image bindings bind as null for now");
+            LOG_ERROR(Render_D3D12, "Image-buffer/image bindings bind as null for now");
         }
         const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
         std::vector<VideoCommon::ImageViewInOut> views;
         std::vector<VideoCommon::SamplerId> sampler_ids;
-        for (const auto& desc : info->texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index) {
-                const u32 index_offset = index << desc.size_shift;
-                const u32 offset = desc.cbuf_offset + index_offset;
-                const GPUVAddr addr = cbufs[desc.cbuf_index].address + offset;
-                u32 raw;
+        const auto read_handle = [&](const auto& desc, u32 index) {
+            const u32 index_offset = index << desc.size_shift;
+            const u32 offset = desc.cbuf_offset + index_offset;
+            const GPUVAddr addr = cbufs[desc.cbuf_index].address + offset;
+            if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
+                          std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
                 if (desc.has_secondary) {
                     const u32 second_offset = desc.secondary_cbuf_offset + index_offset;
                     const GPUVAddr separate_addr =
                         cbufs[desc.secondary_cbuf_index].address + second_offset;
-                    const u32 lhs = gpu_memory->Read<u32>(addr) << desc.shift_left;
-                    const u32 rhs =
+                    const u32 lhs_raw = gpu_memory->Read<u32>(addr) << desc.shift_left;
+                    const u32 rhs_raw =
                         gpu_memory->Read<u32>(separate_addr) << desc.secondary_shift_left;
-                    raw = lhs | rhs;
-                } else {
-                    raw = gpu_memory->Read<u32>(addr);
+                    const u32 raw = lhs_raw | rhs_raw;
+                    return TexturePair(raw, via_header);
                 }
-                const auto handle = TexturePair(raw, via_header);
+            }
+            return TexturePair(gpu_memory->Read<u32>(addr), via_header);
+        };
+        const auto add_image = [&](const auto& desc, bool blacklist) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle = read_handle(desc, index);
+                views.push_back({
+                    .index = handle.first,
+                    .blacklist = blacklist,
+                    .id = {},
+                });
+            }
+        };
+        for (const auto& desc : info->texture_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        for (const auto& desc : info->image_buffer_descriptors) {
+            add_image(desc, false);
+        }
+        const size_t sampled_views_begin = views.size();
+        for (const auto& desc : info->texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index) {
+                const auto handle = read_handle(desc, index);
                 views.push_back(VideoCommon::ImageViewInOut{.index = handle.first});
                 sampler_ids.push_back(handle.first == 0 ? VideoCommon::NULL_SAMPLER_ID
                                                          : m_texture_cache.GetGraphicsSamplerId(
                                                                handle.second));
             }
         }
+        const size_t sampled_views_end = views.size();
+        for (const auto& desc : info->image_descriptors) {
+            add_image(desc, desc.is_written);
+        }
         m_texture_cache.FillGraphicsImageViews<false>(
             std::span(views.data(), views.size()));
+        size_t tbo_index = 0;
+        VideoCommon::ImageViewInOut* texture_buffer_it = views.data();
+        const auto add_buffer = [&](const auto& desc, bool is_image) {
+            bool is_written = false;
+            if constexpr (std::is_same_v<decltype(desc), const Shader::ImageBufferDescriptor&>) {
+                is_written = desc.is_written;
+            }
+            for (u32 i = 0; i < desc.count; ++i) {
+                const ImageView& view =
+                    m_texture_cache.GetImageView(texture_buffer_it->id);
+                m_buffer_cache.BindGraphicsTextureBuffer(stage, tbo_index, view.GpuAddr(),
+                                                         view.BufferSize(), view.format,
+                                                         is_written, is_image);
+                ++tbo_index;
+                ++texture_buffer_it;
+            }
+        };
+        for (const auto& desc : info->texture_buffer_descriptors) {
+            add_buffer(desc, false);
+        }
+        for (const auto& desc : info->image_buffer_descriptors) {
+            add_buffer(desc, true);
+        }
         const size_t rec_begin = m_runtime.GetResourceBindings().size();
         m_buffer_cache.BindHostStageBuffers(stage);
         const auto& records = m_runtime.GetResourceBindings();
@@ -359,11 +591,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 });
             }
         }
-        for (size_t i = 0; i < views.size(); ++i) {
+        for (size_t i = sampled_views_begin; i < sampled_views_end; ++i) {
             res_slots.push_back(DrawSlot{
                 .kind = SlotKind::Sampled,
                 .view = views[i].id,
-                .sampler = sampler_ids[i],
+                .sampler = sampler_ids[i - sampled_views_begin],
             });
         }
         for (const auto& desc : info->image_descriptors) {
@@ -375,48 +607,50 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
         }
     }
-    m_texture_cache.UpdateRenderTargets(false);
-    Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
-
-    const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
-    const DrawParams params = MakeDrawParams(draw_state, instance_count, is_indexed);
-    const auto& index_binding = m_runtime.GetIndexBinding();
-    // Guard rails: never submit draws the backend cannot represent yet. An unbound
-    // render target, an unexpanded index format, or an empty draw would otherwise go
-    // to the GPU as undefined commands.
-    ImageView* depth_view = framebuffer ? framebuffer->DepthBuffer() : nullptr;
-    u32 num_rtvs = 0;
-    for (size_t i = 0; i < VideoCommon::NUM_RT; ++i) {
-        const auto format =
-            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
-        if (format != Tegra::RenderTargetFormat::NONE) {
-            num_rtvs = static_cast<u32>(i) + 1;
+    static u32 traced_draws = 0;
+    const auto& trace_vertex_bindings = m_runtime.GetVertexBindings();
+    const u32 trace_ib_size = index_binding.valid ? index_binding.size : 0;
+    const u32 trace_vb0_size =
+        m_runtime.MaxVertexSlot() > 0 ? trace_vertex_bindings[0].SizeInBytes : 0;
+    const u32 trace_vb0_stride =
+        m_runtime.MaxVertexSlot() > 0 ? trace_vertex_bindings[0].StrideInBytes : 0;
+    if (traced_draws < 30) {
+        if (num_rtvs > 4) {
+            LOG_DEBUG(Render_D3D12,
+                      "Draw {}: num_rtvs={} fmt=[{},{},{},{},{},{},{},{}] dsv={} topo={} verts={} "
+                      "instances={} indexed={} first_idx={} base_vtx={} base_inst={} ib_size={} "
+                      "vb0_size={} vb0_stride={}",
+                      traced_draws, num_rtvs,
+                      static_cast<u32>(stored.pipeline->State().color_formats[0]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[1]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[2]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[3]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[4]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[5]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[6]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[7]),
+                      depth_view ? 1 : 0,
+                      static_cast<u32>(stored.pipeline->State().topology.Value()),
+                      params.num_vertices, params.num_instances, params.is_indexed ? 1 : 0,
+                      params.first_index, params.base_vertex, params.base_instance, trace_ib_size,
+                      trace_vb0_size, trace_vb0_stride);
+        } else {
+            LOG_DEBUG(Render_D3D12,
+                      "Draw {}: num_rtvs={} fmt=[{},{},{},{}] dsv={} topo={} verts={} instances={} "
+                      "indexed={} first_idx={} base_vtx={} base_inst={} ib_size={} vb0_size={} "
+                      "vb0_stride={}",
+                      traced_draws, num_rtvs,
+                      static_cast<u32>(stored.pipeline->State().color_formats[0]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[1]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[2]),
+                      static_cast<u32>(stored.pipeline->State().color_formats[3]),
+                      depth_view ? 1 : 0,
+                      static_cast<u32>(stored.pipeline->State().topology.Value()),
+                      params.num_vertices, params.num_instances, params.is_indexed ? 1 : 0,
+                      params.first_index, params.base_vertex, params.base_instance, trace_ib_size,
+                      trace_vb0_size, trace_vb0_stride);
         }
-    }
-    if (params.num_vertices == 0 || params.num_instances == 0) {
-        return;
-    }
-    if (params.is_indexed && (!index_binding.valid || !index_binding.supported)) {
-        return;
-    }
-    if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
-        return;
-    }
-    for (size_t i = 0; i < num_rtvs; ++i) {
-        const auto format =
-            static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
-        if (format == Tegra::RenderTargetFormat::NONE) {
-            continue;
-        }
-        const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
-        if (!view || !view->RenderTarget().ptr) {
-            // OMSetRenderTargets with a null RTV handle is a device-removing error.
-            if (!logged_rt_hole) {
-                logged_rt_hole = true;
-                LOG_ERROR(Render_D3D12, "Draw with unbound render target slot {} skipped", i);
-            }
-            return;
-        }
+        ++traced_draws;
     }
 
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
@@ -690,6 +924,27 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 }
 
 void RasterizerD3D12::DrawTexture() {}
+
+std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
+    const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride) {
+    if (!framebuffer_addr) {
+        return {};
+    }
+    std::scoped_lock lock{m_texture_cache.mutex};
+    const auto [image_view, scaled] =
+        m_texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
+    if (!image_view) {
+        return {};
+    }
+    m_query_cache.NotifySegment(false);
+    (void)scaled; // Resolution scaling is disabled on the D3D12 backend for now.
+    return AccelerateDisplayInfo{
+        .view = image_view,
+        .width = image_view->size.width,
+        .height = image_view->size.height,
+    };
+}
+
 void RasterizerD3D12::Clear(u32 layer_count) {}
 void RasterizerD3D12::DispatchCompute() {}
 void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {

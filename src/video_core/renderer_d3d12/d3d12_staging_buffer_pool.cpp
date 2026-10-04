@@ -37,6 +37,54 @@ StagingBufferRef StagingBufferPool::Request(u64 size, StagingUsage usage, bool d
         break;
     }
     if (!chosen) {
+        // (b) Reclaim: the oldest expired entry of the same size class, usage and
+        // deferred flag, even if still marked in_use. Safe because the pool is only
+        // pumped after the GPU has gone idle (FlushCommands waits before recycling),
+        // so an in_use entry here is no longer referenced by in-flight work.
+        u64 best_tick = ~u64{0};
+        for (u64 i = 0; i < entries.size(); ++i) {
+            const Entry& entry = entries[i];
+            if (entry.size != size_class || entry.usage != usage ||
+                entry.deferred != deferred) {
+                continue;
+            }
+            if (entry.last_used_tick + NUM_SYNCS > tick) {
+                continue;
+            }
+            if (entry.last_used_tick < best_tick) {
+                best_tick = entry.last_used_tick;
+                chosen_index = i;
+            }
+        }
+        if (chosen_index != ~u64{0}) {
+            chosen = &entries[chosen_index];
+        }
+    }
+    if (!chosen) {
+        // (c) Overwrite: the oldest entry of the same size class, usage and deferred
+        // flag regardless of age or in_use state, instead of allocating unboundedly.
+        u64 best_tick = ~u64{0};
+        for (u64 i = 0; i < entries.size(); ++i) {
+            const Entry& entry = entries[i];
+            if (entry.size != size_class || entry.usage != usage ||
+                entry.deferred != deferred) {
+                continue;
+            }
+            if (entry.last_used_tick < best_tick) {
+                best_tick = entry.last_used_tick;
+                chosen_index = i;
+            }
+        }
+        if (chosen_index != ~u64{0}) {
+            chosen = &entries[chosen_index];
+        }
+    }
+    if (!chosen) {
+        // Hard cap: evict LRU entries until the new entry fits (at least one
+        // eviction attempt is bounded by the pool being non-empty).
+        while (!entries.empty() && total_bytes + size_class > MAX_POOL_BYTES) {
+            EvictLRU();
+        }
         chosen = &CreateEntry(size_class, usage);
         chosen_index = entries.size() - 1;
     }
@@ -61,8 +109,18 @@ void StagingBufferPool::FreeDeferred(StagingBufferRef& ref) {
     if (ref.index >= entries.size()) {
         return;
     }
-    entries[ref.index].in_use = false;
-    entries[ref.index].deferred = false;
+    Entry& entry = entries[ref.index];
+    if (entry.resource.Get() != ref.buffer) {
+        // Stale index: EvictLRU() erases entries via vector::erase, shifting later
+        // indices, so the slot may now hold a different resource. Drop the ref
+        // without touching the new occupant. (Reused-in-place entries keep their
+        // resource, and TickFrame never touches entries, so no check is needed
+        // for the reclaim/overwrite paths.)
+        ref = StagingBufferRef{};
+        return;
+    }
+    entry.in_use = false;
+    entry.deferred = false;
     deferred_frees.emplace_back(ref.index, tick);
     ref = StagingBufferRef{};
 }
@@ -114,8 +172,15 @@ StagingBufferPool::Entry& StagingBufferPool::CreateEntry(u64 size, StagingUsage 
     const D3D12_RESOURCE_STATES state =
         usage == StagingUsage::Upload ? D3D12_RESOURCE_STATE_GENERIC_READ
                                       : D3D12_RESOURCE_STATE_COPY_DEST;
-    if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
-                                            IID_PPV_ARGS(&entry.resource)))) {
+    HRESULT hr = d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state,
+                                               nullptr, IID_PPV_ARGS(&entry.resource));
+    if (FAILED(hr) && !entries.empty()) {
+        // Memory pressure: evict the LRU entry and retry once before giving up.
+        EvictLRU();
+        hr = d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                                          IID_PPV_ARGS(&entry.resource));
+    }
+    if (FAILED(hr)) {
         LOG_CRITICAL(Render_D3D12, "Staging buffer creation failed ({} bytes)", size);
         // Keep the pool usable with an empty entry; the caller will see a null buffer.
         entries.emplace_back(std::move(entry));
@@ -127,8 +192,51 @@ StagingBufferPool::Entry& StagingBufferPool::CreateEntry(u64 size, StagingUsage 
     }
     entry.mapped_span = std::span<u8>{static_cast<u8*>(mapped), static_cast<size_t>(size)};
     total_bytes += size;
+    if (!logged_high_water && total_bytes > 128ull * 1024 * 1024) {
+        logged_high_water = true;
+        LOG_INFO(Render_D3D12, "Staging pool high-water {} bytes", total_bytes);
+    }
     entries.emplace_back(std::move(entry));
     return entries.back();
+}
+
+void StagingBufferPool::EvictLRU() {
+    if (entries.empty()) {
+        return;
+    }
+    // Prefer an idle entry; only evict an in_use entry when every entry is busy.
+    u64 victim = ~u64{0};
+    u64 victim_tick = ~u64{0};
+    for (u64 i = 0; i < entries.size(); ++i) {
+        if (entries[i].in_use) {
+            continue;
+        }
+        if (entries[i].last_used_tick < victim_tick) {
+            victim_tick = entries[i].last_used_tick;
+            victim = i;
+        }
+    }
+    if (victim == ~u64{0}) {
+        for (u64 i = 0; i < entries.size(); ++i) {
+            if (entries[i].last_used_tick < victim_tick) {
+                victim_tick = entries[i].last_used_tick;
+                victim = i;
+            }
+        }
+    }
+    if (victim == ~u64{0}) {
+        return;
+    }
+    // Only successful entries were charged to total_bytes; failed (null resource)
+    // entries were emplaced without charging the pool.
+    const u64 evicted_size = entries[victim].size;
+    const bool evicted_charged = entries[victim].resource.Get() != nullptr;
+    entries.erase(entries.begin() + static_cast<ptrdiff_t>(victim));
+    if (evicted_charged) {
+        total_bytes = total_bytes >= evicted_size ? total_bytes - evicted_size : 0;
+    }
+    // Note: erase shifts later indices, so deferred_frees may hold stale indices.
+    // FreeDeferred validates bounds and resource identity before touching an entry.
 }
 
 } // namespace D3D12

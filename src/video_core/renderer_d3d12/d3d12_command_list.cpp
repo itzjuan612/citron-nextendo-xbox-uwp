@@ -34,13 +34,41 @@ void CommandList::Reset() {
     list->Reset(allocator.Get(), nullptr);
 }
 
-void CommandList::Close() {
+void CommandList::Recover(ID3D12Device* device) {
+    // A list whose Close failed stays wedged open: Close will keep returning
+    // E_FAIL and Reset() cannot recover it. Drop both objects and recreate
+    // them exactly like the constructor, ending in the same closed (ready)
+    // state.
+    allocator.Reset();
+    list.Reset();
+    HRESULT hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                    IID_PPV_ARGS(&allocator));
+    if (FAILED(hr)) {
+        LOG_ERROR(Render_D3D12, "CreateCommandAllocator failed: {:#x}", static_cast<u32>(hr));
+        allocator.Reset();
+        list.Reset();
+        return;
+    }
+    hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+                                       IID_PPV_ARGS(&list));
+    if (FAILED(hr)) {
+        LOG_ERROR(Render_D3D12, "CreateCommandList failed: {:#x}", static_cast<u32>(hr));
+        allocator.Reset();
+        list.Reset();
+        return;
+    }
+    list->Close();
+}
+
+bool CommandList::Close() {
     if (list) {
         const HRESULT hr = list->Close();
         if (FAILED(hr)) {
             LOG_ERROR(Render_D3D12, "CommandList::Close failed: {:#x}", static_cast<u32>(hr));
+            return false;
         }
     }
+    return true;
 }
 
 void CommandList::Execute(Device& device) {
@@ -48,7 +76,11 @@ void CommandList::Execute(Device& device) {
         LOG_ERROR(Render_D3D12, "CommandList::Execute: invalid list/allocator");
         return;
     }
-    Close();
+    if (!Close()) {
+        LOG_ERROR(Render_D3D12, "CommandList::Execute: skipping submit, list failed Close");
+        Recover(device.GetDevice());
+        return;
+    }
     ID3D12CommandList* lists[] = {list.Get()};
     device.GetQueue()->ExecuteCommandLists(1, lists);
 }
@@ -89,6 +121,9 @@ void CommandList::ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE dsv, D3D12_C
 
 void CommandList::Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
                              D3D12_RESOURCE_STATES after) {
+    if (resource == nullptr) {
+        return;
+    }
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barrier.Transition.pResource = resource;
@@ -146,6 +181,9 @@ void CommandList::Dispatch(u32 group_count_x, u32 group_count_y, u32 group_count
 
 void CommandList::CopyBufferRegion(ID3D12Resource* dst, u64 dst_offset, ID3D12Resource* src,
                                    u64 src_offset, u64 size) {
+    if (dst == nullptr || src == nullptr) {
+        return;
+    }
     list->CopyBufferRegion(dst, dst_offset, src, src_offset, size);
 }
 

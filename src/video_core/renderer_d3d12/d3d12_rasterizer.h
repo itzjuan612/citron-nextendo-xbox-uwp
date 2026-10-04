@@ -3,8 +3,11 @@
 
 #pragma once
 
+#include <optional>
+
 #include "common/common_types.h"
 #include "video_core/control/channel_state_cache.h"
+#include "video_core/framebuffer_config.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_d3d12/d3d12_buffer_cache.h"
@@ -47,6 +50,14 @@ public:
 
 private:
     BufferCache& buffer_cache;
+};
+
+/// Result of AccelerateDisplay: the texture-cache view backing the guest display
+/// framebuffer, for the renderer's present blit.
+struct AccelerateDisplayInfo {
+    ImageView* view{};
+    u32 width{};
+    u32 height{};
 };
 
 /// D3D12 rasterizer. Currently a functional skeleton: the command/state translation is
@@ -100,6 +111,11 @@ public:
                                   std::span<const u8> memory) override;
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback) override;
+    /// Present-path hook (mirrors RasterizerVulkan::AccelerateDisplay): returns the
+    /// texture-cache view that backs the guest display framebuffer, or nullopt when
+    /// the framebuffer is not in the cache yet (caller falls back to a clear).
+    std::optional<AccelerateDisplayInfo> AccelerateDisplay(
+        const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride);
     void InitializeChannel(Tegra::Control::ChannelState& channel) override;
     void BindChannel(Tegra::Control::ChannelState& channel) override;
     void ReleaseChannel(s32 channel_id) override;

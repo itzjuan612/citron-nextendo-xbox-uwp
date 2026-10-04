@@ -31,6 +31,11 @@ using VideoCommon::Offset3D;
 using VideoCommon::SubresourceLayers;
 using VideoCore::Surface::PixelFormat;
 
+// Device-removal bisection complete — uploads re-enabled (kSkipTextureUploadCopies = false);
+// texture upload/download GPU recording resumes (records into runtime->command_list:
+// Transition/Copy/Clear/Barrier).
+constexpr bool kSkipTextureUploadCopies = false;
+
 u32 CalcSubresource(u32 mip, u32 slice, u32 plane, u32 mips, u32 array_size) {
     return mip + slice * mips + plane * mips * array_size;
 }
@@ -78,9 +83,58 @@ DXGI_FORMAT ResourceFormat(PixelFormat format) {
         return DXGI_FORMAT_R32G8X24_TYPELESS;
     case PixelFormat::BC1_RGBA_UNORM:
         return DXGI_FORMAT_BC1_TYPELESS;
+    case PixelFormat::BC2_UNORM:
+        return DXGI_FORMAT_BC2_TYPELESS;
+    case PixelFormat::BC3_UNORM:
+        return DXGI_FORMAT_BC3_TYPELESS;
+    case PixelFormat::BC4_UNORM:
+    case PixelFormat::BC4_SNORM:
+        return DXGI_FORMAT_BC4_TYPELESS;
+    case PixelFormat::BC5_UNORM:
+    case PixelFormat::BC5_SNORM:
+        return DXGI_FORMAT_BC5_TYPELESS;
+    case PixelFormat::BC6H_UFLOAT:
+    case PixelFormat::BC6H_SFLOAT:
+        return DXGI_FORMAT_BC6H_TYPELESS;
+    case PixelFormat::A2B10G10R10_UNORM:
+    case PixelFormat::A2B10G10R10_UINT:
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+    case PixelFormat::B10G11R11_FLOAT:
+        // Guest stores BGR order vs DXGI RGB order (R/B channels swap);
+        // TODO: proper swizzle.
+        return DXGI_FORMAT_R11G11B10_FLOAT;
     case PixelFormat::BC7_UNORM:
     case PixelFormat::BC7_SRGB:
         return DXGI_FORMAT_BC7_TYPELESS;
+    case PixelFormat::R16G16B16A16_FLOAT:
+    case PixelFormat::R16G16B16A16_UNORM:
+    case PixelFormat::R16G16B16A16_SNORM:
+    case PixelFormat::R16G16B16A16_SINT:
+    case PixelFormat::R16G16B16A16_UINT:
+    case PixelFormat::R16G16B16X16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+    case PixelFormat::R32G32B32A32_FLOAT:
+    case PixelFormat::R32G32B32A32_UINT:
+    case PixelFormat::R32G32B32A32_SINT:
+        return DXGI_FORMAT_R32G32B32A32_TYPELESS;
+    case PixelFormat::R32G32B32_FLOAT:
+        return DXGI_FORMAT_R32G32B32_TYPELESS;
+    case PixelFormat::R32G32_FLOAT:
+    case PixelFormat::R32G32_SINT:
+    case PixelFormat::R32G32_UINT:
+        return DXGI_FORMAT_R32G32_TYPELESS;
+    case PixelFormat::R16G16_FLOAT:
+    case PixelFormat::R16G16_UNORM:
+    case PixelFormat::R16G16_SNORM:
+    case PixelFormat::R16G16_UINT:
+    case PixelFormat::R16G16_SINT:
+        return DXGI_FORMAT_R16G16_TYPELESS;
+    case PixelFormat::BC1_RGBA_SRGB:
+        return DXGI_FORMAT_BC1_TYPELESS;
+    case PixelFormat::BC2_SRGB:
+        return DXGI_FORMAT_BC2_TYPELESS;
+    case PixelFormat::BC3_SRGB:
+        return DXGI_FORMAT_BC3_TYPELESS;
     default:
         return DXGI_FORMAT_UNKNOWN;
     }
@@ -146,10 +200,74 @@ DXGI_FORMAT SampledFormat(PixelFormat format) {
         return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
     case PixelFormat::BC1_RGBA_UNORM:
         return DXGI_FORMAT_BC1_UNORM;
+    case PixelFormat::BC2_UNORM:
+        return DXGI_FORMAT_BC2_UNORM;
+    case PixelFormat::BC3_UNORM:
+        return DXGI_FORMAT_BC3_UNORM;
+    case PixelFormat::BC4_UNORM:
+        return DXGI_FORMAT_BC4_UNORM;
+    case PixelFormat::BC4_SNORM:
+        return DXGI_FORMAT_BC4_SNORM;
+    case PixelFormat::BC5_UNORM:
+        return DXGI_FORMAT_BC5_UNORM;
+    case PixelFormat::BC5_SNORM:
+        return DXGI_FORMAT_BC5_SNORM;
+    case PixelFormat::BC6H_UFLOAT:
+        return DXGI_FORMAT_BC6H_UF16;
+    case PixelFormat::BC6H_SFLOAT:
+        return DXGI_FORMAT_BC6H_SF16;
+    case PixelFormat::A2B10G10R10_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case PixelFormat::A2B10G10R10_UINT:
+        return DXGI_FORMAT_R10G10B10A2_UINT;
+    case PixelFormat::B10G11R11_FLOAT:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
     case PixelFormat::BC7_UNORM:
         return DXGI_FORMAT_BC7_UNORM;
     case PixelFormat::BC7_SRGB:
         return DXGI_FORMAT_BC7_UNORM_SRGB;
+    case PixelFormat::R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case PixelFormat::R16G16B16A16_UNORM:
+        return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case PixelFormat::R16G16B16A16_SNORM:
+        return DXGI_FORMAT_R16G16B16A16_SNORM;
+    case PixelFormat::R16G16B16A16_SINT:
+        return DXGI_FORMAT_R16G16B16A16_SINT;
+    case PixelFormat::R16G16B16A16_UINT:
+        return DXGI_FORMAT_R16G16B16A16_UINT;
+    case PixelFormat::R16G16B16X16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case PixelFormat::R32G32B32A32_FLOAT:
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+    case PixelFormat::R32G32B32A32_UINT:
+        return DXGI_FORMAT_R32G32B32A32_UINT;
+    case PixelFormat::R32G32B32A32_SINT:
+        return DXGI_FORMAT_R32G32B32A32_SINT;
+    case PixelFormat::R32G32B32_FLOAT:
+        return DXGI_FORMAT_R32G32B32_FLOAT;
+    case PixelFormat::R32G32_FLOAT:
+        return DXGI_FORMAT_R32G32_FLOAT;
+    case PixelFormat::R32G32_SINT:
+        return DXGI_FORMAT_R32G32_SINT;
+    case PixelFormat::R32G32_UINT:
+        return DXGI_FORMAT_R32G32_UINT;
+    case PixelFormat::R16G16_FLOAT:
+        return DXGI_FORMAT_R16G16_FLOAT;
+    case PixelFormat::R16G16_UNORM:
+        return DXGI_FORMAT_R16G16_UNORM;
+    case PixelFormat::R16G16_SNORM:
+        return DXGI_FORMAT_R16G16_SNORM;
+    case PixelFormat::R16G16_UINT:
+        return DXGI_FORMAT_R16G16_UINT;
+    case PixelFormat::R16G16_SINT:
+        return DXGI_FORMAT_R16G16_SINT;
+    case PixelFormat::BC1_RGBA_SRGB:
+        return DXGI_FORMAT_BC1_UNORM_SRGB;
+    case PixelFormat::BC2_SRGB:
+        return DXGI_FORMAT_BC2_UNORM_SRGB;
+    case PixelFormat::BC3_SRGB:
+        return DXGI_FORMAT_BC3_UNORM_SRGB;
     default:
         return DXGI_FORMAT_UNKNOWN;
     }
@@ -161,6 +279,17 @@ DXGI_FORMAT RenderTargetFormat(PixelFormat format) {
     case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
     case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
     case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
     case DXGI_FORMAT_BC7_UNORM:
     case DXGI_FORMAT_BC7_UNORM_SRGB:
         return DXGI_FORMAT_UNKNOWN;
@@ -186,13 +315,20 @@ DXGI_FORMAT DepthStencilFormat(PixelFormat format) {
     }
 }
 
-bool IsDepthStencilFormat(PixelFormat format) {
-    return DepthStencilFormat(format) != DXGI_FORMAT_UNKNOWN;
-}
-
 bool IsCompressedFormat(PixelFormat format) {
     switch (format) {
     case PixelFormat::BC1_RGBA_UNORM:
+    case PixelFormat::BC1_RGBA_SRGB:
+    case PixelFormat::BC2_UNORM:
+    case PixelFormat::BC2_SRGB:
+    case PixelFormat::BC3_UNORM:
+    case PixelFormat::BC3_SRGB:
+    case PixelFormat::BC4_UNORM:
+    case PixelFormat::BC4_SNORM:
+    case PixelFormat::BC5_UNORM:
+    case PixelFormat::BC5_SNORM:
+    case PixelFormat::BC6H_UFLOAT:
+    case PixelFormat::BC6H_SFLOAT:
     case PixelFormat::BC7_UNORM:
     case PixelFormat::BC7_SRGB:
         return true;
@@ -215,7 +351,12 @@ u32 ElementBytes(PixelFormat format) {
         return 4;
     case DXGI_FORMAT_R32G8X24_TYPELESS:
     case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC4_TYPELESS:
         return 8;
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_BC6H_TYPELESS:
     case DXGI_FORMAT_BC7_TYPELESS:
         return 16;
     default:
@@ -356,6 +497,27 @@ void Image::UploadMemory(ID3D12Resource* buffer, u64 offset,
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
         return;
     }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (buffer) GPU copies "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        initialized = true;
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (buffer) GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
+        initialized = true;
+        return;
+    }
     runtime->Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_DEST);
     const std::span<u8> staging_span = runtime->staging_pool.MappedSpan(buffer);
@@ -368,7 +530,33 @@ void Image::UploadMemory(ID3D12Resource* buffer, u64 offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    if (!map.buffer) {
+        // Staging allocation failed; skip the upload (the caller's
+        // CPU-side state is still updated).
+        return;
+    }
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
+        return;
+    }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (staging) GPU copies "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        initialized = true;
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (staging) GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
+        initialized = true;
         return;
     }
     runtime->Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
@@ -386,6 +574,25 @@ void Image::DownloadMemory(ID3D12Resource* buffer, size_t offset,
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
         return;
     }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (buffer) GPU copies "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (buffer) GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
+        return;
+    }
     runtime->Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_SOURCE);
     const std::span<u8> staging_span = runtime->staging_pool.MappedSpan(buffer);
@@ -398,6 +605,15 @@ void Image::DownloadMemory(ID3D12Resource* buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<ID3D12Resource*> buffers, std::span<size_t> offsets,
                            std::span<const BufferImageCopy> copies) {
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (fan-out) GPU copies "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        return;
+    }
     const size_t count = std::min({buffers.size(), offsets.size(), copies.size()});
     for (size_t i = 0; i < count; ++i) {
         DownloadMemory(buffers[i], offsets[i], std::span<const BufferImageCopy>{&copies[i], 1});
@@ -405,7 +621,31 @@ void Image::DownloadMemory(std::span<ID3D12Resource*> buffers, std::span<size_t>
 }
 
 void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    if (!map.buffer) {
+        // Staging allocation failed; skip the readback (the caller's
+        // CPU-side state is still updated).
+        return;
+    }
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
+        return;
+    }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (staging) GPU copies "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (staging) GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
         return;
     }
     runtime->Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
@@ -420,6 +660,25 @@ void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferIm
 void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> staging_span,
                               u64 src_offset, const BufferImageCopy& copy) {
     if (!src_buffer) {
+        return;
+    }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadSubresource GPU copy "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadSubresource GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
         return;
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
@@ -522,6 +781,25 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
 void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> staging_span,
                                  u64 dst_offset, const BufferImageCopy& copy) {
     if (!dst_buffer) {
+        return;
+    }
+    if (kSkipTextureUploadCopies) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadSubresource GPU copy "
+                                    "(kSkipTextureUploadCopies bisection)");
+        }
+        return;
+    }
+    if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
+        static bool logged_once = false;
+        if (!logged_once) {
+            logged_once = true;
+            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadSubresource GPU copy for "
+                                    "unmapped guest format {}",
+                      static_cast<u32>(info.format));
+        }
         return;
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
@@ -801,8 +1079,25 @@ Sampler::Sampler(TextureCacheRuntime&, const TSCEntry& config) {
     desc.BorderColor[3] = opaque ? 1.0f : 0.0f;
 }
 
-Framebuffer::Framebuffer(TextureCacheRuntime&, std::array<ImageView*, VideoCommon::NUM_RT>,
-                         ImageView*, const VideoCommon::RenderTargets&) {}
+Framebuffer::Framebuffer(TextureCacheRuntime&,
+                         std::array<ImageView*, VideoCommon::NUM_RT> color_buffers_,
+                         ImageView* depth_buffer_, const VideoCommon::RenderTargets& key)
+    : color_buffers{color_buffers_}, depth_buffer{depth_buffer_} {
+    // Render area: the render-targets key size clamped to the smallest bound color
+    // buffer (the draw translation also clamps its viewport/scissor to this).
+    VideoCommon::Extent2D size{key.size};
+    for (ImageView* view : color_buffers) {
+        if (view) {
+            size.width = std::min(size.width, view->size.width);
+            size.height = std::min(size.height, view->size.height);
+        }
+    }
+    if (depth_buffer) {
+        size.width = std::min(size.width, depth_buffer->size.width);
+        size.height = std::min(size.height, depth_buffer->size.height);
+    }
+    render_area = size;
+}
 
 TextureCacheRuntime::TextureCacheRuntime(Device& device_, CommandList& command_list_,
                                          StagingBufferPool& staging_pool_)
@@ -842,6 +1137,17 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 
 bool TextureCacheRuntime::CanReportMemoryUsage() const {
     return false;
+}
+
+bool TextureCacheRuntime::IsDepthStencilFormat(VideoCore::Surface::PixelFormat format) {
+    return DepthStencilFormat(format) != DXGI_FORMAT_UNKNOWN;
+}
+
+bool TextureCacheRuntime::IsRepresentableRenderTarget(VideoCore::Surface::PixelFormat format) {
+    if (DepthStencilFormat(format) != DXGI_FORMAT_UNKNOWN) {
+        return false;
+    }
+    return RenderTargetFormat(format) != DXGI_FORMAT_UNKNOWN;
 }
 
 void TextureCacheRuntime::TransitionImageLayout(Image& image) {
@@ -918,12 +1224,60 @@ bool TextureCacheRuntime::ShouldReinterpret(Image& dst, Image& src) {
            dst.info.format != src.info.format;
 }
 
-void TextureCacheRuntime::ReinterpretImage(Image&, Image&,
-                                           std::span<const ImageCopy>) {
-    if (!logged_reinterpret) {
-        logged_reinterpret = true;
-        LOG_ERROR(Render_D3D12, "Reinterpret image copies not implemented yet");
+void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
+                                           std::span<const ImageCopy> copies) {
+    if (!command_list.IsValid() || !dst.Handle() || !src.Handle()) {
+        return;
     }
+    ID3D12Resource* const dst_resource = dst.Handle();
+    ID3D12Resource* const src_resource = src.Handle();
+    if (dst_resource == src_resource) {
+        return;
+    }
+    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+    const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
+    const u32 src_array_size =
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(src_desc.DepthOrArraySize);
+    const u32 dst_array_size =
+        dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(dst_desc.DepthOrArraySize);
+    for (const ImageCopy& copy : copies) {
+        if (copy.extent.width == 0 || copy.extent.height == 0 || copy.extent.depth == 0) {
+            continue;
+        }
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = src_resource;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = CalcSubresource(
+            static_cast<u32>(copy.src_subresource.base_level),
+            static_cast<u32>(copy.src_subresource.base_layer), 0, src_desc.MipLevels,
+            src_array_size);
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = dst_resource;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst_loc.SubresourceIndex = CalcSubresource(
+            static_cast<u32>(copy.dst_subresource.base_level),
+            static_cast<u32>(copy.dst_subresource.base_layer), 0, dst_desc.MipLevels,
+            dst_array_size);
+        D3D12_BOX box{};
+        box.left = static_cast<UINT>(copy.src_offset.x);
+        box.top = static_cast<UINT>(copy.src_offset.y);
+        box.front = 0;
+        box.right = box.left + copy.extent.width;
+        box.bottom = box.top + copy.extent.height;
+        box.back = 1;
+        // 2D-only path per the template (UNIMPLEMENTED_IF on non-e2D types).
+        command_list.Get()->CopyTextureRegion(&dst_loc, static_cast<UINT>(copy.dst_offset.x),
+                                              static_cast<UINT>(copy.dst_offset.y), 0, &src_loc,
+                                              &box);
+    }
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCopy>) {
@@ -951,11 +1305,66 @@ void TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst_view, ImageView
     (void)src_region;
 }
 
-void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView&, ImageView&) {
-    if (!logged_convert) {
-        logged_convert = true;
-        LOG_ERROR(Render_D3D12, "Image format conversion not implemented yet");
+void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
+                                       ImageView& src_view) {
+    ID3D12Resource* const dst_resource = dst_view.Resource();
+    ID3D12Resource* const src_resource = src_view.Resource();
+    if (!command_list.IsValid() || !dst_resource || !src_resource ||
+        dst_resource == src_resource) {
+        return;
     }
+    if (src_resource->GetDesc().Format != dst_resource->GetDesc().Format) {
+        if (!logged_convert) {
+            logged_convert = true;
+            LOG_ERROR(Render_D3D12, "Image format conversion not implemented yet");
+        }
+        return;
+    }
+    const u32 width = std::min(dst_view.size.width, src_view.size.width);
+    const u32 height = std::min(dst_view.size.height, src_view.size.height);
+    if (width == 0 || height == 0) {
+        return;
+    }
+    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+    const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
+    const u32 src_array_size =
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(src_desc.DepthOrArraySize);
+    const u32 dst_array_size =
+        dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(dst_desc.DepthOrArraySize);
+    D3D12_BOX box{};
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = width;
+    box.bottom = height;
+    box.back = 1;
+    for (s32 level = 0; level < src_view.range.extent.levels; ++level) {
+        for (s32 layer = 0; layer < src_view.range.extent.layers; ++layer) {
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = src_resource;
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src_loc.SubresourceIndex = CalcSubresource(
+                static_cast<u32>(src_view.range.base.level + level),
+                static_cast<u32>(src_view.range.base.layer + layer), 0, src_desc.MipLevels,
+                src_array_size);
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = dst_resource;
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst_loc.SubresourceIndex = CalcSubresource(
+                static_cast<u32>(dst_view.range.base.level + level),
+                static_cast<u32>(dst_view.range.base.layer + layer), 0, dst_desc.MipLevels,
+                dst_array_size);
+            command_list.Get()->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
+        }
+    }
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 std::span<const DXGI_FORMAT> TextureCacheRuntime::ViewFormats(PixelFormat format) {
@@ -1008,14 +1417,53 @@ ComPtr<ID3D12Resource> TextureCacheRuntime::CreateImageResource(
         array_size = 1;
     }
 
+    // Block-compressed formats cannot be bound as render targets or UAVs;
+    // they stay plain sample-only resources (no RTV/UAV flags possible).
+    const bool is_compressed =
+        info.format == PixelFormat::BC1_RGBA_UNORM ||
+        info.format == PixelFormat::BC1_RGBA_SRGB ||
+        info.format == PixelFormat::BC2_UNORM ||
+        info.format == PixelFormat::BC2_SRGB ||
+        info.format == PixelFormat::BC3_UNORM ||
+        info.format == PixelFormat::BC3_SRGB ||
+        info.format == PixelFormat::BC4_UNORM ||
+        info.format == PixelFormat::BC4_SNORM ||
+        info.format == PixelFormat::BC5_UNORM ||
+        info.format == PixelFormat::BC5_SNORM ||
+        info.format == PixelFormat::BC6H_UFLOAT ||
+        info.format == PixelFormat::BC6H_SFLOAT ||
+        info.format == PixelFormat::BC7_UNORM ||
+        info.format == PixelFormat::BC7_SRGB;
+
     const bool depth_stencil = IsDepthStencilFormat(info.format);
     D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
     if (depth_stencil) {
         flags |= D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-    } else {
+    } else if (!is_compressed) {
         flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        // R11G11B10_FLOAT does NOT support UAV views: a UAV flag on such a
+        // resource makes the (void, unchecked) CreateUnorderedAccessView call
+        // fail and leaves a garbage descriptor that removes the device once
+        // bound. Allow UAV only on formats with known UAV support, keyed on
+        // the resolved typeless resource format.
         if (info.num_samples <= 1) {
-            flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            switch (format) {
+            case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+            case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+            case DXGI_FORMAT_R16G16_TYPELESS:
+            case DXGI_FORMAT_R32G32_TYPELESS:
+            case DXGI_FORMAT_R32_TYPELESS:
+            case DXGI_FORMAT_R16_TYPELESS:
+            case DXGI_FORMAT_R8G8_TYPELESS:
+            case DXGI_FORMAT_R8_TYPELESS:
+                flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+                break;
+            default:
+                break;
+            }
         }
     }
 
@@ -1045,19 +1493,26 @@ ComPtr<ID3D12Resource> TextureCacheRuntime::CreateImageResource(
         clear.DepthStencil.Depth = 1.0f;
         clear.DepthStencil.Stencil = 0;
         clear_value = &clear;
-    } else if ((flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0) {
-        clear.Format = SampledFormat(info.format) != DXGI_FORMAT_UNKNOWN
-                           ? SampledFormat(info.format)
-                           : format;
+    } else if ((flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+               SampledFormat(info.format) != DXGI_FORMAT_UNKNOWN) {
+        // CreateCommittedResource rejects typeless clear formats
+        // (E_INVALIDARG), so only clear when the sampled format is
+        // fully typed; otherwise leave clear_value nullptr.
+        clear.Format = SampledFormat(info.format);
         clear_value = &clear;
     }
 
     ComPtr<ID3D12Resource> resource;
-    if (FAILED(device.GetDevice()->CreateCommittedResource(
+    const HRESULT create_hr = device.GetDevice()->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, clear_value,
-            IID_PPV_ARGS(&resource)))) {
-        LOG_CRITICAL(Render_D3D12, "Image creation failed ({}x{} fmt={})", desc.Width, desc.Height,
-                     static_cast<u32>(format));
+            IID_PPV_ARGS(&resource));
+    if (FAILED(create_hr)) {
+        LOG_CRITICAL(Render_D3D12,
+                     "Image creation failed ({}x{} fmt={} mips={} array={} "
+                     "samples={} flags={:#x} hr={:#x})",
+                     desc.Width, desc.Height, static_cast<u32>(format), desc.MipLevels,
+                     desc.DepthOrArraySize, desc.SampleDesc.Count,
+                     static_cast<u32>(desc.Flags), static_cast<u32>(create_hr));
         return nullptr;
     }
     return resource;

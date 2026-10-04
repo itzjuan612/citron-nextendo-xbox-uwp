@@ -42,6 +42,7 @@ struct StagingBufferRef {
 class StagingBufferPool {
 public:
     static constexpr u64 NUM_SYNCS = 32;
+    static constexpr u64 MAX_POOL_BYTES = 256ull * 1024 * 1024;
 
     explicit StagingBufferPool(Device& device);
     ~StagingBufferPool();
@@ -81,11 +82,19 @@ private:
 
     Entry& CreateEntry(u64 size, StagingUsage usage);
 
+    // Evicts a single least-recently-used entry (smallest last_used_tick),
+    // preferring entries with in_use == false. Updates total_bytes. Uses
+    // vector::erase, which shifts later indices; deferred_frees may then hold
+    // stale indices, which FreeDeferred tolerates via its bounds + resource
+    // identity check (see FreeDeferred).
+    void EvictLRU();
+
     Device& device;
     std::vector<Entry> entries;
     std::deque<std::pair<u64, u64>> deferred_frees; // (entry index, free tick)
     u64 tick{};
     u64 total_bytes{};
+    bool logged_high_water{};
 };
 
 } // namespace D3D12

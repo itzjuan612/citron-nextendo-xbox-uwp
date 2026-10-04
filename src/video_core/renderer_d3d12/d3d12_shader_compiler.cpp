@@ -151,7 +151,7 @@ std::vector<u8> ShaderCompiler::Translate(std::span<const u32> spirv, ShaderStag
     conf.declared_read_only_images_as_srvs = true;
     conf.inferred_read_only_images_as_srvs = true;
     conf.force_sample_rate_shading = false;
-    conf.shader_model_max = SHADER_MODEL_6_0;
+    conf.shader_model_max = SHADER_MODEL_6_2;
 
     dxil_spirv_debug_options debug{};
     debug.dump_nir = false;

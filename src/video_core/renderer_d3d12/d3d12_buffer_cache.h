@@ -174,6 +174,11 @@ public:
     std::span<u8> BindMappedUniformBuffer([[maybe_unused]] size_t stage,
                                           [[maybe_unused]] u32 binding_index, u32 size) {
         const StagingBufferRef ref = staging_pool.Request(size, StagingUsage::Upload);
+        if (!ref.buffer) {
+            // Staging allocation failed; an empty span leaves the binding
+            // unbound instead of dereferencing a null mapping.
+            return {};
+        }
         BindBuffer(ref.buffer, static_cast<u32>(ref.offset), size, BindingKind::Uniform, false);
         return ref.mapped_span;
     }

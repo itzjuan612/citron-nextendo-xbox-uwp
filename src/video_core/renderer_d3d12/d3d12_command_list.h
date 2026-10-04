@@ -46,8 +46,18 @@ public:
     /// Resets the allocator and the command list for a new recording.
     void Reset();
 
+    /// Recovers the command list after a fatal failure. A list whose Close
+    /// failed (e.g. E_INVALIDARG) can never be closed again, so Reset()
+    /// cannot salvage it and every later submit would be dropped. Releases
+    /// the allocator and list and recreates both exactly like the
+    /// constructor, leaving the list in the same ready-to-record (closed)
+    /// state a fresh construction provides.
+    void Recover(ID3D12Device* device);
+
     /// Closes the command list (required before ExecuteCommandLists).
-    void Close();
+    /// Returns false (and logs) when Close fails; a list that failed to
+    /// close must never be submitted through ExecuteCommandLists.
+    bool Close();
 
     /// Closes and submits the recorded commands to the device's direct queue.
     void Execute(Device& device);
