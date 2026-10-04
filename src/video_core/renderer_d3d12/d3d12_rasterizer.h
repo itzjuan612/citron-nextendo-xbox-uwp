@@ -99,6 +99,8 @@ public:
     void FlushAndInvalidateRegion(
         DAddr addr, u64 size, VideoCommon::CacheType which = VideoCommon::CacheType::All) override;
     void WaitForIdle() override;
+    /// Logs one line of texture/GPU-memory stats for the OOM hunt (called per N presents).
+    void LogMemoryStats();
     void FragmentBarrier() override;
     void TiledCacheBarrier() override;
     void FlushCommands() override;

@@ -101,13 +101,37 @@ void Device::WaitForIdle() {
     if (FAILED(queue->Signal(fence.Get(), value))) {
         return;
     }
-    if (fence->GetCompletedValue() < value) {
-        if (fence_event && SUCCEEDED(fence->SetEventOnCompletion(value, fence_event))) {
-            WaitForSingleObject(fence_event, INFINITE);
-        } else {
-            while (fence->GetCompletedValue() < value) {
-                Sleep(0);
+    if (fence->GetCompletedValue() >= value) {
+        return;
+    }
+    // Bounded wait: a hung GPU (infinite shader loop) or a silently removed device would
+    // otherwise block here forever with zero log output (INFINITE looks exactly like the
+    // random silent deaths on console). Time out, report the removal reason, and let the
+    // caller proceed (downstream calls will fail loudly instead of hanging).
+    static constexpr DWORD idle_timeout_ms = 5000;
+    bool completed = false;
+    if (fence_event && SUCCEEDED(fence->SetEventOnCompletion(value, fence_event))) {
+        completed = WaitForSingleObject(fence_event, idle_timeout_ms) == WAIT_OBJECT_0;
+    } else {
+        const ULONGLONG start_tick = GetTickCount64();
+        while (fence->GetCompletedValue() < value) {
+            if (GetTickCount64() - start_tick >= idle_timeout_ms) {
+                break;
             }
+            Sleep(0);
+        }
+        completed = fence->GetCompletedValue() >= value;
+    }
+    if (!completed) {
+        static u32 idle_timeout_count = 0;
+        const u32 timeout_n = ++idle_timeout_count;
+        ID3D12Device* const d3d = GetDevice();
+        const HRESULT removed = d3d ? d3d->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+        if (timeout_n == 1 || timeout_n % 60 == 0) {
+            LOG_CRITICAL(Render_D3D12,
+                         "WaitForIdle timed out (fence {} completed {}, removed reason: {:#x}, "
+                         "count {})",
+                         value, fence->GetCompletedValue(), static_cast<u32>(removed), timeout_n);
         }
     }
 }

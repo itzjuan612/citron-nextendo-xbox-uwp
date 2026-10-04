@@ -42,7 +42,15 @@ struct StagingBufferRef {
 class StagingBufferPool {
 public:
     static constexpr u64 NUM_SYNCS = 32;
-    static constexpr u64 MAX_POOL_BYTES = 256ull * 1024 * 1024;
+    // 64 MiB: blit-storm uploads are <= 8.3 MB (1920x1080 RGBA); reuse within a small
+    // working set beats a large pool on the Xbox 5 GB commit budget (OOM deaths tracked
+    // to ~1.3 MB/s host-commit growth during boot).
+    static constexpr u64 MAX_POOL_BYTES = 64ull * 1024 * 1024;
+
+    /// Current pooled bytes across live entries (for the OOM instrumentation).
+    [[nodiscard]] u64 TotalBytes() const noexcept {
+        return total_bytes;
+    }
 
     explicit StagingBufferPool(Device& device);
     ~StagingBufferPool();

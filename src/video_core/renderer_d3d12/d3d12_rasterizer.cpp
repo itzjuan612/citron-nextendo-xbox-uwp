@@ -46,6 +46,11 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
       m_res_heap{device.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, true},
       m_sampler_heap{device.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, 1024, true},
       m_accelerate_dma{m_buffer_cache} {
+    // SlotVector moves elements on growth; these pointers are cached long-term in
+    // Framebuffers, so capacity must cover boot-time peak to keep them stable.
+    m_texture_cache.slot_image_views.Reserve(8192);
+    m_texture_cache.slot_images.Reserve(4096);
+    m_buffer_cache.slot_buffers.Reserve(4096);
     // CommandList is created closed; open it for recording. FlushCommands re-opens it
     // after each execute, so every record goes to a live list.
     m_command_list.Reset();
@@ -931,8 +936,164 @@ std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
         return {};
     }
     std::scoped_lock lock{m_texture_cache.mutex};
-    const auto [image_view, scaled] =
+    auto [image_view, scaled] =
         m_texture_cache.TryFindFramebufferImageView(config, framebuffer_addr);
+    {
+        // Temporary display-lookup diagnostic: what address/format is queried and hit/miss.
+        static u32 accelerate_calls = 0;
+        if (++accelerate_calls % 20 == 0) {
+            LOG_DEBUG(Render_D3D12,
+                      "AccelerateDisplay #{}: fb_addr={:#x} queried={:#x} {}x{} stride={} "
+                      "pixfmt={} -> {}",
+                      accelerate_calls, static_cast<u64>(config.address),
+                      static_cast<u64>(framebuffer_addr), config.width, config.height,
+                      config.stride, static_cast<u32>(config.pixel_format),
+                      image_view ? "HIT" : "MISS");
+        }
+    }
+    if (!image_view) {
+        // Miss fallback: CPU-blitted scanout buffers are only registered in the texture
+        // cache after the GPU renders to them, so the exact-address lookup above misses
+        // while triple-buffered surfaces rotate. Register the CPU surface as a linear
+        // image through the same find-or-insert path blits use, upload its bytes, then
+        // retry the lookup so all format/view logic below is reused.
+        const auto pixfmt = config.pixel_format;
+        const bool sane_config =
+            config.width != 0 && config.height != 0 && config.stride != 0 &&
+            config.width < 8192 && config.height < 8192 && config.stride < 8192 &&
+            (pixfmt == Service::android::PixelFormat::Rgba8888 ||
+             pixfmt == Service::android::PixelFormat::Rgb565 ||
+             pixfmt == Service::android::PixelFormat::Bgra8888);
+        if (sane_config && gpu_memory != nullptr) {
+            // Same mapping TryFindFramebufferImageView uses for the view format.
+            const VideoCore::Surface::PixelFormat view_format =
+                pixfmt == Service::android::PixelFormat::Rgb565
+                    ? VideoCore::Surface::PixelFormat::R5G6B5_UNORM
+                    : (pixfmt == Service::android::PixelFormat::Bgra8888
+                           ? VideoCore::Surface::PixelFormat::B8G8R8A8_UNORM
+                           : VideoCore::Surface::PixelFormat::A8B8G8R8_UNORM);
+            const u32 bytes_per_pixel =
+                view_format == VideoCore::Surface::PixelFormat::R5G6B5_UNORM ? 2U : 4U;
+            // Framebuffer stride is in pixels; tolerate byte strides just in case.
+            const u32 stride_pixels = config.stride >= config.width * bytes_per_pixel
+                                          ? config.stride / bytes_per_pixel
+                                          : config.stride;
+            const u32 surface_width =
+                stride_pixels >= config.width ? stride_pixels : config.width;
+            const u32 pitch_bytes = surface_width * bytes_per_pixel;
+            // The find-or-insert path derives the CPU address from a GPU address; CPU-only
+            // scanout surfaces are not GPU-mapped, so fall back to a CPU-address-direct
+            // JoinImages insert that keeps both page tables keyed at the framebuffer address.
+            const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(framebuffer_addr);
+            {
+                static bool logged_gate = false;
+                if (!logged_gate) {
+                    logged_gate = true;
+                    if (cpu_addr) {
+                        LOG_DEBUG(Render_D3D12,
+                                  "Display surface gate: addr={:#x} derived cpu_addr={:#x} {}",
+                                  static_cast<u64>(framebuffer_addr),
+                                  static_cast<u64>(*cpu_addr),
+                                  (*cpu_addr == framebuffer_addr) ? "identity" : "remapped");
+                    } else {
+                        LOG_DEBUG(Render_D3D12,
+                                  "Display surface gate: addr={:#x} derived cpu_addr=unmapped",
+                                  static_cast<u64>(framebuffer_addr));
+                    }
+                }
+            }
+            VideoCommon::ImageInfo info{};
+            info.type = VideoCommon::ImageType::Linear;
+            info.format = view_format;
+            info.size.width = surface_width;
+            info.size.height = config.height;
+            info.size.depth = 1;
+            info.pitch = pitch_bytes;
+            VideoCommon::ImageId image_id{};
+            if (cpu_addr && *cpu_addr == framebuffer_addr) {
+                image_id = m_texture_cache.FindOrInsertImage(
+                    info, static_cast<GPUVAddr>(framebuffer_addr));
+            } else {
+                // Overlap-aware find-first (mirrors GetBlitImages' FindImage-before-insert):
+                // JoinImages always allocates a new image, so a repeated miss for an already
+                // registered scanout address would leak a duplicate ~pitch*height image every
+                // frame. Reuse the live image covering this range when one exists.
+                const size_t range_bytes = static_cast<size_t>(pitch_bytes) * config.height;
+                VideoCommon::ImageId existing_id{};
+                m_texture_cache.ForEachImageInRegion(
+                    static_cast<DAddr>(framebuffer_addr), range_bytes,
+                    [&](VideoCommon::ImageId candidate_id, auto& candidate) {
+                        if (candidate.gpu_addr != static_cast<GPUVAddr>(framebuffer_addr) ||
+                            candidate.cpu_addr != static_cast<DAddr>(framebuffer_addr)) {
+                            return false;
+                        }
+                        if (candidate.info.type != VideoCommon::ImageType::Linear ||
+                            candidate.info.pitch != pitch_bytes ||
+                            candidate.info.format != view_format) {
+                            return false;
+                        }
+                        existing_id = candidate_id;
+                        return true;
+                    });
+                image_id = existing_id ? existing_id
+                                       : m_texture_cache.JoinImages(
+                                             info, static_cast<GPUVAddr>(framebuffer_addr),
+                                             static_cast<DAddr>(framebuffer_addr));
+            }
+            {
+                static bool logged_insert = false;
+                if (!logged_insert) {
+                    logged_insert = true;
+                    LOG_DEBUG(Render_D3D12, "Display surface insert: addr={:#x} image_id={} {}",
+                              static_cast<u64>(framebuffer_addr), image_id.index,
+                              image_id ? "ok" : "null");
+                }
+            }
+            if (image_id) {
+                // Fresh images start CpuModified; this uploads the CPU bytes.
+                m_texture_cache.PrepareImage(image_id, false, false);
+                // Freshly inserted images have no views yet, so a TryFind retry would
+                // filter them out (empty view list) before creating one. Create the
+                // view directly, mirroring TryFindFramebufferImageView's view block.
+                VideoCommon::ImageViewInfo retry_info{VideoCommon::ImageViewType::e2D,
+                                                       view_format};
+                if (config.blending == Tegra::BlendMode::Opaque) {
+                    retry_info.x_source =
+                        static_cast<u8>(Tegra::Texture::SwizzleSource::R);
+                    retry_info.y_source =
+                        static_cast<u8>(Tegra::Texture::SwizzleSource::G);
+                    retry_info.z_source =
+                        static_cast<u8>(Tegra::Texture::SwizzleSource::B);
+                    retry_info.w_source =
+                        static_cast<u8>(Tegra::Texture::SwizzleSource::OneFloat);
+                }
+                const VideoCommon::ImageViewId retry_view_id =
+                    m_texture_cache.FindOrEmplaceImageView(image_id, retry_info);
+                image_view = &m_texture_cache.GetImageView(retry_view_id);
+                scaled = false;
+                {
+                    static bool logged_retry = false;
+                    if (!logged_retry) {
+                        logged_retry = true;
+                        LOG_DEBUG(Render_D3D12, "Display surface retry: addr={:#x} -> {}",
+                                  static_cast<u64>(framebuffer_addr),
+                                  image_view ? "HIT" : "MISS");
+                    }
+                }
+                if (image_view) {
+                    static bool logged_registered = false;
+                    if (!logged_registered) {
+                        logged_registered = true;
+                        LOG_DEBUG(Render_D3D12,
+                                  "Display surface registered as linear image: addr={:#x} "
+                                  "{}x{} pixfmt={}",
+                                  static_cast<u64>(framebuffer_addr), surface_width,
+                                  config.height, static_cast<u32>(pixfmt));
+                    }
+                }
+            }
+        }
+    }
     if (!image_view) {
         return {};
     }
@@ -1078,13 +1239,26 @@ void RasterizerD3D12::TickFrame() {
     m_buffer_cache.TickFrame();
     m_texture_cache.TickFrame();
 }
+void RasterizerD3D12::LogMemoryStats() {
+    std::scoped_lock lock{m_texture_cache.mutex};
+    const auto vram = m_texture_cache.GetVRAMStats();
+    LOG_INFO(Render_D3D12,
+             "Memory stats: textures={} images={} used={:.0f} MB staging={:.0f} MB "
+             "gpu_usage={:.0f} MB evicted_total={:.0f} MB",
+             vram.texture_count, vram.sparse_texture_count,
+             static_cast<f64>(vram.total_used_bytes) / (1024.0 * 1024.0),
+             static_cast<f64>(m_staging_pool.TotalBytes()) / (1024.0 * 1024.0),
+             static_cast<f64>(m_texture_runtime.GetDeviceMemoryUsage()) / (1024.0 * 1024.0),
+             static_cast<f64>(vram.evicted_total) / (1024.0 * 1024.0));
+}
 Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() {
     return m_accelerate_dma;
 }
 bool RasterizerD3D12::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                             const Tegra::Engines::Fermi2D::Surface& dst,
                                             const Tegra::Engines::Fermi2D::Config& copy_config) {
-    return false;
+    std::scoped_lock lock{m_texture_cache.mutex};
+    return m_texture_cache.BlitImage(dst, src, copy_config);
 }
 void RasterizerD3D12::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                std::span<const u8> memory) {

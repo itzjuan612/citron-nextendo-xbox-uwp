@@ -82,9 +82,19 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         swapchain.ClearAndPresent(1.0f, 0.25f, 0.05f);
     }
 
-    // Present-path tracing: one DEBUG line every 20 Composite calls.
+    // Drive texture/buffer GC + staging pool ticks once per present (mirrors Vulkan
+    // SwapBuffers, which calls rasterizer.TickFrame() per Composite). TickFrame takes its
+    // own cache locks; no m_buffer_cache/m_texture_cache mutex is held at this point
+    // (AccelerateDisplay's lock is scope-local and released on return).
+    rasterizer.TickFrame();
+
+    // Present-path tracing: one DEBUG line every 20 Composite calls, with memory stats
+    // piggybacked every 120th to catch the OOM leak (~1.3 MB/s observed on console).
     static u32 composite_frames = 0;
     if (++composite_frames % 20 == 0) {
+        if (composite_frames % 120 == 0) {
+            rasterizer.LogMemoryStats();
+        }
         if (presented) {
             LOG_DEBUG(Render_D3D12,
                       "Composite frame {}: blit path (framebuffer present, "

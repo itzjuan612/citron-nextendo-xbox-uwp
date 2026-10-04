@@ -154,6 +154,13 @@ public:
         return values_capacity - free_list.size();
     }
 
+    void Reserve(size_t new_capacity) noexcept {
+        if (new_capacity <= values_capacity) {
+            return;
+        }
+        ReserveImpl(new_capacity);
+    }
+
 private:
     struct NonTrivialDummy {
         NonTrivialDummy() noexcept {}
@@ -187,14 +194,14 @@ private:
 
     [[nodiscard]] u32 FreeValueIndex() noexcept {
         if (free_list.empty()) {
-            Reserve(values_capacity ? (values_capacity << 1) : 1);
+            ReserveImpl(values_capacity ? (values_capacity << 1) : 1);
         }
         const u32 free_index = free_list.back();
         free_list.pop_back();
         return free_index;
     }
 
-    void Reserve(size_t new_capacity) noexcept {
+    void ReserveImpl(size_t new_capacity) noexcept {
         Entry* const new_values = new Entry[new_capacity];
         size_t index = 0;
         for (u64 bits : stored_bitset) {

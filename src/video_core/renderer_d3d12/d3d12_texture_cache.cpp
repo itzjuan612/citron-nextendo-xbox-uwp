@@ -1127,16 +1127,54 @@ void TextureCacheRuntime::TickFrame() {
     staging_pool.TickFrame();
 }
 
+/// Queries the LOCAL video-memory segment for the adapter backing the D3D12 device.
+/// Least-invasive path: Device stores no adapter getter, so this goes through the
+/// ID3D12Device -> IDXGIDevice -> IDXGIAdapter -> IDXGIAdapter3 chain (the same chain
+/// Device::Device uses for its default-adapter fallback). Queried once per call;
+/// callers sample this at most once per frame, so nothing is cached here.
+static bool QueryLocalVideoMemoryInfo(ID3D12Device* d3d_device,
+                                      DXGI_QUERY_VIDEO_MEMORY_INFO* out) {
+    if (!d3d_device || !out) {
+        return false;
+    }
+    ComPtr<IDXGIDevice> dxgi_device;
+    if (FAILED(d3d_device->QueryInterface(IID_PPV_ARGS(&dxgi_device)))) {
+        return false;
+    }
+    ComPtr<IDXGIAdapter> adapter;
+    if (FAILED(dxgi_device->GetAdapter(&adapter))) {
+        return false;
+    }
+    ComPtr<IDXGIAdapter3> adapter3;
+    if (FAILED(adapter->QueryInterface(IID_PPV_ARGS(&adapter3)))) {
+        return false;
+    }
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (FAILED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+        return false;
+    }
+    *out = info;
+    return true;
+}
+
 u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (QueryLocalVideoMemoryInfo(device.GetDevice(), &info)) {
+        return info.Budget;
+    }
     return 0;
 }
 
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
+    DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+    if (QueryLocalVideoMemoryInfo(device.GetDevice(), &info)) {
+        return info.CurrentUsage;
+    }
     return 0;
 }
 
 bool TextureCacheRuntime::CanReportMemoryUsage() const {
-    return false;
+    return true;
 }
 
 bool TextureCacheRuntime::IsDepthStencilFormat(VideoCore::Surface::PixelFormat format) {
@@ -1287,22 +1325,149 @@ void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCop
     }
 }
 
-void TextureCacheRuntime::BlitImage(Framebuffer*, ImageView& dst_view, ImageView& src_view,
+void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view,
+                                    ImageView& src_view,
                                     const VideoCommon::Region2D& dst_region,
                                     const VideoCommon::Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
-    // Only plain 1:1 same-format SrcCopy blits are handled for now; scaled/filtered and
-    // format-converting blits belong to the framebuffer blit step.
-    if (!logged_blit) {
-        logged_blit = true;
-        LOG_ERROR(Render_D3D12, "General image blits not implemented yet (filter={}, op={})",
-                  static_cast<u32>(filter), static_cast<u32>(operation));
+    (void)dst_framebuffer;
+    (void)filter;
+    ID3D12Resource* const dst_resource = dst_view.Resource();
+    ID3D12Resource* const src_resource = src_view.Resource();
+    if (!command_list.IsValid() || !dst_resource || !src_resource ||
+        dst_resource == src_resource) {
+        return;
     }
-    (void)dst_view;
-    (void)src_view;
-    (void)dst_region;
-    (void)src_region;
+    // Mirror Vulkan's dispatch: only SrcCopy is accelerated, ROP/blend ops need the CPU path.
+    if (operation != Tegra::Engines::Fermi2D::Operation::SrcCopy) {
+        if (!logged_blit) {
+            logged_blit = true;
+            LOG_DEBUG(Render_D3D12, "Skipping non-SrcCopy image blit (op={})",
+                      static_cast<u32>(operation));
+        }
+        return;
+    }
+    const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+    const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
+    // Raw byte copies need identical typeless resource formats. This is also the
+    // aspect-compatibility check: depth/stencil resources never match color ones, and true
+    // format conversions need a shader draw (see ConvertImage), so never attempt them here.
+    if (src_desc.Format != dst_desc.Format ||
+        src_desc.Dimension != dst_desc.Dimension ||
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        if (!logged_blit) {
+            logged_blit = true;
+            LOG_DEBUG(Render_D3D12, "Skipping incompatible image blit (format {} -> {})",
+                      static_cast<u32>(src_desc.Format), static_cast<u32>(dst_desc.Format));
+        }
+        return;
+    }
+    const s32 src_width = src_region.end.x - src_region.start.x;
+    const s32 src_height = src_region.end.y - src_region.start.y;
+    const s32 dst_width = dst_region.end.x - dst_region.start.x;
+    const s32 dst_height = dst_region.end.y - dst_region.start.y;
+    // CopyTextureRegion cannot stretch: scaled blits stay on the CPU fallback.
+    // (A 1:1 bilinear blit samples texel centers, so it is an exact copy.)
+    if (src_width <= 0 || src_height <= 0 || src_width != dst_width || src_height != dst_height) {
+        if (!logged_blit) {
+            logged_blit = true;
+            LOG_DEBUG(Render_D3D12, "Skipping scaled image blit ({}x{} -> {}x{})", src_width,
+                      src_height, dst_width, dst_height);
+        }
+        return;
+    }
+    // Never record an out-of-bounds copy.
+    if (src_region.start.x < 0 || src_region.start.y < 0 ||
+        src_region.end.x > static_cast<s32>(src_view.size.width) ||
+        src_region.end.y > static_cast<s32>(src_view.size.height) ||
+        dst_region.start.x < 0 || dst_region.start.y < 0 ||
+        dst_region.end.x > static_cast<s32>(dst_view.size.width) ||
+        dst_region.end.y > static_cast<s32>(dst_view.size.height)) {
+        if (!logged_blit) {
+            logged_blit = true;
+            LOG_DEBUG(Render_D3D12, "Skipping out-of-bounds image blit");
+        }
+        return;
+    }
+    const u32 src_samples = src_desc.SampleDesc.Count;
+    const u32 dst_samples = dst_desc.SampleDesc.Count;
+    const bool is_resolve = src_samples > 1 && dst_samples == 1;
+    if (src_samples != dst_samples && !is_resolve) {
+        if (!logged_blit) {
+            logged_blit = true;
+            LOG_DEBUG(Render_D3D12, "Skipping MSAA image blit ({}x -> {}x)", src_samples,
+                      dst_samples);
+        }
+        return;
+    }
+    if (is_resolve) {
+        // ResolveSubresource covers whole subresources, so it is only valid for full-view blits.
+        const bool is_full_view =
+            src_region.start.x == 0 && src_region.start.y == 0 &&
+            src_region.end.x == static_cast<s32>(src_view.size.width) &&
+            src_region.end.y == static_cast<s32>(src_view.size.height) &&
+            dst_region.start.x == 0 && dst_region.start.y == 0 &&
+            dst_region.end.x == static_cast<s32>(dst_view.size.width) &&
+            dst_region.end.y == static_cast<s32>(dst_view.size.height);
+        if (!is_full_view) {
+            if (!logged_blit) {
+                logged_blit = true;
+                LOG_DEBUG(Render_D3D12, "Skipping sub-rectangle MSAA resolve blit");
+            }
+            return;
+        }
+    }
+    const u32 src_array_size =
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(src_desc.DepthOrArraySize);
+    const u32 dst_array_size =
+        dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(dst_desc.DepthOrArraySize);
+    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    const s32 levels = std::min(src_view.range.extent.levels, dst_view.range.extent.levels);
+    const s32 layers = std::min(src_view.range.extent.layers, dst_view.range.extent.layers);
+    for (s32 level = 0; level < levels; ++level) {
+        for (s32 layer = 0; layer < layers; ++layer) {
+            const u32 src_sub = CalcSubresource(
+                static_cast<u32>(src_view.range.base.level + level),
+                static_cast<u32>(src_view.range.base.layer + layer), 0, src_desc.MipLevels,
+                src_array_size);
+            const u32 dst_sub = CalcSubresource(
+                static_cast<u32>(dst_view.range.base.level + level),
+                static_cast<u32>(dst_view.range.base.layer + layer), 0, dst_desc.MipLevels,
+                dst_array_size);
+            if (is_resolve) {
+                command_list.Get()->ResolveSubresource(dst_resource, dst_sub, src_resource,
+                                                       src_sub, dst_desc.Format);
+                continue;
+            }
+            D3D12_TEXTURE_COPY_LOCATION src_loc{};
+            src_loc.pResource = src_resource;
+            src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src_loc.SubresourceIndex = src_sub;
+            D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+            dst_loc.pResource = dst_resource;
+            dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst_loc.SubresourceIndex = dst_sub;
+            D3D12_BOX box{};
+            box.left = static_cast<UINT>(src_region.start.x);
+            box.top = static_cast<UINT>(src_region.start.y);
+            box.front = 0;
+            box.right = static_cast<UINT>(src_region.end.x);
+            box.bottom = static_cast<UINT>(src_region.end.y);
+            box.back = 1;
+            command_list.Get()->CopyTextureRegion(&dst_loc,
+                                                  static_cast<UINT>(dst_region.start.x),
+                                                  static_cast<UINT>(dst_region.start.y), 0,
+                                                  &src_loc, &box);
+        }
+    }
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,

@@ -16,13 +16,17 @@
 #include <winrt/Windows.Gaming.Input.h>
 #include <winrt/Windows.Graphics.Display.h>
 #include <winrt/Windows.Storage.h>
+#include <winrt/Windows.System.Display.h>
 #include <winrt/Windows.UI.Core.h>
 
 #include <windows.h>
 
 #include <algorithm>
 #include <exception>
+#include <csignal>
 #include <filesystem>
+#include <new.h>
+#include <psapi.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -241,6 +245,16 @@ public:
         } catch (...) {
         }
 
+        // Prevent Xbox idle-suspend from killing unattended console runs (no input
+        // for minutes returns the app to the dashboard with zero log output).
+        try {
+            if (!display_request_) {
+                display_request_ = winrt::Windows::System::Display::DisplayRequest{};
+            }
+            display_request_.RequestActive();
+        } catch (...) {
+        }
+
         // Resolve the app data directory and boot content once the window exists.
         try {
             const auto folder = winrt::Windows::Storage::ApplicationData::Current().LocalFolder();
@@ -284,6 +298,56 @@ public:
             LOG_ERROR(Frontend, "Failed to resolve LocalFolder: {}", winrt::to_string(e.message()));
         }
 
+        // Process-memory sentinel: silent fail-fast deaths (OOM/heap-corruption bypass all
+        // exception filters) leave no trace; watching commit climb toward the 5 GB budget
+        // every ~10 s identifies the killer before it strikes.
+        static constexpr ULONGLONG memory_log_interval_ms = 10000;
+        ULONGLONG last_memory_log_tick = GetTickCount64();
+        auto log_process_memory = [&] {
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            pmc.cb = sizeof(pmc);
+            if (GetProcessMemoryInfo(GetCurrentProcess(),
+                                     reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                                     sizeof(pmc))) {
+                // Classify committed regions: RWX private ~= JIT code cache (the top
+                // suspect for the ~1.3 MB/s boot-time climb), other private, mapped.
+                u64 rwx_private = 0;
+                u64 other_private = 0;
+                u64 mapped = 0;
+                SYSTEM_INFO si{};
+                GetSystemInfo(&si);
+                for (LPCVOID addr = si.lpMinimumApplicationAddress; addr < si.lpMaximumApplicationAddress;) {
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) {
+                        break;
+                    }
+                    if (mbi.State == MEM_COMMIT) {
+                        const u64 size = static_cast<u64>(mbi.RegionSize);
+                        const bool private_mem = (mbi.Type == MEM_PRIVATE);
+                        const bool executable =
+                            (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                        if (private_mem && executable) {
+                            rwx_private += size;
+                        } else if (private_mem) {
+                            other_private += size;
+                        } else {
+                            mapped += size;
+                        }
+                    }
+                    addr = reinterpret_cast<LPCVOID>(reinterpret_cast<uintptr_t>(mbi.BaseAddress) +
+                                                     mbi.RegionSize);
+                }
+                LOG_INFO(Frontend,
+                         "Memory sentinel: commit={} MB workingset={} MB rwx(JIT)={} MB "
+                         "priv={} MB mapped={} MB",
+                         static_cast<u64>(pmc.PrivateUsage) / (1024ULL * 1024ULL),
+                         static_cast<u64>(pmc.WorkingSetSize) / (1024ULL * 1024ULL),
+                         rwx_private / (1024ULL * 1024ULL), other_private / (1024ULL * 1024ULL),
+                         mapped / (1024ULL * 1024ULL));
+            }
+        };
+
         while (!closed_) {
             window_.Dispatcher().ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
             // Presents the renderer's pending frame. Must run on this thread (CoreWindow owner).
@@ -294,9 +358,21 @@ public:
                 } catch (...) {
                 }
             }
+            const ULONGLONG now_tick = GetTickCount64();
+            if (now_tick - last_memory_log_tick >= memory_log_interval_ms) {
+                last_memory_log_tick = now_tick;
+                log_process_memory();
+            }
             Sleep(8);
         }
 
+        try {
+            if (display_request_) {
+                display_request_.RequestRelease();
+                display_request_ = nullptr;
+            }
+        } catch (...) {
+        }
         session.Stop();
         session.Shutdown();
         if (g_boot_thread.joinable()) {
@@ -307,6 +383,10 @@ public:
 private:
     CoreWindow window_{nullptr};
     bool closed_{false};
+    // Lives as long as the view (app lifetime) so the active request is never released
+    // during emulation. Xbox idle-suspend returns unattended apps to the dashboard
+    // after minutes with no input and zero logs.
+    winrt::Windows::System::Display::DisplayRequest display_request_{nullptr};
 };
 
 class CitronUwpSource : public implements<CitronUwpSource, IFrameworkViewSource> {
@@ -335,6 +415,26 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         LOG_CRITICAL(Frontend, "std::terminate called");
         Common::Log::Stop();
         std::abort();
+    });
+    // Fail-fast paths (OOM, invalid parameters, heap corruption) bypass all exception
+    // filters; these hooks are the only way to leave a trace before the silent death.
+    _set_new_mode(1);
+    _set_new_handler([](size_t) -> int {
+        LOG_CRITICAL(Frontend, "operator new failed (OOM): commit exhausted before bad_alloc");
+        Common::Log::Stop();
+        throw std::bad_alloc{};
+    });
+    signal(SIGABRT, [](int) {
+        LOG_CRITICAL(Frontend, "SIGABRT raised (abort()/assert path)");
+        Common::Log::Stop();
+    });
+    signal(SIGFPE, [](int) {
+        LOG_CRITICAL(Frontend, "SIGFPE raised");
+        Common::Log::Stop();
+    });
+    signal(SIGILL, [](int) {
+        LOG_CRITICAL(Frontend, "SIGILL raised");
+        Common::Log::Stop();
     });
 
     CoreApplication::Run(make<CitronUwpSource>());
