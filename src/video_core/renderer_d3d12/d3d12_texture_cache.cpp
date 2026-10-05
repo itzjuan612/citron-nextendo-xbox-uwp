@@ -292,6 +292,10 @@ DXGI_FORMAT RenderTargetFormat(PixelFormat format) {
     case DXGI_FORMAT_BC3_UNORM_SRGB:
     case DXGI_FORMAT_BC7_UNORM:
     case DXGI_FORMAT_BC7_UNORM_SRGB:
+    // D3D12 supports R11G11B10_FLOAT for UAVs but not as a render target; treating it as
+    // unrepresentable makes ConfigureDraw skip those draws instead of failing PSO
+    // creation for every draw (observed flooding 21k failures and 15 MB of log per run).
+    case DXGI_FORMAT_R11G11B10_FLOAT:
         return DXGI_FORMAT_UNKNOWN;
     default:
         return sampled;
