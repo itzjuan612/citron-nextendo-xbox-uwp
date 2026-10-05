@@ -1126,7 +1126,7 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     });
 }
 
-void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
+bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
                                     const Region2D& dst_region, const Region2D& src_region,
                                     Tegra::Engines::Fermi2D::Filter filter,
                                     Tegra::Engines::Fermi2D::Operation operation) {
@@ -1135,12 +1135,12 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     const bool is_src_msaa = src.Samples() != VK_SAMPLE_COUNT_1_BIT;
     if (aspect_mask != ImageAspectMask(dst.format)) {
         UNIMPLEMENTED_MSG("Incompatible blit from format {} to {}", src.format, dst.format);
-        return;
+        return false;
     }
     if (aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT && !is_src_msaa && !is_dst_msaa) {
         blit_image_helper.BlitColor(dst_framebuffer, src.Handle(Shader::TextureType::Color2D),
                                     dst_region, src_region, filter, operation);
-        return;
+        return true;
     }
     ASSERT(src.format == dst.format);
     if (aspect_mask == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) {
@@ -1160,7 +1160,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             UNIMPLEMENTED_IF(is_src_msaa || is_dst_msaa);
             blit_image_helper.BlitDepthStencil(dst_framebuffer, src.DepthView(), src.StencilView(),
                                                dst_region, src_region, filter, operation);
-            return;
+            return true;
         }
     }
     ASSERT(!(is_dst_msaa && !is_src_msaa));
@@ -1253,6 +1253,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                                0, write_barrier);
     });
+    return true;
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer* dst, ImageView& dst_view, ImageView& src_view) {

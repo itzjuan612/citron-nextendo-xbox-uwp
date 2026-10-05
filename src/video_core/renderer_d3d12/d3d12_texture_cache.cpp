@@ -1329,7 +1329,7 @@ void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCop
     }
 }
 
-void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view,
+bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view,
                                     ImageView& src_view,
                                     const VideoCommon::Region2D& dst_region,
                                     const VideoCommon::Region2D& src_region,
@@ -1341,7 +1341,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     ID3D12Resource* const src_resource = src_view.Resource();
     if (!command_list.IsValid() || !dst_resource || !src_resource ||
         dst_resource == src_resource) {
-        return;
+        return false;
     }
     // Mirror Vulkan's dispatch: only SrcCopy is accelerated, ROP/blend ops need the CPU path.
     if (operation != Tegra::Engines::Fermi2D::Operation::SrcCopy) {
@@ -1350,7 +1350,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             LOG_DEBUG(Render_D3D12, "Skipping non-SrcCopy image blit (op={})",
                       static_cast<u32>(operation));
         }
-        return;
+        return false;
     }
     const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
     const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
@@ -1365,7 +1365,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             LOG_DEBUG(Render_D3D12, "Skipping incompatible image blit (format {} -> {})",
                       static_cast<u32>(src_desc.Format), static_cast<u32>(dst_desc.Format));
         }
-        return;
+        return false;
     }
     const s32 src_width = src_region.end.x - src_region.start.x;
     const s32 src_height = src_region.end.y - src_region.start.y;
@@ -1379,7 +1379,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             LOG_DEBUG(Render_D3D12, "Skipping scaled image blit ({}x{} -> {}x{})", src_width,
                       src_height, dst_width, dst_height);
         }
-        return;
+        return false;
     }
     // Never record an out-of-bounds copy.
     if (src_region.start.x < 0 || src_region.start.y < 0 ||
@@ -1392,7 +1392,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             logged_blit = true;
             LOG_DEBUG(Render_D3D12, "Skipping out-of-bounds image blit");
         }
-        return;
+        return false;
     }
     const u32 src_samples = src_desc.SampleDesc.Count;
     const u32 dst_samples = dst_desc.SampleDesc.Count;
@@ -1403,7 +1403,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
             LOG_DEBUG(Render_D3D12, "Skipping MSAA image blit ({}x -> {}x)", src_samples,
                       dst_samples);
         }
-        return;
+        return false;
     }
     if (is_resolve) {
         // ResolveSubresource covers whole subresources, so it is only valid for full-view blits.
@@ -1419,7 +1419,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                 logged_blit = true;
                 LOG_DEBUG(Render_D3D12, "Skipping sub-rectangle MSAA resolve blit");
             }
-            return;
+            return false;
         }
     }
     const u32 src_array_size =
@@ -1472,6 +1472,7 @@ void TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     }
     Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    return true;
 }
 
 void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,

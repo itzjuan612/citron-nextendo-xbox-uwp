@@ -803,8 +803,10 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
         // Provide a framebuffer in case it's necessary
         ImageView& dst_view = slot_image_views[dst_view_id];
         ImageView& src_view = slot_image_views[src_view_id];
-        runtime.BlitImage(dst_framebuffer, dst_view, src_view, dst_region, src_region, copy.filter,
-                          copy.operation);
+        if (!runtime.BlitImage(dst_framebuffer, dst_view, src_view, dst_region, src_region,
+                               copy.filter, copy.operation)) {
+            return false;
+        }
     }
     return true;
 }

@@ -63,7 +63,7 @@ public:
 
     bool CanReportMemoryUsage() const;
 
-    void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
+    bool BlitImage(Framebuffer* dst_framebuffer, ImageView& dst, ImageView& src,
                    const Region2D& dst_region, const Region2D& src_region,
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);

@@ -294,7 +294,7 @@ public:
 
     void CopyImageMSAA(Image& dst, Image& src, std::span<const VideoCommon::ImageCopy> copies);
 
-    void BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view, ImageView& src_view,
+    bool BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view, ImageView& src_view,
                    const VideoCommon::Region2D& dst_region, const VideoCommon::Region2D& src_region,
                    Tegra::Engines::Fermi2D::Filter filter,
                    Tegra::Engines::Fermi2D::Operation operation);
