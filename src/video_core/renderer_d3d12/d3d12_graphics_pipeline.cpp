@@ -493,6 +493,19 @@ GraphicsPipeline::GraphicsPipeline(
                         static_cast<u32>(attribute.Type()), static_cast<u32>(attribute.Size()));
             continue;
         }
+        // D3D12 requires AlignedByteOffset to be a multiple of 4; the guest can leave stale,
+        // unaligned attribute state for attributes the shader never fetches (Vulkan drivers
+        // tolerate it, D3D12 rejects the whole PSO with E_INVALIDARG). Skip such elements.
+        if ((attribute.offset.Value() % 4) != 0) {
+            static bool logged_unaligned = false;
+            if (!logged_unaligned) {
+                logged_unaligned = true;
+                LOG_WARNING(Render_D3D12,
+                            "Skipping input element {} with unaligned offset {} (format {:#x})",
+                            i, attribute.offset.Value(), static_cast<u32>(format));
+            }
+            continue;
+        }
         const u32 buffer = attribute.buffer.Value();
         input_slot_count = std::max(input_slot_count, buffer + 1);
         D3D12_INPUT_ELEMENT_DESC element{};
