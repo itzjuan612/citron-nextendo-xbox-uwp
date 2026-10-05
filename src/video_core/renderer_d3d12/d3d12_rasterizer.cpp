@@ -1235,6 +1235,18 @@ void RasterizerD3D12::FlushCommands() {
     m_cbv_scratch_used = 0;
 }
 void RasterizerD3D12::TickFrame() {
+    // Detect a GPU hang/TDR before it can silently kill the process: D3D12 exposes the
+    // removal reason here, and this log is the only in-app trace (fail-fast paths never
+    // reach the crash/terminate handlers).
+    static u32 remove_check_counter = 0;
+    if ((++remove_check_counter % 256) == 0) {
+        static bool logged_removed = false;
+        const HRESULT reason = m_device.GetDevice()->GetDeviceRemovedReason();
+        if (FAILED(reason) && !logged_removed) {
+            logged_removed = true;
+            LOG_CRITICAL(Render_D3D12, "Device removed: reason {:#x}", static_cast<u32>(reason));
+        }
+    }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.TickFrame();
     m_texture_cache.TickFrame();
