@@ -77,7 +77,12 @@ ShaderCompiler::ShaderCompiler() {
     }
 }
 
-ShaderCompiler::~ShaderCompiler() = default;
+ShaderCompiler::~ShaderCompiler() {
+    if (validator) {
+        static_cast<IDxcValidator*>(validator)->Release();
+        validator = nullptr;
+    }
+}
 
 void ShaderCompiler::LoadLibraries() {
     if (!spirv_to_dxil_library.Open("spirv_to_dxil.dll")) {
@@ -100,15 +105,19 @@ void ShaderCompiler::LoadLibraries() {
     }
     const auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(dxil_create_instance);
 
-    ComPtr<IDxcValidator> validator;
-    HRESULT hr = create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&validator));
-    if (FAILED(hr) || !validator) {
+    ComPtr<IDxcValidator> new_validator;
+    HRESULT hr = create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&new_validator));
+    if (FAILED(hr) || !new_validator) {
         last_error = "failed to create the DXIL validator";
         return;
     }
+    // Keep the validator alive for the life of the compiler; re-creating it per compile
+    // retains DXC per-instance state.
+    validator = new_validator.Detach();
 
     ComPtr<IDxcVersionInfo> version_info;
-    if (SUCCEEDED(validator->QueryInterface(IID_PPV_ARGS(&version_info)))) {
+    if (SUCCEEDED(static_cast<IDxcValidator*>(validator)->QueryInterface(
+            IID_PPV_ARGS(&version_info)))) {
         UINT32 major = 0;
         UINT32 minor = 0;
         if (SUCCEEDED(version_info->GetVersion(&major, &minor)) && major == 1) {
@@ -181,18 +190,22 @@ std::vector<u8> ShaderCompiler::Translate(std::span<const u32> spirv, ShaderStag
 }
 
 bool ShaderCompiler::Sign(std::vector<u8>& dxil) {
-    ComPtr<IDxcValidator> validator;
-    const auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(dxil_create_instance);
-    HRESULT hr = create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&validator));
-    if (FAILED(hr) || !validator) {
-        last_error = "failed to create the DXIL validator";
-        return false;
+    ComPtr<IDxcValidator> dxc_validator;
+    if (this->validator != nullptr) {
+        dxc_validator = static_cast<IDxcValidator*>(this->validator);
+    } else {
+        const auto create_instance = reinterpret_cast<DxcCreateInstanceProc>(dxil_create_instance);
+        HRESULT hr = create_instance(CLSID_DxcValidator, IID_PPV_ARGS(&dxc_validator));
+        if (FAILED(hr) || !dxc_validator) {
+            last_error = "failed to create the DXIL validator";
+            return false;
+        }
     }
 
     // The validator signs the container in place; the DXIL container is never resized.
     ShaderBlob blob(dxil.data(), dxil.size());
     ComPtr<IDxcOperationResult> result;
-    validator->Validate(&blob, DxcValidatorFlags_InPlaceEdit, &result);
+    dxc_validator->Validate(&blob, DxcValidatorFlags_InPlaceEdit, &result);
 
     HRESULT status = E_FAIL;
     if (result) {

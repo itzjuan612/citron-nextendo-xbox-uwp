@@ -65,6 +65,10 @@ private:
     decltype(&spirv_to_dxil) spirv_to_dxil_fn{};
     decltype(&spirv_to_dxil_free) spirv_to_dxil_free_fn{};
     void* dxil_create_instance{};
+    /// Cached `IDxcValidator` (as void* to keep dxcapi.h out of this header). Creating a
+    /// validator per shader compile leaks the compiler's per-instance state, which the
+    /// fixed 5120 MB Xbox budget cannot absorb over hundreds of compiles.
+    void* validator{};
     u32 validator_version{};
 
     std::mutex mutex;

@@ -34,7 +34,9 @@
 #include "citron_uwp/content_locator.h"
 #include "citron_uwp/session.h"
 #include "input_common/drivers/virtual_gamepad.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
+#include "core/hle/kernel/k_process.h"
 
 using namespace winrt;
 using namespace winrt::Windows::ApplicationModel::Core;
@@ -301,19 +303,34 @@ public:
         // Process-memory sentinel: silent fail-fast deaths (OOM/heap-corruption bypass all
         // exception filters) leave no trace; watching commit climb toward the 5 GB budget
         // every ~10 s identifies the killer before it strikes.
-        static constexpr ULONGLONG memory_log_interval_ms = 10000;
+        static constexpr ULONGLONG memory_log_interval_ms = 2000;
         ULONGLONG last_memory_log_tick = GetTickCount64();
+        u64 last_commit_mb = 0;
         auto log_process_memory = [&] {
             PROCESS_MEMORY_COUNTERS_EX pmc{};
             pmc.cb = sizeof(pmc);
             if (GetProcessMemoryInfo(GetCurrentProcess(),
                                      reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
                                      sizeof(pmc))) {
+                const u64 commit_mb = static_cast<u64>(pmc.PrivateUsage) / (1024ULL * 1024ULL);
+                if (last_commit_mb != 0 && commit_mb > last_commit_mb + 48) {
+                    LOG_CRITICAL(Frontend,
+                                 "COMMIT JUMP: {} -> {} MB (+{} MB) within one sentinel interval",
+                                 last_commit_mb, commit_mb, commit_mb - last_commit_mb);
+                }
+                last_commit_mb = commit_mb;
                 // Classify committed regions: RWX private ~= JIT code cache (the top
                 // suspect for the ~1.3 MB/s boot-time climb), other private, mapped.
                 u64 rwx_private = 0;
                 u64 other_private = 0;
                 u64 mapped = 0;
+                struct BigRegion {
+                    const void* base;
+                    u64 size;
+                    u32 protect;
+                };
+                BigRegion big_regions[8]{};
+                size_t big_region_count = 0;
                 SYSTEM_INFO si{};
                 GetSystemInfo(&si);
                 for (LPCVOID addr = si.lpMinimumApplicationAddress; addr < si.lpMaximumApplicationAddress;) {
@@ -331,6 +348,25 @@ public:
                             rwx_private += size;
                         } else if (private_mem) {
                             other_private += size;
+                            // Track the largest non-executable private regions so a growing
+                            // consumer is identifiable by base address across samples.
+                            if (size >= (32ULL * 1024 * 1024)) {
+                                size_t pos = 0;
+                                while (pos < big_region_count && big_regions[pos].size >= size) {
+                                    ++pos;
+                                }
+                                if (pos < 8) {
+                                    const size_t last = big_region_count < 8 ? big_region_count : 7;
+                                    for (size_t move = last; move > pos; --move) {
+                                        big_regions[move] = big_regions[move - 1];
+                                    }
+                                    big_regions[pos] = {mbi.BaseAddress, size,
+                                                        static_cast<u32>(mbi.Protect)};
+                                    if (big_region_count < 8) {
+                                        ++big_region_count;
+                                    }
+                                }
+                            }
                         } else {
                             mapped += size;
                         }
@@ -345,6 +381,29 @@ public:
                          static_cast<u64>(pmc.WorkingSetSize) / (1024ULL * 1024ULL),
                          rwx_private / (1024ULL * 1024ULL), other_private / (1024ULL * 1024ULL),
                          mapped / (1024ULL * 1024ULL));
+                for (size_t i = 0; i < big_region_count; ++i) {
+                    LOG_INFO(Frontend, "  big priv region #{}: base={:#x} size={} MB prot={:#x}", i,
+                             reinterpret_cast<uintptr_t>(big_regions[i].base),
+                             big_regions[i].size / (1024ULL * 1024ULL), big_regions[i].protect);
+                }
+            }
+            // Guest-side attribution for the commit climb: normal memory is the heap region
+            // plus mapped physical memory in guest units. If it tracks the host climb, guest
+            // heap growth is the culprit; if it stays flat, the growth is host-side (GPU page
+            // tables, caches, kernel mapping structures).
+            const Kernel::KProcess* const process = session.System().ApplicationProcess();
+            if (process != nullptr) {
+                LOG_INFO(Frontend,
+                         "Guest memory sentinel: normal={} MB used={} MB total={} MB "
+                         "lazy_commits={} sparse_committed={} MB",
+                         static_cast<u64>(process->GetNormalMemorySize()) / (1024ULL * 1024ULL),
+                         static_cast<u64>(process->GetUsedUserPhysicalMemorySize()) /
+                             (1024ULL * 1024ULL),
+                         static_cast<u64>(process->GetTotalUserPhysicalMemorySize()) /
+                             (1024ULL * 1024ULL),
+                         Common::GetLazyBackingCommitCount(),
+                         Common::g_sparse_lazy_commit_total_bytes.load(std::memory_order_relaxed) /
+                             (1024ULL * 1024ULL));
             }
         };
 
@@ -419,8 +478,25 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // Fail-fast paths (OOM, invalid parameters, heap corruption) bypass all exception
     // filters; these hooks are the only way to leave a trace before the silent death.
     _set_new_mode(1);
-    _set_new_handler([](size_t) -> int {
-        LOG_CRITICAL(Frontend, "operator new failed (OOM): commit exhausted before bad_alloc");
+    _set_new_handler([](size_t size) -> int {
+        LOG_CRITICAL(Frontend,
+                     "operator new failed (OOM): requested {} MB ({} bytes); commit exhausted "
+                     "before bad_alloc",
+                     static_cast<u64>(size) / (1024ULL * 1024ULL), static_cast<u64>(size));
+        // Frames 0-1 are the CRT's new machinery; frames 2+ identify the requesting code.
+        void* frames[32]{};
+        const USHORT frame_count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+        for (USHORT i = 0; i < frame_count; ++i) {
+            const auto frame_address = reinterpret_cast<uintptr_t>(frames[i]);
+            HMODULE frame_module = nullptr;
+            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                    reinterpret_cast<LPCWSTR>(frame_address), &frame_module)) {
+                continue;
+            }
+            LOG_CRITICAL(Frontend, "  new-fail frame #{}: module + 0x{:X}", i,
+                         frame_address - reinterpret_cast<uintptr_t>(frame_module));
+        }
         Common::Log::Stop();
         throw std::bad_alloc{};
     });

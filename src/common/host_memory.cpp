@@ -27,6 +27,7 @@
 
 #endif // ^^^ Linux ^^^
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -228,6 +229,8 @@ public:
         // TODO
         UNREACHABLE();
     }
+
+    void CommitBackingRange(size_t, size_t) {}
 
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
@@ -656,6 +659,8 @@ public:
         virtual_base = nullptr;
     }
 
+    void CommitBackingRange(size_t, size_t) {}
+
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
@@ -817,11 +822,121 @@ private:
 
 #else // ^^^ Linux ^^^ vvv Generic vvv
 
+#ifdef CITRON_UWP
+namespace {
+
+// UWP reserves the 4 GiB DRAM backing instead of committing it eagerly: the eager commit
+// consumed ~4 GiB of the fixed 5120 MB Xbox process-commit budget before the game even
+// started. Pages are committed when the guest maps them (HostMemory::CommitBackingRange)
+// and, as a fallback for physical memory the CPU page table never maps (GPU-only buffers),
+// on first access through this vectored exception handler.
+constexpr size_t LazyBackingChunkSize = 64 * 1024;
+constexpr size_t MaxLazyBackingRanges = 8;
+
+SRWLOCK g_lazy_backing_lock = SRWLOCK_INIT;
+struct LazyBackingRange {
+    u8* base;
+    size_t size;
+};
+LazyBackingRange g_lazy_backing_ranges[MaxLazyBackingRanges]{};
+size_t g_lazy_backing_range_count = 0;
+std::atomic<u64> g_lazy_backing_commit_count{0};
+
+LONG CALLBACK LazyBackingViolationHandler(EXCEPTION_POINTERS* info) {
+    const EXCEPTION_RECORD* const record = info->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    const auto fault = static_cast<uintptr_t>(record->ExceptionInformation[1]);
+    void* commit_base = nullptr;
+    size_t commit_size = 0;
+    AcquireSRWLockShared(&g_lazy_backing_lock);
+    for (size_t i = 0; i < g_lazy_backing_range_count; ++i) {
+        const auto& range = g_lazy_backing_ranges[i];
+        const auto begin = reinterpret_cast<uintptr_t>(range.base);
+        if (fault < begin || fault - begin >= range.size) {
+            continue;
+        }
+        const size_t offset =
+            Common::AlignDown(static_cast<size_t>(fault - begin), LazyBackingChunkSize);
+        commit_base = range.base + offset;
+        commit_size = (std::min)(LazyBackingChunkSize, range.size - offset);
+        break;
+    }
+    ReleaseSRWLockShared(&g_lazy_backing_lock);
+    if (commit_base == nullptr || commit_size == 0) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // No logging here: the fault can be raised while the log mutex is held.
+    if (VirtualAlloc(commit_base, commit_size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    g_lazy_backing_commit_count.fetch_add(1, std::memory_order_relaxed);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void RegisterLazyBackingRange(u8* base, size_t size) {
+    AcquireSRWLockExclusive(&g_lazy_backing_lock);
+    const bool first_range = g_lazy_backing_range_count == 0;
+    if (g_lazy_backing_range_count < MaxLazyBackingRanges) {
+        g_lazy_backing_ranges[g_lazy_backing_range_count++] = LazyBackingRange{base, size};
+    }
+    ReleaseSRWLockExclusive(&g_lazy_backing_lock);
+    if (first_range) {
+        // AddVectoredExceptionHandler is not in the UWP API-partition headers; the export
+        // is still present in kernelbase, so resolve it dynamically.
+        using AddVectoredExceptionHandlerFn =
+            PVOID(WINAPI*)(ULONG, LONG(CALLBACK*)(EXCEPTION_POINTERS*));
+        const HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
+        const auto add_handler =
+            kernelbase != nullptr
+                ? reinterpret_cast<AddVectoredExceptionHandlerFn>(
+                      GetProcAddress(kernelbase, "AddVectoredExceptionHandler"))
+                : nullptr;
+        if (add_handler != nullptr) {
+            add_handler(1, LazyBackingViolationHandler);
+        }
+    }
+}
+
+void UnregisterLazyBackingRange(u8* base) {
+    AcquireSRWLockExclusive(&g_lazy_backing_lock);
+    for (size_t i = 0; i < g_lazy_backing_range_count; ++i) {
+        if (g_lazy_backing_ranges[i].base == base) {
+            g_lazy_backing_ranges[i] = g_lazy_backing_ranges[--g_lazy_backing_range_count];
+            break;
+        }
+    }
+    ReleaseSRWLockExclusive(&g_lazy_backing_lock);
+}
+
+} // namespace
+#endif // CITRON_UWP
+
 class HostMemory::Impl {
 public:
-    explicit Impl(size_t backing_size, size_t /*virtual_size*/) : backing_buffer{backing_size} {
+    explicit Impl(size_t backing_size, size_t /*virtual_size*/)
+#ifdef CITRON_UWP
+        : backing_size_{backing_size} {
+        backing_base = static_cast<u8*>(ReserveMemoryPages(backing_size));
+        RegisterLazyBackingRange(backing_base, backing_size);
+    }
+#else
+        : backing_buffer{backing_size} {
         backing_base = backing_buffer.data();
     }
+#endif
+
+#ifdef CITRON_UWP
+    ~Impl() {
+        if (backing_base != nullptr) {
+            UnregisterLazyBackingRange(backing_base);
+            FreeMemoryPages(backing_base, backing_size_);
+        }
+    }
+#endif
 
     void Map(size_t virtual_offset, size_t host_offset, size_t length, MemoryPermission perm) {}
 
@@ -831,11 +946,33 @@ public:
 
     void EnableDirectMappedAddress() {}
 
+    void CommitBackingRange(size_t physical_offset, size_t length) {
+#ifdef CITRON_UWP
+        if (backing_base == nullptr || backing_size_ == 0 || physical_offset >= backing_size_) {
+            return;
+        }
+        const size_t end = (std::min)(physical_offset + length, backing_size_);
+        const size_t begin = Common::AlignDown(physical_offset, LazyBackingChunkSize);
+        const size_t commit_end =
+            (std::min)(Common::AlignUp(end, LazyBackingChunkSize), backing_size_);
+        if (commit_end > begin) {
+            CommitMemoryPages(backing_base + begin, commit_end - begin);
+        }
+#else
+        (void)physical_offset;
+        (void)length;
+#endif
+    }
+
     u8* backing_base{nullptr};
     u8* virtual_base{nullptr};
 
 private:
+#ifdef CITRON_UWP
+    size_t backing_size_{};
+#else
     VirtualBuffer<u8> backing_buffer;
+#endif
 };
 
 #endif // ^^^ Generic ^^^
@@ -951,6 +1088,20 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
     std::memset(backing_base + physical_offset, fill_value, length);
+}
+
+void HostMemory::CommitBackingRange(size_t physical_offset, size_t length) {
+    if (impl) {
+        impl->CommitBackingRange(physical_offset, length);
+    }
+}
+
+u64 GetLazyBackingCommitCount() noexcept {
+#ifdef CITRON_UWP
+    return g_lazy_backing_commit_count.load(std::memory_order_relaxed);
+#else
+    return 0;
+#endif
 }
 
 void HostMemory::EnableDirectMappedAddress() {

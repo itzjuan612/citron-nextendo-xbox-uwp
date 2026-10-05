@@ -59,10 +59,13 @@ struct PipelineKeyHash {
 /// yet — a stall on first use of each unique pipeline).
 class PipelineCache : public VideoCommon::ShaderCache {
 public:
-    /// A pipeline plus the translated programs that own its `Shader::Info`s.
+    /// A pipeline plus the translated `Shader::Info`s needed for descriptor setup.
+    /// The translation-time IR (`Shader::IR::Program`) is intentionally dropped after
+    /// each stage compiles: only `info` is read at draw time, so retaining the full IR
+    /// per cached pipeline would pin the per-stage block/syntax vectors forever.
     struct StoredPipeline {
         std::unique_ptr<GraphicsPipeline> pipeline;
-        std::array<Shader::IR::Program, MAX_SHADER_STAGES> programs;
+        std::array<Shader::Info, MAX_SHADER_STAGES> infos_storage;
         std::array<const Shader::Info*, MAX_SHADER_STAGES> infos{};
     };
 
@@ -74,7 +77,7 @@ public:
     /// Returns nullptr when shaders are invalid or translation/compilation fails.
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipeline();
 
-    /// Same as above but also exposes the stored programs/infos for descriptor setup.
+    /// Same as above but also exposes the stored shader infos for descriptor setup.
     [[nodiscard]] StoredPipeline* CurrentStoredPipeline();
 
 private:
@@ -89,6 +92,8 @@ private:
     ShaderPools pools;
     GraphicsPipelineCacheKey current_key{};
     StoredPipeline* current_pipeline{};
+    size_t compiled_stage_count{};
+    size_t compiled_stage_bytes{};
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<StoredPipeline>, PipelineKeyHash>
         cache;
 };

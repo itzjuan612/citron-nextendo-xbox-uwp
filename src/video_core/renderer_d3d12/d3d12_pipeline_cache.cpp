@@ -348,6 +348,11 @@ PipelineCache::StoredPipeline* PipelineCache::CurrentPipelineSlowPath() {
     }
     StoredPipeline* const result = stored.get();
     cache.emplace(current_key, std::move(stored));
+    if (cache.size() % 16 == 0) {
+        LOG_INFO(Render_D3D12,
+                 "Pipeline cache: entries={}, compiled_stages={}, compiled_bytes={}",
+                 cache.size(), compiled_stage_count, compiled_stage_bytes);
+    }
     return result;
 }
 
@@ -426,9 +431,13 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
         }
         stages[stage_index] = std::move(dxil);
         runtime_data[stage_index] = metadata.requires_runtime_data;
-        stored->programs[stage_index] = std::move(program);
-        stored->infos[stage_index] = &stored->programs[stage_index].info;
-        previous_stage = &stored->programs[stage_index];
+        compiled_stage_count += 1;
+        compiled_stage_bytes += stages[stage_index].size();
+        // Copy only the draw-time `info` out of the IR program; the block/syntax vectors
+        // stay in the local `programs` array and are released when this function returns.
+        stored->infos_storage[stage_index] = program.info;
+        stored->infos[stage_index] = &stored->infos_storage[stage_index];
+        previous_stage = &program;
     }
     stored->pipeline = std::make_unique<GraphicsPipeline>(device.GetDevice(), key, stages,
                                                           stored->infos, runtime_data);

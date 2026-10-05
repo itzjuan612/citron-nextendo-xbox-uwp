@@ -203,6 +203,19 @@ public:
 
     void TickFrame();
 
+    /// Diagnostics: current host-side buffer allocations (OOM hunt).
+    struct MemoryUsage {
+        u64 total_bytes;
+        u64 large_bytes;
+        u64 evicted_bytes;
+        u32 buffers;
+        u32 large_buffers;
+    };
+    [[nodiscard]] MemoryUsage GetMemoryUsage() const noexcept {
+        return {total_used_memory, large_buffer_memory, evicted_buffer_bytes, buffer_count,
+                large_buffer_count};
+    }
+
     void WriteMemory(DAddr device_addr, u64 size);
 
     void CachedWriteMemory(DAddr device_addr, u64 size);

@@ -51,6 +51,13 @@ public:
 
     void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value);
 
+    /**
+     * Commits the backing store covering [physical_offset, physical_offset + length).
+     * Most platforms commit the backing eagerly; UWP reserves it and commits here as the
+     * guest maps/touches memory, so the 4 GiB DRAM footprint fits the Xbox commit budget.
+     */
+    void CommitBackingRange(size_t physical_offset, size_t length);
+
     [[nodiscard]] u8* BackingBasePointer() noexcept {
         return backing_base;
     }
@@ -85,5 +92,8 @@ private:
     u8* virtual_base{};
     size_t virtual_base_offset{};
 };
+
+/// Number of exception-driven lazy backing commits (UWP only; always 0 elsewhere).
+u64 GetLazyBackingCommitCount() noexcept;
 
 } // namespace Common

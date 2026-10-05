@@ -1242,14 +1242,19 @@ void RasterizerD3D12::TickFrame() {
 void RasterizerD3D12::LogMemoryStats() {
     std::scoped_lock lock{m_texture_cache.mutex};
     const auto vram = m_texture_cache.GetVRAMStats();
+    const auto buffers = m_buffer_cache.GetMemoryUsage();
     LOG_INFO(Render_D3D12,
              "Memory stats: textures={} images={} used={:.0f} MB staging={:.0f} MB "
-             "gpu_usage={:.0f} MB evicted_total={:.0f} MB",
+             "gpu_usage={:.0f} MB evicted_total={:.0f} MB buffers={} buffer_used={:.0f} MB "
+             "buffer_large={:.0f} MB buffer_evicted={:.0f} MB",
              vram.texture_count, vram.sparse_texture_count,
              static_cast<f64>(vram.total_used_bytes) / (1024.0 * 1024.0),
              static_cast<f64>(m_staging_pool.TotalBytes()) / (1024.0 * 1024.0),
              static_cast<f64>(m_texture_runtime.GetDeviceMemoryUsage()) / (1024.0 * 1024.0),
-             static_cast<f64>(vram.evicted_total) / (1024.0 * 1024.0));
+             static_cast<f64>(vram.evicted_total) / (1024.0 * 1024.0), buffers.buffers,
+             static_cast<f64>(buffers.total_bytes) / (1024.0 * 1024.0),
+             static_cast<f64>(buffers.large_bytes) / (1024.0 * 1024.0),
+             static_cast<f64>(buffers.evicted_bytes) / (1024.0 * 1024.0));
 }
 Tegra::Engines::AccelerateDMAInterface& RasterizerD3D12::AccessAccelerateDMA() {
     return m_accelerate_dma;

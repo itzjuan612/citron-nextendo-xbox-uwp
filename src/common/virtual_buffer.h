@@ -91,6 +91,9 @@ private:
 
 #ifdef CITRON_UWP
 
+/// Cumulative bytes committed by all SparseLazyBuffer instances (OOM diagnostics).
+inline std::atomic<u64> g_sparse_lazy_commit_total_bytes{0};
+
 /// Reserves a virtual range without committing it (pages are inaccessible until committed).
 void* ReserveMemoryPages(std::size_t size) noexcept;
 /// Commits a previously reserved range; the OS zero-fills the pages.
@@ -226,6 +229,7 @@ void SparseLazyBuffer<T, OnCommit>::CommitChunk(std::size_t chunk) const {
         const std::size_t size = (std::min)(ChunkSize, total_bytes - offset);
         void* committed = CommitMemoryPages(base + offset, size);
         ASSERT_MSG(committed != nullptr, "SparseLazyBuffer: failed to commit {} bytes", size);
+        g_sparse_lazy_commit_total_bytes.fetch_add(size, std::memory_order_relaxed);
         OnCommit{}(reinterpret_cast<T*>(base + offset),
                    reinterpret_cast<T*>(base + offset + size));
         chunk_states[chunk].store(ChunkCommitted, std::memory_order_release);

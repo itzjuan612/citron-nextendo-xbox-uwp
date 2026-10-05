@@ -147,6 +147,53 @@ DXGI_FORMAT VertexFormat(Maxwell3D::Regs::VertexAttribute::Type type,
         type = Type::SInt;
     }
 
+    // 3-component sizes. D3D12 has exact 3x32 formats, but no 3x16 or 3x8 formats; for
+    // those the 4-component variant is used (the shader input signature ignores the extra
+    // component, and out-of-bounds input fetch reads return 0), which is what other
+    // backends do for the widths D3D12 cannot express.
+    if (size == Size::Size_R32_G32_B32) {
+        switch (type) {
+        case Type::Float:
+            return DXGI_FORMAT_R32G32B32_FLOAT;
+        case Type::UInt:
+            return DXGI_FORMAT_R32G32B32_UINT;
+        case Type::SInt:
+            return DXGI_FORMAT_R32G32B32_SINT;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+    if (size == Size::Size_R16_G16_B16) {
+        switch (type) {
+        case Type::Float:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case Type::UNorm:
+            return DXGI_FORMAT_R16G16B16A16_UNORM;
+        case Type::SNorm:
+            return DXGI_FORMAT_R16G16B16A16_SNORM;
+        case Type::UInt:
+            return DXGI_FORMAT_R16G16B16A16_UINT;
+        case Type::SInt:
+            return DXGI_FORMAT_R16G16B16A16_SINT;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+    if (size == Size::Size_R8_G8_B8) {
+        switch (type) {
+        case Type::UNorm:
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case Type::SNorm:
+            return DXGI_FORMAT_R8G8B8A8_SNORM;
+        case Type::UInt:
+            return DXGI_FORMAT_R8G8B8A8_UINT;
+        case Type::SInt:
+            return DXGI_FORMAT_R8G8B8A8_SINT;
+        default:
+            return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+
     // {R, RG, RGB(A), RGBA} for one component width and signedness.
     const auto pick = [&](DXGI_FORMAT r, DXGI_FORMAT rg, DXGI_FORMAT rgba) -> DXGI_FORMAT {
         switch (size) {

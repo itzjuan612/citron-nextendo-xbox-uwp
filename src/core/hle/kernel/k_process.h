@@ -319,6 +319,10 @@ public:
         return m_handle_table;
     }
 
+    /// Guest normal memory currently mapped (heap region + mapped physical memory).
+    size_t GetNormalMemorySize() const {
+        return m_page_table.GetNormalMemorySize();
+    }
     size_t GetUsedUserPhysicalMemorySize() const;
     size_t GetTotalUserPhysicalMemorySize() const;
     size_t GetUsedNonSystemUserPhysicalMemorySize() const;

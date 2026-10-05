@@ -631,6 +631,11 @@ struct Memory::Impl {
                 base += 1;
             }
         } else {
+            // Commit the host backing for this physical mapping now that the guest can use
+            // it; UWP keeps the 4 GiB DRAM backing reserved until pages are actually mapped
+            // (eager commit does not fit the 5120 MB Xbox process-commit budget).
+            system.DeviceMemory().buffer.CommitBackingRange(GetInteger(target) - DramMemoryMap::Base,
+                                                            size * CITRON_PAGESIZE);
             auto orig_base = base;
             while (base != end) {
                 auto host_ptr = uintptr_t(system.DeviceMemory().GetPointer<u8>(target)) - (base << CITRON_PAGEBITS);

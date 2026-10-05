@@ -298,7 +298,12 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(
     config.enable_cycle_counting = !m_uses_wall_clock;
 
     // Code cache size
-#ifdef ARCHITECTURE_arm64
+#if defined(CITRON_UWP)
+    // The 512 MiB desktop cap lets the JIT balloon hundreds of MB inside the fixed
+    // 5120 MB Xbox commit budget; it commits lazily and flushes when full, so 256 MiB
+    // bounds it without starving code space.
+    config.code_cache_size = u32(256_MiB);
+#elif defined(ARCHITECTURE_arm64)
     config.code_cache_size = u32(128_MiB);
 #else
     config.code_cache_size = u32(512_MiB);
