@@ -86,6 +86,11 @@ bool DynamicLibrary::Open(const char* filename) {
         MultiByteToWideChar(CP_UTF8, 0, filename, -1, wide.data(), wide_len);
     }
     handle = reinterpret_cast<void*>(LoadPackagedLibrary(wide.c_str(), 0));
+    if (handle == nullptr) {
+        // LoadPackagedLibrary only searches the app package; system libraries such as
+        // XAudio2_9.dll need the normal loader fallback.
+        handle = reinterpret_cast<void*>(LoadLibraryW(wide.c_str()));
+    }
 #else
     handle = reinterpret_cast<void*>(LoadLibraryA(filename));
 #endif

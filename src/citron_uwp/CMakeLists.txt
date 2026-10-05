@@ -36,7 +36,7 @@ set_property(TARGET citron-uwp PROPERTY VS_APP_CONTAINER_APPLICATION TRUE)
 target_link_options(citron-uwp PRIVATE /APPCONTAINER /MANIFEST:NO)
 if(MSVC)
     set_target_properties(citron-uwp PROPERTIES
-        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup")
+        LINK_FLAGS "/SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup /STACK:16777216")
 endif()
 
 create_target_directory_groups(citron-uwp)
