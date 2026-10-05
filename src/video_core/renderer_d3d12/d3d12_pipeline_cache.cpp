@@ -20,8 +20,10 @@
 #include "shader_recompiler/program_header.h"
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/shader_info.h"
+#include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
+#include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 #include "video_core/surface.h"
 
 namespace D3D12 {
@@ -35,6 +37,24 @@ using Shader::Maxwell::GenerateGeometryPassthrough;
 using Shader::Maxwell::MergeDualVertexPrograms;
 using Shader::Maxwell::TranslateProgram;
 using VideoCore::Surface::PixelFormat;
+
+/// A pipeline cannot be created when any colour attachment format has no render-target
+/// representation in D3D12 (e.g. R11G11B10_FLOAT). Rejecting the key here avoids paying for
+/// shader translation and a failing CreateGraphicsPipelineState on every draw.
+[[nodiscard]] bool IsPipelineFormatRepresentable(const GraphicsPipelineCacheKey& key) {
+    for (const u32 raw_format : key.state.color_formats) {
+        const auto format = static_cast<Tegra::RenderTargetFormat>(raw_format);
+        if (format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+        if (pixel_format == VideoCore::Surface::PixelFormat::Invalid ||
+            !TextureCacheRuntime::IsRepresentableRenderTarget(pixel_format)) {
+            return false;
+        }
+    }
+    return true;
+}
 
 // The Xbox grants a fixed 5120 MB commit budget. Translating a large shader transiently
 // commits hundreds of MB (captured OOM stacks land in the Maxwell->IR passes), which does
@@ -366,6 +386,20 @@ PipelineCache::StoredPipeline* PipelineCache::CurrentPipelineSlowPath() {
     const auto it = cache.find(current_key);
     if (it != cache.end()) {
         return it->second.get();
+    }
+    if (failed_keys.contains(current_key)) {
+        return nullptr;
+    }
+    if (!IsPipelineFormatRepresentable(current_key)) {
+        failed_keys.insert(current_key);
+        static std::atomic<u32> unrepresentable_keys{0};
+        const u32 count = unrepresentable_keys.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 8) {
+            LOG_ERROR(Render_D3D12,
+                      "Pipeline with unrepresentable render target format skipped (key {})",
+                      count);
+        }
+        return nullptr;
     }
     auto stored = CreatePipeline(current_key);
     if (!stored) {

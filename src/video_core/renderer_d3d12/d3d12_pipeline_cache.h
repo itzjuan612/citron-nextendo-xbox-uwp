@@ -6,6 +6,7 @@
 #include <array>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <d3d12.h>
@@ -96,6 +97,10 @@ private:
     size_t compiled_stage_bytes{};
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<StoredPipeline>, PipelineKeyHash>
         cache;
+    /// Keys that deterministically cannot produce a PSO (e.g. unrepresentable RT formats).
+    /// Cached so a guest retrying the draw every frame cannot re-run translation or flood
+    /// the log (observed: 21k failed PSO creations and 15 MB of log in one run).
+    std::unordered_set<GraphicsPipelineCacheKey, PipelineKeyHash> failed_keys;
 };
 
 } // namespace D3D12
