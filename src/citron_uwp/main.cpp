@@ -479,25 +479,30 @@ int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     // filters; these hooks are the only way to leave a trace before the silent death.
     _set_new_mode(1);
     _set_new_handler([](size_t size) -> int {
+        static std::atomic<u32> oom_count{0};
+        const u32 count = oom_count.fetch_add(1, std::memory_order_relaxed) + 1;
         LOG_CRITICAL(Frontend,
-                     "operator new failed (OOM): requested {} MB ({} bytes); commit exhausted "
-                     "before bad_alloc",
-                     static_cast<u64>(size) / (1024ULL * 1024ULL), static_cast<u64>(size));
+                     "operator new failed (OOM): requested {} MB ({} bytes), commit exhausted "
+                     "(count {})",
+                     static_cast<u64>(size) / (1024ULL * 1024ULL), static_cast<u64>(size), count);
         // Frames 0-1 are the CRT's new machinery; frames 2+ identify the requesting code.
-        void* frames[32]{};
-        const USHORT frame_count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
-        for (USHORT i = 0; i < frame_count; ++i) {
-            const auto frame_address = reinterpret_cast<uintptr_t>(frames[i]);
-            HMODULE frame_module = nullptr;
-            if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                    reinterpret_cast<LPCWSTR>(frame_address), &frame_module)) {
-                continue;
+        // Only the first few failures pay for symbolization, and logging stays up because
+        // callers can recover (pipeline translation catches bad_alloc).
+        if (count <= 4) {
+            void* frames[32]{};
+            const USHORT frame_count = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+            for (USHORT i = 0; i < frame_count; ++i) {
+                const auto frame_address = reinterpret_cast<uintptr_t>(frames[i]);
+                HMODULE frame_module = nullptr;
+                if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        reinterpret_cast<LPCWSTR>(frame_address), &frame_module)) {
+                    continue;
+                }
+                LOG_CRITICAL(Frontend, "  new-fail frame #{}: module + 0x{:X}", i,
+                             frame_address - reinterpret_cast<uintptr_t>(frame_module));
             }
-            LOG_CRITICAL(Frontend, "  new-fail frame #{}: module + 0x{:X}", i,
-                         frame_address - reinterpret_cast<uintptr_t>(frame_module));
         }
-        Common::Log::Stop();
         throw std::bad_alloc{};
     });
     signal(SIGABRT, [](int) {

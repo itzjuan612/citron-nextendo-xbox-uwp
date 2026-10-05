@@ -232,6 +232,10 @@ public:
 
     void CommitBackingRange(size_t, size_t) {}
 
+    void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+        std::memset(backing_base + physical_offset, fill_value, length);
+    }
+
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
@@ -661,6 +665,10 @@ public:
 
     void CommitBackingRange(size_t, size_t) {}
 
+    void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+        std::memset(backing_base + physical_offset, fill_value, length);
+    }
+
     const size_t backing_size; ///< Size of the backing memory in bytes
     const size_t virtual_size; ///< Size of the virtual address placeholder in bytes
 
@@ -833,14 +841,68 @@ namespace {
 constexpr size_t LazyBackingChunkSize = 64 * 1024;
 constexpr size_t MaxLazyBackingRanges = 8;
 
+// Pages are OS-zero when first committed, so the kernel's "clear to pattern" can be deferred
+// for untouched chunks (chunk_fills) and applied by whoever commits the chunk first. Without
+// this, mapping Splatoon 3's ~3.2 GiB heap committed (and touched) the whole pool at boot.
+constexpr u8 LazyChunkUncommitted = 0;
+constexpr u8 LazyChunkCommitting = 1;
+constexpr u8 LazyChunkCommitted = 2;
+
 SRWLOCK g_lazy_backing_lock = SRWLOCK_INIT;
 struct LazyBackingRange {
     u8* base;
     size_t size;
+    size_t chunk_count;
+    std::atomic<u8>* chunk_states;
+    std::atomic<u8>* chunk_fills;
 };
 LazyBackingRange g_lazy_backing_ranges[MaxLazyBackingRanges]{};
 size_t g_lazy_backing_range_count = 0;
 std::atomic<u64> g_lazy_backing_commit_count{0};
+
+/// Commits one chunk (once) and applies its deferred fill pattern. Returns false if the
+/// commit failed. Safe to call from the exception handler: no locks, no logging.
+bool CommitLazyChunk(const LazyBackingRange& range, size_t chunk) {
+    u8 expected = LazyChunkUncommitted;
+    if (!range.chunk_states[chunk].compare_exchange_strong(expected, LazyChunkCommitting,
+                                                           std::memory_order_acq_rel)) {
+        while (range.chunk_states[chunk].load(std::memory_order_acquire) == LazyChunkCommitting) {
+            Sleep(0);
+        }
+        return range.chunk_states[chunk].load(std::memory_order_acquire) == LazyChunkCommitted;
+    }
+
+    const size_t offset = chunk * LazyBackingChunkSize;
+    const size_t size = (std::min)(LazyBackingChunkSize, range.size - offset);
+    if (VirtualAlloc(range.base + offset, size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+        range.chunk_states[chunk].store(LazyChunkUncommitted, std::memory_order_release);
+        return false;
+    }
+    const u8 fill = range.chunk_fills[chunk].load(std::memory_order_relaxed);
+    if (fill != 0) {
+        std::memset(range.base + offset, fill, size);
+        range.chunk_fills[chunk].store(0, std::memory_order_relaxed);
+    }
+    range.chunk_states[chunk].store(LazyChunkCommitted, std::memory_order_release);
+    g_lazy_backing_commit_count.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+const LazyBackingRange* FindLazyBackingRange(uintptr_t address, size_t* out_chunk) {
+    const LazyBackingRange* found = nullptr;
+    AcquireSRWLockShared(&g_lazy_backing_lock);
+    for (size_t i = 0; i < g_lazy_backing_range_count; ++i) {
+        const auto& range = g_lazy_backing_ranges[i];
+        const auto begin = reinterpret_cast<uintptr_t>(range.base);
+        if (address >= begin && address - begin < range.size) {
+            *out_chunk = static_cast<size_t>(address - begin) / LazyBackingChunkSize;
+            found = &range;
+            break;
+        }
+    }
+    ReleaseSRWLockShared(&g_lazy_backing_lock);
+    return found;
+}
 
 LONG CALLBACK LazyBackingViolationHandler(EXCEPTION_POINTERS* info) {
     const EXCEPTION_RECORD* const record = info->ExceptionRecord;
@@ -848,40 +910,27 @@ LONG CALLBACK LazyBackingViolationHandler(EXCEPTION_POINTERS* info) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    const auto fault = static_cast<uintptr_t>(record->ExceptionInformation[1]);
-    void* commit_base = nullptr;
-    size_t commit_size = 0;
-    AcquireSRWLockShared(&g_lazy_backing_lock);
-    for (size_t i = 0; i < g_lazy_backing_range_count; ++i) {
-        const auto& range = g_lazy_backing_ranges[i];
-        const auto begin = reinterpret_cast<uintptr_t>(range.base);
-        if (fault < begin || fault - begin >= range.size) {
-            continue;
-        }
-        const size_t offset =
-            Common::AlignDown(static_cast<size_t>(fault - begin), LazyBackingChunkSize);
-        commit_base = range.base + offset;
-        commit_size = (std::min)(LazyBackingChunkSize, range.size - offset);
-        break;
-    }
-    ReleaseSRWLockShared(&g_lazy_backing_lock);
-    if (commit_base == nullptr || commit_size == 0) {
+    size_t chunk = 0;
+    const LazyBackingRange* const range =
+        FindLazyBackingRange(static_cast<uintptr_t>(record->ExceptionInformation[1]), &chunk);
+    if (range == nullptr) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
     // No logging here: the fault can be raised while the log mutex is held.
-    if (VirtualAlloc(commit_base, commit_size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+    if (!CommitLazyChunk(*range, chunk)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    g_lazy_backing_commit_count.fetch_add(1, std::memory_order_relaxed);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-void RegisterLazyBackingRange(u8* base, size_t size) {
+void RegisterLazyBackingRange(u8* base, size_t size, std::atomic<u8>* chunk_states,
+                              std::atomic<u8>* chunk_fills, size_t chunk_count) {
     AcquireSRWLockExclusive(&g_lazy_backing_lock);
     const bool first_range = g_lazy_backing_range_count == 0;
     if (g_lazy_backing_range_count < MaxLazyBackingRanges) {
-        g_lazy_backing_ranges[g_lazy_backing_range_count++] = LazyBackingRange{base, size};
+        g_lazy_backing_ranges[g_lazy_backing_range_count++] =
+            LazyBackingRange{base, size, chunk_count, chunk_states, chunk_fills};
     }
     ReleaseSRWLockExclusive(&g_lazy_backing_lock);
     if (first_range) {
@@ -927,7 +976,11 @@ public:
 #ifdef CITRON_UWP
         : backing_size_{backing_size} {
         backing_base = static_cast<u8*>(ReserveMemoryPages(backing_size));
-        RegisterLazyBackingRange(backing_base, backing_size);
+        chunk_count_ = (backing_size + LazyBackingChunkSize - 1) / LazyBackingChunkSize;
+        chunk_states_ = new std::atomic<u8>[chunk_count_]();
+        chunk_fills_ = new std::atomic<u8>[chunk_count_]();
+        RegisterLazyBackingRange(backing_base, backing_size, chunk_states_, chunk_fills_,
+                                 chunk_count_);
     }
 #else
         : backing_buffer{backing_size} {
@@ -941,6 +994,8 @@ public:
             UnregisterLazyBackingRange(backing_base);
             FreeMemoryPages(backing_base, backing_size_);
         }
+        delete[] chunk_states_;
+        delete[] chunk_fills_;
     }
 #endif
 
@@ -957,16 +1012,54 @@ public:
         if (backing_base == nullptr || backing_size_ == 0 || physical_offset >= backing_size_) {
             return;
         }
+        const LazyBackingRange range{backing_base, backing_size_, chunk_count_, chunk_states_,
+                                     chunk_fills_};
         const size_t end = (std::min)(physical_offset + length, backing_size_);
         const size_t begin = Common::AlignDown(physical_offset, LazyBackingChunkSize);
         const size_t commit_end =
             (std::min)(Common::AlignUp(end, LazyBackingChunkSize), backing_size_);
-        if (commit_end > begin) {
-            CommitMemoryPages(backing_base + begin, commit_end - begin);
+        for (size_t chunk = begin / LazyBackingChunkSize;
+             chunk < (commit_end + LazyBackingChunkSize - 1) / LazyBackingChunkSize; ++chunk) {
+            CommitLazyChunk(range, chunk);
         }
 #else
         (void)physical_offset;
         (void)length;
+#endif
+    }
+
+    void ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+#ifdef CITRON_UWP
+        if (backing_base == nullptr || backing_size_ == 0 || physical_offset >= backing_size_ ||
+            length == 0) {
+            return;
+        }
+        const u8 fill = static_cast<u8>(fill_value);
+        const size_t end = (std::min)(physical_offset + length, backing_size_);
+        const size_t first_chunk = physical_offset / LazyBackingChunkSize;
+        const size_t last_chunk = (end + LazyBackingChunkSize - 1) / LazyBackingChunkSize;
+        for (size_t chunk = first_chunk; chunk < last_chunk; ++chunk) {
+            const size_t chunk_offset = chunk * LazyBackingChunkSize;
+            const size_t begin = (std::max)(chunk_offset, physical_offset);
+            const size_t chunk_end = (std::min)(chunk_offset + LazyBackingChunkSize, end);
+            u8 state = chunk_states_[chunk].load(std::memory_order_acquire);
+            if (state == LazyChunkUncommitted) {
+                // Untouched chunk: pages are OS-zero on first commit, so record the pattern
+                // and let the committer apply it instead of touching the whole mapped heap.
+                chunk_fills_[chunk].store(fill, std::memory_order_relaxed);
+                state = chunk_states_[chunk].load(std::memory_order_acquire);
+                if (state == LazyChunkUncommitted) {
+                    continue;
+                }
+            }
+            while (chunk_states_[chunk].load(std::memory_order_acquire) == LazyChunkCommitting) {
+                Sleep(0);
+            }
+            std::memset(backing_base + begin, fill, chunk_end - begin);
+            chunk_fills_[chunk].store(0, std::memory_order_relaxed);
+        }
+#else
+        std::memset(backing_base + physical_offset, fill_value, length);
 #endif
     }
 
@@ -976,6 +1069,9 @@ public:
 private:
 #ifdef CITRON_UWP
     size_t backing_size_{};
+    size_t chunk_count_{};
+    std::atomic<u8>* chunk_states_{};
+    std::atomic<u8>* chunk_fills_{};
 #else
     VirtualBuffer<u8> backing_buffer;
 #endif
@@ -1093,7 +1189,9 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
-    std::memset(backing_base + physical_offset, fill_value, length);
+    if (impl) {
+        impl->ClearBackingRegion(physical_offset, length, fill_value);
+    }
 }
 
 void HostMemory::CommitBackingRange(size_t physical_offset, size_t length) {

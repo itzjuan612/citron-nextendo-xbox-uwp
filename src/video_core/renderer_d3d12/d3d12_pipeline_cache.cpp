@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <new>
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -482,6 +483,17 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
     return stored;
 } catch (const Shader::Exception& exception) {
     LOG_ERROR(Render_D3D12, "Draw shader translation failed: {}", exception.what());
+    return nullptr;
+} catch (const std::bad_alloc&) {
+    // The fixed Xbox commit budget can run out while translating a large shader (the new
+    // handler throws after logging). Skip this pipeline instead of killing the process;
+    // the draw is retried and succeeds once there is headroom again.
+    static std::atomic<u32> oom_count{0};
+    const u32 count = oom_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= 8 || count % 64 == 0) {
+        LOG_ERROR(Render_D3D12,
+                  "Pipeline compile ran out of memory; skipping pipeline (count {})", count);
+    }
     return nullptr;
 }
 
