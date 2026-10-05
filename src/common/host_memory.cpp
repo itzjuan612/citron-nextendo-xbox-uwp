@@ -897,6 +897,12 @@ void RegisterLazyBackingRange(u8* base, size_t size) {
                 : nullptr;
         if (add_handler != nullptr) {
             add_handler(1, LazyBackingViolationHandler);
+            LOG_INFO(HW_Memory, "Lazy backing commit handler registered ({} MiB reserved)",
+                     size / (1024 * 1024));
+        } else {
+            LOG_CRITICAL(HW_Memory,
+                         "Failed to resolve AddVectoredExceptionHandler; lazily reserved "
+                         "backing pages will fault on first access");
         }
     }
 }

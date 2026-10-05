@@ -151,6 +151,9 @@ std::size_t KSystemControl::Init::GetApplicationPoolSize() {
     }();
 
     // Return (possibly) adjusted size.
+    // NOTE: trimming this for UWP was tested in 1.0.82.0 (-512 MiB): the guest fills its
+    // pool at boot and panics at ~80 s (unmapped 0x0) when the pool is smaller, so the
+    // full 3285 MiB application pool is required. Do not shrink it again.
     return base_pool_size;
 }
 

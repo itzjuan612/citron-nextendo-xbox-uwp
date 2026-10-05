@@ -4,6 +4,12 @@
 #include <algorithm>
 #include <atomic>
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+
 #include "common/bit_cast.h"
 #include "common/logging.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -28,6 +34,24 @@ using Shader::Maxwell::GenerateGeometryPassthrough;
 using Shader::Maxwell::MergeDualVertexPrograms;
 using Shader::Maxwell::TranslateProgram;
 using VideoCore::Surface::PixelFormat;
+
+// The Xbox grants a fixed 5120 MB commit budget. Translating a large shader transiently
+// commits hundreds of MB (captured OOM stacks land in the Maxwell->IR passes), which does
+// not fit while the process already sits at ~4.5 GB. Skip compiling when the headroom is
+// gone instead of letting the allocation kill the app; the pipeline is retried later.
+constexpr u64 CommitBudgetBytes = 5120ull * 1024 * 1024;
+constexpr u64 PipelineCompileReserveBytes = 640ull * 1024 * 1024;
+
+[[nodiscard]] bool HasPipelineCompileHeadroom() {
+    PROCESS_MEMORY_COUNTERS_EX pmc{};
+    pmc.cb = sizeof(pmc);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(),
+                              reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+        return true;
+    }
+    const u64 committed = static_cast<u64>(pmc.PrivateUsage);
+    return committed + PipelineCompileReserveBytes < CommitBudgetBytes;
+}
 
 Shader::CompareFunction MaxwellToCompareFunction(Maxwell3D::Regs::ComparisonOp comparison) {
     using Op = Maxwell3D::Regs::ComparisonOp;
@@ -358,6 +382,16 @@ PipelineCache::StoredPipeline* PipelineCache::CurrentPipelineSlowPath() {
 
 std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
     const GraphicsPipelineCacheKey& key) try {
+    if (!HasPipelineCompileHeadroom()) {
+        static std::atomic<u32> skip_count{0};
+        const u32 count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 8 || count % 64 == 0) {
+            LOG_WARNING(Render_D3D12,
+                        "Pipeline compile skipped: commit headroom below {} MB (count {})",
+                        PipelineCompileReserveBytes / (1024 * 1024), count);
+        }
+        return nullptr;
+    }
     VideoCommon::ShaderCache::GraphicsEnvironments environments;
     GetGraphicsEnvironments(environments, key.unique_hashes);
 
