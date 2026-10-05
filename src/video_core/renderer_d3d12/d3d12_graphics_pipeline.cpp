@@ -661,6 +661,38 @@ GraphicsPipeline::GraphicsPipeline(
 
     const HRESULT hr = device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     if (FAILED(hr)) {
+        // Dump the full state for the first few failures: E_INVALIDARG has no debug layer on
+        // Xbox, so the invalid field must be identified from the values themselves.
+        static u32 failure_dump_count = 0;
+        if (failure_dump_count++ < 3) {
+            for (const auto& element : input_elements) {
+                LOG_ERROR(Render_D3D12,
+                          "  input element: sem_idx={} fmt={:#x} slot={} offset={} class={} "
+                          "step={}",
+                          element.SemanticIndex, static_cast<u32>(element.Format),
+                          element.InputSlot, element.AlignedByteOffset,
+                          static_cast<u32>(element.InputSlotClass), element.InstanceDataStepRate);
+            }
+            LOG_ERROR(Render_D3D12,
+                      "  state: depth={} write={} func={} stencil={} sfail={} dpfail={} "
+                      "dppass={} sfunc={} blend0={} logic={} strip={} topotype={} fill={} "
+                      "cull={} forced_samples={} conservative={}",
+                      depth_stencil_desc.DepthEnable,
+                      static_cast<u32>(depth_stencil_desc.DepthWriteMask),
+                      static_cast<u32>(depth_stencil_desc.DepthFunc),
+                      depth_stencil_desc.StencilEnable,
+                      static_cast<u32>(depth_stencil_desc.FrontFace.StencilFailOp),
+                      static_cast<u32>(depth_stencil_desc.FrontFace.StencilDepthFailOp),
+                      static_cast<u32>(depth_stencil_desc.FrontFace.StencilPassOp),
+                      static_cast<u32>(depth_stencil_desc.FrontFace.StencilFunc),
+                      blend_desc.RenderTarget[0].BlendEnable,
+                      blend_desc.RenderTarget[0].LogicOpEnable,
+                      static_cast<u32>(desc.IBStripCutValue),
+                      static_cast<u32>(desc.PrimitiveTopologyType),
+                      static_cast<u32>(rasterizer_desc.FillMode),
+                      static_cast<u32>(rasterizer_desc.CullMode), rasterizer_desc.ForcedSampleCount,
+                      static_cast<u32>(rasterizer_desc.ConservativeRaster));
+        }
         const auto rtv_hex = [&desc](u32 index) {
             return index < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT
                        ? static_cast<u32>(desc.RTVFormats[index])
