@@ -85,6 +85,7 @@ enum class AudioEngine : u32 {
     Sdl2,
     Null,
     Oboe,
+    XAudio2,
 };
 
 template <>
@@ -93,6 +94,7 @@ EnumMetadata<AudioEngine>::Canonicalizations() {
     return {
         {"auto", AudioEngine::Auto},   {"cubeb", AudioEngine::Cubeb}, {"sdl2", AudioEngine::Sdl2},
         {"null", AudioEngine::Null},   {"oboe", AudioEngine::Oboe},
+        {"xaudio2", AudioEngine::XAudio2},
     };
 }
 

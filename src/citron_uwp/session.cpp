@@ -43,7 +43,7 @@ namespace {
 /// Defaults tuned for the Xbox Series X|S D3D12 backend.
 void ApplyUwpRuntimeSettings() {
     Settings::values.renderer_backend.SetValue(Settings::RendererBackend::D3D12);
-    Settings::values.sink_id.SetValue(Settings::AudioEngine::Null);
+    Settings::values.sink_id.SetValue(Settings::AudioEngine::XAudio2);
     Settings::values.audio_output_device_id.SetValue("auto");
     Settings::values.audio_input_device_id.SetValue("null");
     Settings::values.log_filter.SetValue("*:Info Render.D3D12:Debug HW.GPU:Debug");

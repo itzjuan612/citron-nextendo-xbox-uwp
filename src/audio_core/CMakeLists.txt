@@ -291,6 +291,16 @@ if (ANDROID)
     target_compile_definitions(audio_core PRIVATE HAVE_OBOE)
 endif()
 
+if (CITRON_UWP)
+    target_sources(audio_core PRIVATE
+        sink/xaudio2_sink.cpp
+        sink/xaudio2_sink.h
+    )
+
+    # XAudio2_9.dll is loaded dynamically at runtime, so no import library is linked.
+    target_compile_definitions(audio_core PRIVATE HAVE_XAUDIO2=1)
+endif()
+
 if (CITRON_USE_PRECOMPILED_HEADERS)
     target_precompile_headers(audio_core PRIVATE precompiled_headers.h)
 endif()
