@@ -415,7 +415,7 @@ DXGI_FORMAT SurfaceFormat(VideoSurface::PixelFormat format) {
     case VideoSurface::PixelFormat::R8G8_SINT:
         return DXGI_FORMAT_R8G8_SINT;
     case VideoSurface::PixelFormat::B10G11R11_FLOAT:
-        return DXGI_FORMAT_R11G11B10_FLOAT;
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
     case VideoSurface::PixelFormat::A2B10G10R10_UNORM:
         return DXGI_FORMAT_R10G10B10A2_UNORM;
     case VideoSurface::PixelFormat::A2B10G10R10_UINT:

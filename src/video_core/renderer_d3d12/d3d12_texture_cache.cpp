@@ -100,9 +100,10 @@ DXGI_FORMAT ResourceFormat(PixelFormat format) {
     case PixelFormat::A2B10G10R10_UINT:
         return DXGI_FORMAT_R10G10B10A2_TYPELESS;
     case PixelFormat::B10G11R11_FLOAT:
-        // Guest stores BGR order vs DXGI RGB order (R/B channels swap);
-        // TODO: proper swizzle.
-        return DXGI_FORMAT_R11G11B10_FLOAT;
+        // DXGI has no RTV-capable R11G11B10 format, so the resource is allocated as
+        // typeless R10G10B10A2 and viewed as UNORM (legal typeless pair). The guest
+        // bit layout is reinterpreted rather than converted.
+        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
     case PixelFormat::BC7_UNORM:
     case PixelFormat::BC7_SRGB:
         return DXGI_FORMAT_BC7_TYPELESS;
@@ -221,7 +222,7 @@ DXGI_FORMAT SampledFormat(PixelFormat format) {
     case PixelFormat::A2B10G10R10_UINT:
         return DXGI_FORMAT_R10G10B10A2_UINT;
     case PixelFormat::B10G11R11_FLOAT:
-        return DXGI_FORMAT_R11G11B10_FLOAT;
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
     case PixelFormat::BC7_UNORM:
         return DXGI_FORMAT_BC7_UNORM;
     case PixelFormat::BC7_SRGB:
@@ -292,10 +293,6 @@ DXGI_FORMAT RenderTargetFormat(PixelFormat format) {
     case DXGI_FORMAT_BC3_UNORM_SRGB:
     case DXGI_FORMAT_BC7_UNORM:
     case DXGI_FORMAT_BC7_UNORM_SRGB:
-    // D3D12 supports R11G11B10_FLOAT for UAVs but not as a render target; treating it as
-    // unrepresentable makes ConfigureDraw skip those draws instead of failing PSO
-    // creation for every draw (observed flooding 21k failures and 15 MB of log per run).
-    case DXGI_FORMAT_R11G11B10_FLOAT:
         return DXGI_FORMAT_UNKNOWN;
     default:
         return sampled;

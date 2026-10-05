@@ -39,7 +39,7 @@ using Shader::Maxwell::TranslateProgram;
 using VideoCore::Surface::PixelFormat;
 
 /// A pipeline cannot be created when any colour attachment format has no render-target
-/// representation in D3D12 (e.g. R11G11B10_FLOAT). Rejecting the key here avoids paying for
+/// representation in D3D12 (e.g. BC1_UNORM). Rejecting the key here avoids paying for
 /// shader translation and a failing CreateGraphicsPipelineState on every draw.
 [[nodiscard]] bool IsPipelineFormatRepresentable(const GraphicsPipelineCacheKey& key) {
     for (const u32 raw_format : key.state.color_formats) {
