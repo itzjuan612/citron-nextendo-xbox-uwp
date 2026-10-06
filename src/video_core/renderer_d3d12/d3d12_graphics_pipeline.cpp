@@ -19,6 +19,30 @@ namespace {
 using Maxwell3D = Tegra::Engines::Maxwell3D;
 namespace VideoSurface = VideoCore::Surface;
 
+// D3D12 (and the stricter Xbox runtime) rejects color-manipulating factors in the alpha
+// blend slots with E_INVALIDARG. The guest can legally leave color factors in Maxwell's
+// alpha factor fields; map them to the corresponding alpha factor.
+D3D12_BLEND SanitizeAlphaBlendFactor(D3D12_BLEND factor) {
+    switch (factor) {
+    case D3D12_BLEND_SRC_COLOR:
+        return D3D12_BLEND_SRC_ALPHA;
+    case D3D12_BLEND_INV_SRC_COLOR:
+        return D3D12_BLEND_INV_SRC_ALPHA;
+    case D3D12_BLEND_DEST_COLOR:
+        return D3D12_BLEND_DEST_ALPHA;
+    case D3D12_BLEND_INV_DEST_COLOR:
+        return D3D12_BLEND_INV_DEST_ALPHA;
+    case D3D12_BLEND_SRC1_COLOR:
+        return D3D12_BLEND_SRC1_ALPHA;
+    case D3D12_BLEND_INV_SRC1_COLOR:
+        return D3D12_BLEND_INV_SRC1_ALPHA;
+    case D3D12_BLEND_SRC_ALPHA_SAT:
+        return D3D12_BLEND_SRC_ALPHA;
+    default:
+        return factor;
+    }
+}
+
 D3D12_BLEND BlendFactor(Maxwell3D::Regs::Blend::Factor factor) {
     switch (factor) {
     case Maxwell3D::Regs::Blend::Factor::Zero_D3D:
@@ -546,8 +570,8 @@ GraphicsPipeline::GraphicsPipeline(
         target.SrcBlend = BlendFactor(attachment.SourceRGBFactor());
         target.DestBlend = BlendFactor(attachment.DestRGBFactor());
         target.BlendOp = BlendEquation(attachment.EquationRGB());
-        target.SrcBlendAlpha = BlendFactor(attachment.SourceAlphaFactor());
-        target.DestBlendAlpha = BlendFactor(attachment.DestAlphaFactor());
+        target.SrcBlendAlpha = SanitizeAlphaBlendFactor(BlendFactor(attachment.SourceAlphaFactor()));
+        target.DestBlendAlpha = SanitizeAlphaBlendFactor(BlendFactor(attachment.DestAlphaFactor()));
         target.BlendOpAlpha = BlendEquation(attachment.EquationAlpha());
     }
     blend_desc.RenderTarget[0].LogicOpEnable = state.logic_op_enable != 0;

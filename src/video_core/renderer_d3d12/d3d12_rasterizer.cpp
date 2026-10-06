@@ -7,6 +7,7 @@
 
 #include "common/alignment.h"
 #include "video_core/control/channel_state.h"
+#include "video_core/dirty_flags.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
@@ -1292,6 +1293,11 @@ void RasterizerD3D12::LoadDiskResources(u64 title_id, std::stop_token stop_loadi
                                         const VideoCore::DiskResourceLoadCallback& callback) {}
 void RasterizerD3D12::InitializeChannel(Tegra::Control::ChannelState& channel) {
     CreateChannel(channel);
+    // Initialize the Maxwell dirty-flag tables exactly like the Vulkan state tracker does.
+    // The shared buffer cache consumes these flags to update and bind vertex/index buffers;
+    // without this setup the tables stay all zero and every attributed draw is skipped
+    // (degenerate vertex view), leaving the screen black.
+    VideoCommon::Dirty::SetupDirtyFlags(channel.maxwell_3d->dirty.tables);
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     m_buffer_cache.CreateChannel(channel);
     m_texture_cache.CreateChannel(channel);
