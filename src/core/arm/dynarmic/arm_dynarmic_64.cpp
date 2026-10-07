@@ -299,9 +299,11 @@ std::shared_ptr<Dynarmic::A64::Jit> ArmDynarmic64::MakeJit(
 
     // Code cache size
 #if defined(CITRON_UWP)
-    // Phase 6 budget: JIT <= 150 MiB. The JIT commits lazily and flushes when full, so the
-    // cap bounds peak commit inside the fixed 5120 MB Xbox budget (was 512 MiB desktop cap).
-    config.code_cache_size = u32(150_MiB);
+    // Phase 6 budget: JIT <= 96 MiB. The JIT commits lazily and flushes when full, so the cap
+    // bounds peak commit inside the fixed 5120 MB Xbox budget (was 150 MiB; the measured
+    // rwx footprint is ~1.5x the cap because of the W^X aliases, and shader-compile
+    // transients need the headroom).
+    config.code_cache_size = u32(96_MiB);
 #elif defined(ARCHITECTURE_arm64)
     config.code_cache_size = u32(128_MiB);
 #else
