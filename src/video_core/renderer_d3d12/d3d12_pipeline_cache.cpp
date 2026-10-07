@@ -56,12 +56,13 @@ using VideoCore::Surface::PixelFormat;
     return true;
 }
 
-// The Xbox grants a fixed 5120 MB commit budget. Translating a large shader transiently
-// commits hundreds of MB (captured OOM stacks land in the Maxwell->IR passes), which does
-// not fit while the process already sits at ~4.5 GB. Skip compiling when the headroom is
-// gone instead of letting the allocation kill the app; the pipeline is retried later.
+// The Xbox kills the process once commit spikes past ~4.5 GB (observed silent deaths at
+// 4477-4600 MB peak). Translating a large shader transiently commits 60-270 MB on top of a
+// ~4.0 GB late-run baseline (attributed COMMIT JUMP lines: rwx/JIT and mapped flat, private
+// transient). Keep a 1150 MB reserve under the 5120 MB budget so a compile is only started
+// while the transient still fits; the pipeline is retried later.
 constexpr u64 CommitBudgetBytes = 5120ull * 1024 * 1024;
-constexpr u64 PipelineCompileReserveBytes = 640ull * 1024 * 1024;
+constexpr u64 PipelineCompileReserveBytes = 1150ull * 1024 * 1024;
 
 [[nodiscard]] bool HasPipelineCompileHeadroom() {
     PROCESS_MEMORY_COUNTERS_EX pmc{};

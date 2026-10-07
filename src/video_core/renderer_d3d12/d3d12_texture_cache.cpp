@@ -1278,10 +1278,10 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
         return info.Budget;
     }
     // Fallback budget when the DXGI memory query is unavailable (Xbox). The shared texture
-    // cache derives its GC watermarks from this value: 512 MiB makes the cache evict under
-    // pressure (normal GC above 0, aggressive at >= 512 MiB) so host commit stays inside
+    // cache derives its GC watermarks from this value: 384 MiB makes the cache evict under
+    // pressure (normal GC above 0, aggressive at >= 384 MiB) so host commit stays inside
     // the UWP ceiling instead of growing without bound.
-    return 512ull * 1024ull * 1024ull;
+    return 384ull * 1024ull * 1024ull;
 }
 
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {

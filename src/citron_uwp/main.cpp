@@ -313,11 +313,9 @@ public:
                                      reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
                                      sizeof(pmc))) {
                 const u64 commit_mb = static_cast<u64>(pmc.PrivateUsage) / (1024ULL * 1024ULL);
-                if (last_commit_mb != 0 && commit_mb > last_commit_mb + 48) {
-                    LOG_CRITICAL(Frontend,
-                                 "COMMIT JUMP: {} -> {} MB (+{} MB) within one sentinel interval",
-                                 last_commit_mb, commit_mb, commit_mb - last_commit_mb);
-                }
+                const bool commit_jumped =
+                    last_commit_mb != 0 && commit_mb > last_commit_mb + 48;
+                const u64 prev_commit_mb = last_commit_mb;
                 last_commit_mb = commit_mb;
                 // Classify committed regions: RWX private ~= JIT code cache (the top
                 // suspect for the ~1.3 MB/s boot-time climb), other private, mapped.
@@ -385,6 +383,23 @@ public:
                     LOG_INFO(Frontend, "  big priv region #{}: base={:#x} size={} MB prot={:#x}", i,
                              reinterpret_cast<uintptr_t>(big_regions[i].base),
                              big_regions[i].size / (1024ULL * 1024ULL), big_regions[i].protect);
+                }
+                if (commit_jumped) {
+                    // Attribution for the burst: which committed category grew with it.
+                    LOG_CRITICAL(Frontend,
+                                 "COMMIT JUMP: {} -> {} MB (+{} MB) rwx(JIT)={} MB priv={} MB "
+                                 "mapped={} MB lazy_commits={} big0={} MB big1={} MB big2={} MB",
+                                 prev_commit_mb, commit_mb, commit_mb - prev_commit_mb,
+                                 rwx_private / (1024ULL * 1024ULL),
+                                 other_private / (1024ULL * 1024ULL),
+                                 mapped / (1024ULL * 1024ULL),
+                                 Common::GetLazyBackingCommitCount(),
+                                 big_region_count > 0 ? big_regions[0].size / (1024ULL * 1024ULL)
+                                                      : 0,
+                                 big_region_count > 1 ? big_regions[1].size / (1024ULL * 1024ULL)
+                                                      : 0,
+                                 big_region_count > 2 ? big_regions[2].size / (1024ULL * 1024ULL)
+                                                      : 0);
                 }
             }
             // Guest-side attribution for the commit climb: normal memory is the heap region
