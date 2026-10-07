@@ -27,6 +27,7 @@ enum class CmdKind : u32 {
     Draw,
     DrawIndexed,
     Dispatch,
+    StateSignal,
 };
 
 struct CmdRecord {

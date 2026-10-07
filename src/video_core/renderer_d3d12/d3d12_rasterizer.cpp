@@ -1058,6 +1058,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     transition_rt(depth_view ? depth_view->Resource() : nullptr,
                   D3D12_RESOURCE_STATE_DEPTH_WRITE);
     if (num_rtvs > 0 || dsv.ptr != 0) {
+        Diag::Push(Diag::CmdKind::StateSignal, 10, num_rtvs, num_rtvs > 0 ? rtvs[0].ptr : 0,
+                   dsv.ptr);
         m_command_list.Get()->OMSetRenderTargets(num_rtvs, num_rtvs > 0 ? rtvs : nullptr,
                                                  FALSE, dsv.ptr != 0 ? &dsv : nullptr);
     }
@@ -1075,6 +1077,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     m_command_list.SetPrimitiveTopology(topology);
     const u32 vertex_count = m_runtime.MaxVertexSlot();
     if (vertex_count > 0) {
+        Diag::Push(Diag::CmdKind::StateSignal, 11, vertex_count,
+                   reinterpret_cast<u64>(m_runtime.GetVertexBindings().data()));
         m_command_list.Get()->IASetVertexBuffers(
             0, vertex_count, m_runtime.GetVertexBindings().data());
     }
@@ -1083,6 +1087,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         ib_view.BufferLocation = index_binding.address;
         ib_view.SizeInBytes = index_binding.size;
         ib_view.Format = index_binding.format;
+        Diag::Push(Diag::CmdKind::StateSignal, 12, index_binding.address, index_binding.size,
+                   static_cast<u64>(index_binding.format));
         m_command_list.Get()->IASetIndexBuffer(&ib_view);
     }
 
@@ -1579,6 +1585,16 @@ void RasterizerD3D12::TickFrame() {
         }
     }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
+    // Flush before ticking: the cache GC can delete images the caches own, and Xbox's
+    // command-list Close validates resource references. Destroying a resource still
+    // referenced by a recorded-but-unexecuted command makes Close fail with E_INVALIDARG.
+    // Executing and waiting for idle first guarantees nothing pending references them.
+    m_command_list.Execute(m_device);
+    m_device.WaitForIdle();
+    m_command_list.Reset();
+    m_res_heap.Reset();
+    m_sampler_heap.Reset();
+    m_cbv_scratch_used = 0;
     m_buffer_cache.TickFrame();
     m_texture_cache.TickFrame();
 }
