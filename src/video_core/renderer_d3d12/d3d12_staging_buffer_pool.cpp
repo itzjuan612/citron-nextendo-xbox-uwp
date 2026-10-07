@@ -61,13 +61,16 @@ StagingBufferRef StagingBufferPool::Request(u64 size, StagingUsage usage, bool d
         }
     }
     if (!chosen) {
-        // (c) Overwrite: the oldest entry of the same size class, usage and deferred
-        // flag regardless of age or in_use state, instead of allocating unboundedly.
+        // (c) Reuse-in-place: the oldest entry of the same size class, usage and deferred
+        // flag, but only when it is not in use by in-flight work. Returning an in-use
+        // entry hands the same buffer to several uploads recorded into one command list,
+        // so the CPU overwrites data a pending GPU copy still has to read. When every
+        // entry of the class is in flight, fall through and allocate an extra one.
         u64 best_tick = ~u64{0};
         for (u64 i = 0; i < entries.size(); ++i) {
             const Entry& entry = entries[i];
             if (entry.size != size_class || entry.usage != usage ||
-                entry.deferred != deferred) {
+                entry.deferred != deferred || entry.in_use) {
                 continue;
             }
             if (entry.last_used_tick < best_tick) {

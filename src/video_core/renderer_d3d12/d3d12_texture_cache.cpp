@@ -31,10 +31,12 @@ using VideoCommon::Offset3D;
 using VideoCommon::SubresourceLayers;
 using VideoCore::Surface::PixelFormat;
 
-// Device-removal bisection complete — uploads re-enabled (kSkipTextureUploadCopies = false);
-// texture upload/download GPU recording resumes (records into runtime->command_list:
-// Transition/Copy/Clear/Barrier).
-constexpr bool kSkipTextureUploadCopies = false;
+// TEMP DIAGNOSTIC: ring buffer of the most recent texture uploads, dumped when the
+// rasterizer's per-draw flush detects a device removal.
+constexpr u32 TXUP_RING_SIZE = 16;
+std::array<std::string, TXUP_RING_SIZE> g_txup_ring;
+std::atomic<u32> g_txup_ring_index{0};
+std::atomic<bool> g_txup_ring_dumped{false};
 
 u32 CalcSubresource(u32 mip, u32 slice, u32 plane, u32 mips, u32 array_size) {
     return mip + slice * mips + plane * mips * array_size;
@@ -431,6 +433,36 @@ D3D12_COMPARISON_FUNC ComparisonFunc(DepthCompareFunc func) {
 
 } // Anonymous namespace
 
+// TEMP FIX (session 11): D3D12 only allows UAV creation for formats with
+// D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW support. Creating a UAV for a
+// format without support (SRGB variants, R11G11B10_FLOAT, block-compressed formats,
+// ...) is an invalid call that removes the device on Xbox. The resource flag alone is
+// not sufficient: SRGB resources get ALLOW_UNORDERED_ACCESS because their typeless
+// format is UAV-capable, but the typed SRGB view is not.
+bool IsUavCompatibleFormat(ID3D12Device* device, DXGI_FORMAT format) {
+    if (device == nullptr || format == DXGI_FORMAT_UNKNOWN) {
+        return false;
+    }
+    const u32 index = static_cast<u32>(format);
+    static std::array<std::atomic<s32>, 256> cache{};
+    if (index >= cache.size()) {
+        return false;
+    }
+    const s32 cached = cache[index].load(std::memory_order_relaxed);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+    support.Format = format;
+    const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                   sizeof(support));
+    const bool supported =
+        SUCCEEDED(hr) &&
+        (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
+    cache[index].store(supported ? 1 : 0, std::memory_order_relaxed);
+    return supported;
+}
+
 Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info, GPUVAddr gpu_addr,
              VAddr cpu_addr)
     : VideoCommon::ImageBase{info, gpu_addr, cpu_addr}, device{&runtime_.device},
@@ -464,12 +496,19 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::StorageImageView(s32 level) {
         return D3D12_CPU_DESCRIPTOR_HANDLE{0};
     }
     const DXGI_FORMAT format = SampledFormat(info.format);
+    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0 ||
+        !IsUavCompatibleFormat(device->GetDevice(), format)) {
+        // Xbox removes the device when a UAV is created on a resource without
+        // D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS or for a format without UAV support
+        // (SRGB, R11G11B10, compressed formats, ...).
+        return D3D12_CPU_DESCRIPTOR_HANDLE{0};
+    }
     const u32 index = runtime->view_heap.Allocate();
     if (index == DescriptorHeap::INVALID_INDEX) {
         return D3D12_CPU_DESCRIPTOR_HANDLE{0};
     }
     const D3D12_CPU_DESCRIPTOR_HANDLE handle = runtime->view_heap.CpuHandle(index);
-    const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
     uav.Format = format;
     if (desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
@@ -496,16 +535,6 @@ D3D12_CPU_DESCRIPTOR_HANDLE Image::StorageImageView(s32 level) {
 void Image::UploadMemory(ID3D12Resource* buffer, u64 offset,
                          std::span<const BufferImageCopy> copies) {
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
-        return;
-    }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (buffer) GPU copies "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
-        initialized = true;
         return;
     }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
@@ -539,16 +568,6 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
         return;
     }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadMemory (staging) GPU copies "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
-        initialized = true;
-        return;
-    }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
         static bool logged_once = false;
         if (!logged_once) {
@@ -575,15 +594,6 @@ void Image::DownloadMemory(ID3D12Resource* buffer, size_t offset,
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
         return;
     }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (buffer) GPU copies "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
-        return;
-    }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
         static bool logged_once = false;
         if (!logged_once) {
@@ -606,15 +616,6 @@ void Image::DownloadMemory(ID3D12Resource* buffer, size_t offset,
 
 void Image::DownloadMemory(std::span<ID3D12Resource*> buffers, std::span<size_t> offsets,
                            std::span<const BufferImageCopy> copies) {
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (fan-out) GPU copies "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
-        return;
-    }
     const size_t count = std::min({buffers.size(), offsets.size(), copies.size()});
     for (size_t i = 0; i < count; ++i) {
         DownloadMemory(buffers[i], offsets[i], std::span<const BufferImageCopy>{&copies[i], 1});
@@ -628,15 +629,6 @@ void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferIm
         return;
     }
     if (!resource || info.num_samples > 1 || !runtime->command_list.IsValid()) {
-        return;
-    }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadMemory (staging) GPU copies "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
         return;
     }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
@@ -658,18 +650,22 @@ void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferIm
                                       D3D12_RESOURCE_STATE_COMMON);
 }
 
+void DumpRecentTextureUploads() {
+    if (g_txup_ring_dumped.exchange(true, std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 total = g_txup_ring_index.load(std::memory_order_relaxed);
+    const u32 count = std::min<u32>(total, TXUP_RING_SIZE);
+    LOG_CRITICAL(Render_D3D12, "Recent texture uploads (last {} of {}):", count, total);
+    for (u32 i = 0; i < count; ++i) {
+        const u32 idx = (total - count + i) % TXUP_RING_SIZE;
+        LOG_CRITICAL(Render_D3D12, "  {}", g_txup_ring[idx]);
+    }
+}
+
 void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> staging_span,
                               u64 src_offset, const BufferImageCopy& copy) {
     if (!src_buffer) {
-        return;
-    }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::UploadSubresource GPU copy "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
         return;
     }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
@@ -684,6 +680,23 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     const u32 mip = static_cast<u32>(copy.image_subresource.base_level);
+    // A copy whose mip level or layer range exceeds the host resource computes an
+    // out-of-range subresource index; recording it makes CommandList::Close fail with
+    // E_INVALIDARG on Xbox and removes the device. Skip those copies.
+    const u32 base_layer = static_cast<u32>(copy.image_subresource.base_layer);
+    const u32 copy_layers = std::max<u32>(copy.image_subresource.num_layers, 1);
+    const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (mip >= desc.MipLevels || (!is_3d && base_layer + copy_layers > array_size)) {
+        static std::atomic<u32> g_subresource_oor{0};
+        if (g_subresource_oor.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12,
+                      "TXUPLOAD subresource out of range: mip={} mips={} layer={} layers={} "
+                      "copy_layers={} img={}x{}: copy skipped",
+                      mip, desc.MipLevels, base_layer, array_size, copy_layers,
+                      static_cast<u64>(desc.Width), desc.Height);
+        }
+        return;
+    }
     const u32 extent_layers =
         desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : array_size;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -698,9 +711,35 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
     const u32 rows =
         compressed ? (copy.image_extent.height + 3) / 4 : copy.image_extent.height;
     const u64 tight_pitch = static_cast<u64>(width_units) * elem_bytes;
+    // For block-compressed formats D3D12 requires the copy box coordinates (and the
+    // placed-footprint dimensions) to be aligned to the 4x4 block, even for the last
+    // mips that are smaller than one block. A 2x2/1x1 box makes CopyTextureRegion
+    // invalid: CommandList::Close fails with E_INVALIDARG and the device is removed.
+    const u32 box_width = compressed ? Common::AlignUp(copy.image_extent.width, 4u)
+                                     : copy.image_extent.width;
+    const u32 box_height = compressed ? Common::AlignUp(copy.image_extent.height, 4u)
+                                      : copy.image_extent.height;
+    // Xbox rejects sub-4x4 copies (Close fails E_INVALIDARG); skip them.
+    if (copy.image_extent.width < 4 || copy.image_extent.height < 4) {
+        static std::atomic<u32> g_sub4_skip{0};
+        if (g_sub4_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12,
+                      "TXUPLOAD sub-4x4 copy skipped (fmt={} lvl={} copy={}x{} compressed={})",
+                      static_cast<u32>(info.format), copy.image_subresource.base_level,
+                      copy.image_extent.width, copy.image_extent.height, compressed ? 1 : 0);
+        }
+        return;
+    }
+    // `buffer_row_length` is in texels; for block-compressed formats the row is a row of
+    // blocks, so convert to blocks before multiplying by the block byte size. Using texels
+    // directly made the pitch 4x too large, which pushed every row read past the guest
+    // data (repack overrun) / recorded copies whose rows exceeded the source buffer
+    // (device removal on Xbox).
     const u64 src_pitch =
         copy.buffer_row_length != 0
-            ? static_cast<u64>(copy.buffer_row_length) * (compressed ? elem_bytes : elem_bytes)
+            ? static_cast<u64>(compressed ? (copy.buffer_row_length + 3) / 4
+                                          : copy.buffer_row_length) *
+                  elem_bytes
             : tight_pitch;
     const u64 canonical_pitch = footprint.Footprint.RowPitch;
     if (rows == 0 || copy.image_extent.width == 0 || copy.image_extent.depth == 0) {
@@ -746,10 +785,55 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         src.PlacedFootprint.Offset = src_offset;
     }
     src.PlacedFootprint.Footprint = footprint.Footprint;
-    src.PlacedFootprint.Footprint.Width = copy.image_extent.width;
-    src.PlacedFootprint.Footprint.Height = copy.image_extent.height;
+    src.PlacedFootprint.Footprint.Width = box_width;
+    src.PlacedFootprint.Footprint.Height = box_height;
     src.PlacedFootprint.Footprint.Depth = copy.image_extent.depth;
     src.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(copy_src_pitch);
+
+    // TEMP DIAGNOSTIC: remember the copy parameters in a ring so the uploads preceding a
+    // device-removal can be dumped.
+    {
+        const u32 ring_idx =
+            g_txup_ring_index.fetch_add(1, std::memory_order_relaxed) % TXUP_RING_SIZE;
+        g_txup_ring[ring_idx] = fmt::format(
+            "guest_fmt={} res_fmt={:#x} img={}x{} copy={}x{}x{} lvl={} layer={} layers={} "
+            "src_off={:#x} pitch={} canon={} src_buf={:#x} repack={}",
+            static_cast<u32>(info.format), static_cast<u32>(desc.Format),
+            static_cast<u64>(desc.Width), desc.Height, copy.image_extent.width,
+            copy.image_extent.height, copy.image_extent.depth,
+            copy.image_subresource.base_level, copy.image_subresource.base_layer, layers,
+            src_offset, src_pitch, canonical_pitch,
+            static_cast<u64>(src_buffer->GetDesc().Width), repack.buffer ? 1 : 0);
+    }
+
+    // Guard: a placed-footprint copy whose rows extend past the source buffer removes the
+    // device on Xbox. Refuse to record such a copy and log the offender.
+    {
+        const u64 last_layer = layers > 1 ? static_cast<u64>(layer_src_stride) * (layers - 1) : 0;
+        const u64 gpu_end = src_offset + last_layer +
+                            static_cast<u64>(copy_src_pitch) * (rows - 1) + tight_pitch;
+        const u64 gpu_size = static_cast<u64>(src_buffer->GetDesc().Width);
+        const u64 cpu_end = src_offset + last_layer +
+                            static_cast<u64>(src_pitch) * (rows - 1) + tight_pitch;
+        const bool gpu_overrun = gpu_end > gpu_size;
+        const bool cpu_overrun = !staging_span.empty() && cpu_end > staging_span.size();
+        if ((!repack.buffer && gpu_overrun) || (repack.buffer && cpu_overrun)) {
+            static std::atomic<u32> g_txup_overrun{0};
+            if (g_txup_overrun.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12,
+                          "TXUPLOAD OVERRUN guest_fmt={} img={}x{} copy={}x{} lvl={} pitch={} "
+                          "canon={} src_off={:#x} need_end={:#x} buf_size={:#x} repack={}: copy "
+                          "skipped",
+                          static_cast<u32>(info.format), static_cast<u64>(desc.Width), desc.Height,
+                          copy.image_extent.width, copy.image_extent.height,
+                          copy.image_subresource.base_level, copy_src_pitch, canonical_pitch,
+                          src_offset, repack.buffer ? cpu_end : gpu_end,
+                          repack.buffer ? static_cast<u64>(staging_span.size()) : gpu_size,
+                          repack.buffer ? 1 : 0);
+            }
+            return;
+        }
+    }
 
     for (u32 l = 0; l < layers; ++l) {
         const u32 layer = static_cast<u32>(copy.image_subresource.base_layer) + l;
@@ -763,8 +847,8 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         box.left = 0;
         box.top = 0;
         box.front = 0;
-        box.right = copy.image_extent.width;
-        box.bottom = copy.image_extent.height;
+        box.right = box_width;
+        box.bottom = box_height;
         box.back = copy.image_extent.depth;
         D3D12_TEXTURE_COPY_LOCATION layer_src = src;
         if (!repack.buffer) {
@@ -784,15 +868,6 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
     if (!dst_buffer) {
         return;
     }
-    if (kSkipTextureUploadCopies) {
-        static bool logged_once = false;
-        if (!logged_once) {
-            logged_once = true;
-            LOG_DEBUG(Render_D3D12, "Skipping Image::DownloadSubresource GPU copy "
-                                    "(kSkipTextureUploadCopies bisection)");
-        }
-        return;
-    }
     if (::D3D12::ResourceFormat(info.format) == DXGI_FORMAT_UNKNOWN) {
         static bool logged_once = false;
         if (!logged_once) {
@@ -805,6 +880,23 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
     const u32 mip = static_cast<u32>(copy.image_subresource.base_level);
+    // A copy whose mip level or layer range exceeds the host resource computes an
+    // out-of-range subresource index; recording it makes CommandList::Close fail with
+    // E_INVALIDARG on Xbox and removes the device. Skip those copies.
+    const u32 base_layer = static_cast<u32>(copy.image_subresource.base_layer);
+    const u32 copy_layers = std::max<u32>(copy.image_subresource.num_layers, 1);
+    const bool is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    if (mip >= desc.MipLevels || (!is_3d && base_layer + copy_layers > array_size)) {
+        static std::atomic<u32> g_subresource_oor{0};
+        if (g_subresource_oor.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12,
+                      "TXUPLOAD subresource out of range: mip={} mips={} layer={} layers={} "
+                      "copy_layers={} img={}x{}: copy skipped",
+                      mip, desc.MipLevels, base_layer, array_size, copy_layers,
+                      static_cast<u64>(desc.Width), desc.Height);
+        }
+        return;
+    }
     const u32 extent_layers =
         desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D ? 1 : array_size;
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
@@ -820,6 +912,25 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
     const u32 rows =
         compressed ? (copy.image_extent.height + 3) / 4 : copy.image_extent.height;
     const u64 tight_pitch = static_cast<u64>(width_units) * elem_bytes;
+    // For block-compressed formats D3D12 requires the copy box coordinates (and the
+    // placed-footprint dimensions) to be aligned to the 4x4 block, even for the last
+    // mips that are smaller than one block. A 2x2/1x1 box makes CopyTextureRegion
+    // invalid: CommandList::Close fails with E_INVALIDARG and the device is removed.
+    const u32 box_width = compressed ? Common::AlignUp(copy.image_extent.width, 4u)
+                                     : copy.image_extent.width;
+    const u32 box_height = compressed ? Common::AlignUp(copy.image_extent.height, 4u)
+                                      : copy.image_extent.height;
+    // Xbox rejects sub-4x4 copies (Close fails E_INVALIDARG); skip them.
+    if (copy.image_extent.width < 4 || copy.image_extent.height < 4) {
+        static std::atomic<u32> g_sub4_skip{0};
+        if (g_sub4_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12,
+                      "TXUPLOAD sub-4x4 copy skipped (fmt={} lvl={} copy={}x{} compressed={})",
+                      static_cast<u32>(info.format), copy.image_subresource.base_level,
+                      copy.image_extent.width, copy.image_extent.height, compressed ? 1 : 0);
+        }
+        return;
+    }
     const u64 src_pitch =
         copy.buffer_row_length != 0 ? static_cast<u64>(copy.buffer_row_length) * elem_bytes
                                     : tight_pitch;
@@ -857,8 +968,8 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         gpu_dst.PlacedFootprint.Footprint = footprint.Footprint;
         layer_dst_stride = copy.buffer_size / layers;
     }
-    gpu_dst.PlacedFootprint.Footprint.Width = copy.image_extent.width;
-    gpu_dst.PlacedFootprint.Footprint.Height = copy.image_extent.height;
+    gpu_dst.PlacedFootprint.Footprint.Width = box_width;
+    gpu_dst.PlacedFootprint.Footprint.Height = box_height;
     gpu_dst.PlacedFootprint.Footprint.Depth = copy.image_extent.depth;
     gpu_dst.PlacedFootprint.Footprint.RowPitch = static_cast<UINT>(
         src_pitch != canonical_pitch ? canonical_pitch : src_pitch);
@@ -875,8 +986,8 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         box.left = static_cast<UINT>(copy.image_offset.x);
         box.top = static_cast<UINT>(copy.image_offset.y);
         box.front = static_cast<UINT>(copy.image_offset.z);
-        box.right = box.left + copy.image_extent.width;
-        box.bottom = box.top + copy.image_extent.height;
+        box.right = box.left + box_width;
+        box.bottom = box.top + box_height;
         box.back = box.front + (copy.image_extent.depth == 0 ? 1 : copy.image_extent.depth);
         D3D12_TEXTURE_COPY_LOCATION layer_dst = gpu_dst;
         layer_dst.PlacedFootprint.Offset += static_cast<u64>(l) * layer_dst_stride;
@@ -1018,7 +1129,10 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
         }
     }
 
-    if (desc.SampleDesc.Count == 1 && !image.IsDepthStencil()) {
+    if (desc.SampleDesc.Count == 1 && !image.IsDepthStencil() &&
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0 &&
+        IsUavCompatibleFormat(image.device->GetDevice(),
+                              rtv_format != DXGI_FORMAT_UNKNOWN ? rtv_format : sampled_format)) {
         const u32 uav_index = image.runtime->view_heap.Allocate();
         if (uav_index != DescriptorHeap::INVALID_INDEX) {
             storage_view = image.runtime->view_heap.CpuHandle(uav_index);
@@ -1273,10 +1387,25 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
     if (dst_resource == src_resource) {
         return;
     }
-    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
     const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
+    // D3D12's CopyTextureRegion cannot convert between different resource formats; the
+    // cross-family raw copy is an invalid call on Xbox (device removal). The guest
+    // reinterprets the same memory with a different format, which our typeless resources
+    // cannot express directly, so skip the copy until a buffer-roundtrip path exists.
+    if (src_desc.Format != dst_desc.Format) {
+        static std::atomic<u32> g_reinterpret_skip{0};
+        if (g_reinterpret_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12,
+                      "ReinterpretImage fmt mismatch src={:#x} dst={:#x} copies={}: copy "
+                      "skipped",
+                      static_cast<u32>(src_desc.Format), static_cast<u32>(dst_desc.Format),
+                      copies.size());
+        }
+        return;
+    }
+    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     const u32 src_array_size =
         src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
             ? 1

@@ -249,6 +249,24 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
     }
     const bool transition_dst = dst_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
     const bool transition_src = !same_resource && src_heap.Type == D3D12_HEAP_TYPE_DEFAULT;
+    // TEMP DIAGNOSTIC: refuse to record a buffer copy that runs past either resource;
+    // such copies are execution-time device removals on Xbox.
+    const auto diag_range_ok = [&](ID3D12Resource* dst, u64 dst_off, ID3D12Resource* src,
+                                   u64 src_off, u64 size) {
+        const u64 dst_size = dst->GetDesc().Width;
+        const u64 src_size = src->GetDesc().Width;
+        if (dst_off + size > dst_size || src_off + size > src_size) {
+            static std::atomic<u32> g_bufcopy_bad{0};
+            if (g_bufcopy_bad.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12,
+                          "BUFCOPY OVERRUN src_off={:#x}+{} (buf {:#x}) dst_off={:#x} (buf "
+                          "{:#x}): copy skipped",
+                          src_off, size, src_size, dst_off, dst_size);
+            }
+            return false;
+        }
+        return true;
+    };
     if (same_resource) {
         // A self-copy reads and writes the same resource in one operation, so it
         // must be in COPY_SOURCE|COPY_DEST simultaneously.
@@ -259,6 +277,10 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
                                 D3D12_RESOURCE_STATE_COPY_DEST | D3D12_RESOURCE_STATE_COPY_SOURCE);
         for (const VideoCommon::BufferCopy& copy : copies) {
             if (copy.size == 0) {
+                continue;
+            }
+            if (!diag_range_ok(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset,
+                               copy.size)) {
                 continue;
             }
             command_list.CopyBufferRegion(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset,
@@ -279,6 +301,9 @@ void BufferCacheRuntime::CopyBuffer(ID3D12Resource* dst_buffer, ID3D12Resource* 
     }
     for (const VideoCommon::BufferCopy& copy : copies) {
         if (copy.size == 0) {
+            continue;
+        }
+        if (!diag_range_ok(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset, copy.size)) {
             continue;
         }
         command_list.CopyBufferRegion(dst_buffer, copy.dst_offset, src_buffer, copy.src_offset,

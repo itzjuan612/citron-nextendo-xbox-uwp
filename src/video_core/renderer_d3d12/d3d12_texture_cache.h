@@ -182,6 +182,10 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE rt_view{};
 };
 
+/// TEMP DIAGNOSTIC: dumps the last texture uploads (called when a DIAG flush detects a
+/// device removal).
+void DumpRecentTextureUploads();
+
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
 
 /// Guest sampler state translated to a D3D12 sampler description. The draw translation

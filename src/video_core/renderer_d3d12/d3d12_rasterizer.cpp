@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 #include <type_traits>
 
 #include "common/alignment.h"
@@ -10,6 +12,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 
@@ -18,6 +21,18 @@ namespace D3D12 {
 namespace {
 // Draws re-enabled, guards active (no-vertex skip, depth-RTV skip, all-slots-bound guard, RT-format and index/vertex range validation).
 constexpr bool kSkipDraws = false;
+
+// Temporary diagnostic: localize the device removal to a single draw by flushing after the
+// first few draws and checking GetDeviceRemovedReason, dumping full bindings for each.
+std::atomic<u32> g_diag_draws{0};
+
+// TEMP DIAGNOSTIC (session 11): split ConfigureDraw's state recording from the rest of the
+// frame. When true, ConfigureDraw returns right after the upload/binding stage walk, before
+// any state command (root signature, PSO, descriptor heaps/tables, RT transitions, OMSet,
+// input assembly, viewport/scissor, CounterEnable) and before the draw itself is recorded.
+// Uploads/buffer binding above the return point still run, so if the device still dies the
+// trigger is outside ConfigureDraw's state commands; if it survives, they are implicated.
+constexpr bool kSkipConfigureDrawState = false;
 } // namespace
 
 using Tegra::Texture::TexturePair;
@@ -236,6 +251,28 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     GraphicsPipeline* pipeline = stored.pipeline.get();
     const auto& regs = maxwell3d->regs;
 
+    // TEMP DIAGNOSTIC: submit everything recorded before this draw and check the device,
+    // to split "interleaved work" from "this draw's own commands".
+    {
+        static std::atomic<u32> g_diag_preflush{0};
+        const u32 pre_index = g_diag_preflush.fetch_add(1, std::memory_order_relaxed);
+        if (pre_index < 4) {
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const HRESULT pre_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG pre-flush {}: device reason {:#x}", pre_index,
+                      static_cast<u32>(pre_reason));
+            if (FAILED(pre_reason)) {
+                Diag::Dump();
+            }
+        }
+    }
+
     m_runtime.ClearDrawBindings();
 
     // Validate BEFORE recording any uploads: draws the backend cannot represent must
@@ -244,6 +281,28 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // removing the device even for draws every later guard would skip).
     m_texture_cache.UpdateRenderTargets(false);
     Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
+
+    // TEMP DIAGNOSTIC: flush right after the RT-cache update so its recorded work can be
+    // separated from the draw-state commands that follow.
+    {
+        static std::atomic<u32> g_diag_midflush{0};
+        const u32 mid_index = g_diag_midflush.fetch_add(1, std::memory_order_relaxed);
+        if (mid_index < 6) {
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const HRESULT mid_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG mid-flush {}: device reason {:#x}", mid_index,
+                      static_cast<u32>(mid_reason));
+            if (FAILED(mid_reason)) {
+                Diag::Dump();
+            }
+        }
+    }
 
     const auto& draw_state = maxwell3d->draw_manager->GetDrawState();
     const DrawParams params = MakeDrawParams(draw_state, instance_count, is_indexed);
@@ -542,6 +601,27 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         m_texture_cache.FillGraphicsImageViews<false>(
             std::span(views.data(), views.size()));
+        // TEMP DIAGNOSTIC: flush right after the texture views/upload step.
+        {
+            static std::atomic<u32> g_diag_tex_flush{0};
+            if (num_rtvs == 6 &&
+                g_diag_tex_flush.fetch_add(1, std::memory_order_relaxed) < 4) {
+                m_command_list.Execute(m_device);
+                m_device.WaitForIdle();
+                m_command_list.Reset();
+                m_res_heap.Reset();
+                m_sampler_heap.Reset();
+                m_cbv_scratch_used = 0;
+                Diag::Push(Diag::CmdKind::Marker, 200);
+                const HRESULT tex_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+                LOG_ERROR(Render_D3D12, "DIAG tex-flush: device reason {:#x}",
+                          static_cast<u32>(tex_reason));
+                if (FAILED(tex_reason)) {
+                    DumpRecentTextureUploads();
+                    Diag::Dump();
+                }
+            }
+        }
         size_t tbo_index = 0;
         VideoCommon::ImageViewInOut* texture_buffer_it = views.data();
         const auto add_buffer = [&](const auto& desc, bool is_image) {
@@ -659,10 +739,82 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         ++traced_draws;
     }
 
+    const bool diag_fault_pipe = num_rtvs == 6 && cbv_records.size() == 3;
+
+    // TEMP DIAGNOSTIC: flush after the stage/descriptor walk (texture and buffer uploads)
+    // and before any pipeline/root-signature/descriptor-table state is recorded.
+    {
+        static std::atomic<u32> g_diag_stage_flush{0};
+        if (diag_fault_pipe && g_diag_stage_flush.fetch_add(1, std::memory_order_relaxed) < 2) {
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            const HRESULT stage_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG stage-flush: device reason {:#x}",
+                      static_cast<u32>(stage_reason));
+            if (FAILED(stage_reason)) {
+                DumpRecentTextureUploads();
+            }
+        }
+    }
+
+    // TEMP DIAGNOSTIC (session 11): skip every state command from here on. The device
+    // removal at ~211 s survives with no draw/upload/copy/blit command, so record nothing
+    // from the state block (root sig, PSO, heaps, descriptor tables, RT barriers, OMSet,
+    // IA, viewport/scissor, counter) and see whether the device survives. The removal
+    // check is DELAYED (~50 ms after WaitForIdle) because the removal status latches late
+    // on Xbox; an immediate 0x0 check is not trustworthy. Active for all draws so a fault
+    // at ~211 s can still be attributed even if it happens after the first draw batch.
+    if (kSkipConfigureDrawState) {
+        static std::atomic<u32> g_diag_stateskip{0};
+        const u32 skip_index = g_diag_stateskip.fetch_add(1, std::memory_order_relaxed);
+        if (skip_index < 4) {
+            LOG_ERROR(Render_D3D12,
+                      "DIAG stateskip {}: indexed={} verts={} inst={} num_rtvs={} cbv={} res={} "
+                      "zpass={}",
+                      skip_index, params.is_indexed ? 1 : 0, params.num_vertices,
+                      params.num_instances, num_rtvs, cbv_records.size(), res_slots.size(),
+                      regs.zpass_pixel_count_enable);
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            Diag::Push(Diag::CmdKind::Marker, 100 + skip_index);
+            const HRESULT stateskip_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG stateskip {}: delayed device reason {:#x}", skip_index,
+                      static_cast<u32>(stateskip_reason));
+            if (FAILED(stateskip_reason)) {
+                Diag::Dump();
+            }
+        }
+        return;
+    }
+
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
     m_command_list.SetPipelineState(pipeline->Get());
     ID3D12DescriptorHeap* heaps[] = {m_res_heap.Get(), m_sampler_heap.Get()};
     m_command_list.Get()->SetDescriptorHeaps(2, heaps);
+    // TEMP DIAGNOSTIC: flush after root signature/PSO/heaps only.
+    {
+        static std::atomic<u32> g_diag_pso_flush{0};
+        if (diag_fault_pipe && g_diag_pso_flush.fetch_add(1, std::memory_order_relaxed) < 2) {
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            const HRESULT pso_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG pso-flush: device reason {:#x}",
+                      static_cast<u32>(pso_reason));
+        }
+    }
 
     const RootSignature& root_sig = pipeline->GetRootSignature();
     const auto& bindings = m_runtime.GetResourceBindings();
@@ -822,6 +974,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             default_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             default_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
             default_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            // ComparisonFunc and MaxAnisotropy are validated enums on Xbox; D3D12's
+            // zero-initialized values (0) are invalid and make the whole sampler
+            // descriptor invalid, which faults the GPU when a shader uses it.
+            default_sampler.MaxAnisotropy = 1;
+            default_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            default_sampler.MinLOD = 0.0f;
             default_sampler.MaxLOD = D3D12_FLOAT32_MAX;
             d3d->CreateSampler(&default_sampler, m_sampler_heap.CpuHandle(sampler_base + k));
         }
@@ -849,6 +1007,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (root_sig.GetRuntimeDataIndex() != RootSignature::INVALID_PARAMETER) {
         m_command_list.SetGraphicsRootConstantBufferView(root_sig.GetRuntimeDataIndex(),
                                                          m_zero_address);
+    }
+
+    // TEMP DIAGNOSTIC: flush after the PSO/root-signature/descriptor-table commands, before
+    // the render-target/input-assembly state, to split the remaining state commands.
+    {
+        static std::atomic<u32> g_diag_tables_flush{0};
+        if (num_rtvs == 6 && cbv_records.size() == 3 &&
+            g_diag_tables_flush.fetch_add(1, std::memory_order_relaxed) < 2) {
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+            m_res_heap.Reset();
+            m_sampler_heap.Reset();
+            m_cbv_scratch_used = 0;
+            const HRESULT tables_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+            LOG_ERROR(Render_D3D12, "DIAG tables-flush: device reason {:#x}",
+                      static_cast<u32>(tables_reason));
+        }
     }
 
     // Render targets from the texture cache's current framebuffer. Transitions are
@@ -926,6 +1102,149 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // Restore render targets to the home state for later copies/blits.
     for (u32 i = 0; i < rt_resource_count; ++i) {
         m_command_list.Transition(rt_resources[i], rt_states[i], D3D12_RESOURCE_STATE_COMMON);
+    }
+
+    // Temporary diagnostic: dump the bindings of the first executing draws and flush after
+    // each so the async device removal can be attributed to a single draw.
+    const u32 diag_index = g_diag_draws.fetch_add(1, std::memory_order_relaxed);
+    if (diag_index < 4) {
+        LOG_ERROR(Render_D3D12,
+                  "DIAG draw {}: indexed={} verts={} inst={} first_idx={} base_vertex={} "
+                  "num_rtvs={} max_vb_slot={} zpass={}",
+                  diag_index, params.is_indexed, params.num_vertices, params.num_instances,
+                  params.first_index, params.base_vertex, num_rtvs, m_runtime.MaxVertexSlot(),
+                  regs.zpass_pixel_count_enable);
+        for (u32 i = 0; i < num_rtvs; ++i) {
+            ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+            const u64 gpu_addr = view ? static_cast<u64>(view->GpuAddr()) : 0;
+            const u32 res_fmt =
+                (view && view->Resource())
+                    ? static_cast<u32>(view->Resource()->GetDesc().Format)
+                    : 0;
+            const u32 pso_fmt = static_cast<u32>(SurfaceFormat(
+                VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+                    static_cast<Tegra::RenderTargetFormat>(
+                        stored.pipeline->State().color_formats[i]))));
+            LOG_ERROR(Render_D3D12,
+                      "DIAG draw {} rt{}: pso_fmt={:#x} view_res_fmt={:#x} gpu_addr={:#x}",
+                      diag_index, i, pso_fmt, res_fmt, gpu_addr);
+            if (view && view->Resource()) {
+                const auto diag_desc = view->Resource()->GetDesc();
+                LOG_ERROR(Render_D3D12,
+                          "DIAG draw {} rt{} desc: dim={} {}x{} mips={} fmt={:#x} flags={:#x} "
+                          "samples={}",
+                          diag_index, i, static_cast<u32>(diag_desc.Dimension), diag_desc.Width,
+                          diag_desc.Height, diag_desc.MipLevels,
+                          static_cast<u32>(diag_desc.Format), static_cast<u32>(diag_desc.Flags),
+                          diag_desc.SampleDesc.Count);
+            }
+        }
+        if (depth_view) {
+            LOG_ERROR(Render_D3D12, "DIAG draw {} depth: gpu_addr={:#x} res_fmt={:#x}",
+                      diag_index, static_cast<u64>(depth_view->GpuAddr()),
+                      depth_view->Resource()
+                          ? static_cast<u32>(depth_view->Resource()->GetDesc().Format)
+                          : 0);
+        }
+        const auto& diag_vbs = m_runtime.GetVertexBindings();
+        for (u32 s = 0; s < m_runtime.MaxVertexSlot(); ++s) {
+            LOG_ERROR(Render_D3D12, "DIAG draw {} vb{}: loc={:#x} size={} stride={}", diag_index,
+                      s, static_cast<u64>(diag_vbs[s].BufferLocation),
+                      diag_vbs[s].SizeInBytes, diag_vbs[s].StrideInBytes);
+        }
+        if (params.is_indexed) {
+            const auto& ib = m_runtime.GetIndexBinding();
+            LOG_ERROR(Render_D3D12, "DIAG draw {} ib: loc={:#x} size={} fmt={} valid={}",
+                      diag_index, static_cast<u64>(ib.address), ib.size,
+                      static_cast<u32>(ib.format), ib.valid);
+        }
+        // Descriptor bindings with an alias check against this draw's RTV/depth addresses.
+        u64 diag_rt_addrs[8]{};
+        for (u32 i = 0; i < num_rtvs && i < 8; ++i) {
+            ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+            diag_rt_addrs[i] = view ? static_cast<u64>(view->GpuAddr()) : 0;
+        }
+        const u64 diag_depth_addr = depth_view ? static_cast<u64>(depth_view->GpuAddr()) : 0;
+        const auto diag_aliases_rt = [&](u64 addr) {
+            if (addr == 0) {
+                return false;
+            }
+            for (u32 i = 0; i < num_rtvs && i < 8; ++i) {
+                if (diag_rt_addrs[i] != 0 && addr == diag_rt_addrs[i]) {
+                    return true;
+                }
+            }
+            return diag_depth_addr != 0 && addr == diag_depth_addr;
+        };
+        const D3D12_VIEWPORT diag_vp = MakeViewport(regs);
+        const D3D12_RECT diag_sc = MakeScissor(regs);
+        LOG_ERROR(Render_D3D12,
+                  "DIAG draw {} viewport: x={} y={} w={} h={} minz={} maxz={} scissor: "
+                  "l={} t={} r={} b={} clip={}x{}",
+                  diag_index, diag_vp.TopLeftX, diag_vp.TopLeftY, diag_vp.Width,
+                  diag_vp.Height, diag_vp.MinDepth, diag_vp.MaxDepth, diag_sc.left, diag_sc.top,
+                  diag_sc.right, diag_sc.bottom, regs.surface_clip.width,
+                  regs.surface_clip.height);
+        const auto& diag_bindings = m_runtime.GetResourceBindings();
+        const RootSignature& diag_rs = stored.pipeline->GetRootSignature();
+        LOG_ERROR(Render_D3D12,
+                  "DIAG draw {} tables: cbv={} res={} heap_base={} sampler_base={} cbv_tbl={} "
+                  "srv_tbl={} uav_tbl={} smp_tbl={}",
+                  diag_index, cbv_records.size(), res_slots.size(), heap_base, sampler_base,
+                  diag_rs.GetCbvTableIndex(), diag_rs.GetSrvTableIndex(),
+                  diag_rs.GetUavTableIndex(), diag_rs.GetSamplerTableIndex());
+        for (u32 i = 0; i < cbv_records.size(); ++i) {
+            const auto& rec = diag_bindings[cbv_records[i]];
+            LOG_ERROR(Render_D3D12,
+                      "DIAG draw {} cbv{}: addr={:#x} size={} view={:#x} alias_rt={}", diag_index,
+                      i, static_cast<u64>(rec.address), rec.size,
+                      static_cast<u64>(rec.view.ptr), diag_aliases_rt(rec.address));
+        }
+        for (u32 i = 0; i < res_slots.size(); ++i) {
+            const DrawSlot& slot = res_slots[i];
+            switch (slot.kind) {
+            case SlotKind::Storage:
+            case SlotKind::TexelBuffer:
+            case SlotKind::ImageBuffer: {
+                if (slot.record < diag_bindings.size()) {
+                    const auto& rec = diag_bindings[slot.record];
+                    LOG_ERROR(Render_D3D12,
+                              "DIAG draw {} res{} kind={} addr={:#x} size={} view={:#x} "
+                              "alias_rt={}",
+                              diag_index, i, static_cast<u32>(slot.kind),
+                              static_cast<u64>(rec.address), rec.size,
+                              static_cast<u64>(rec.view.ptr), diag_aliases_rt(rec.address));
+                } else {
+                    LOG_ERROR(Render_D3D12, "DIAG draw {} res{} kind={} unbound", diag_index, i,
+                              static_cast<u32>(slot.kind));
+                }
+                break;
+            }
+            case SlotKind::Sampled: {
+                const ImageView& img_view = m_texture_cache.GetImageView(slot.view);
+                LOG_ERROR(Render_D3D12,
+                          "DIAG draw {} res{} kind=Sampled addr={:#x} alias_rt={} default_sampler={}",
+                          diag_index, i, static_cast<u64>(img_view.GpuAddr()),
+                          diag_aliases_rt(static_cast<u64>(img_view.GpuAddr())),
+                          slot.sampler == VideoCommon::NULL_SAMPLER_ID);
+                break;
+            }
+            case SlotKind::Image: {
+                LOG_ERROR(Render_D3D12, "DIAG draw {} res{} kind=Image placeholder", diag_index,
+                          i);
+                break;
+            }
+            }
+        }
+        m_command_list.Execute(m_device);
+        m_device.WaitForIdle();
+        m_command_list.Reset();
+        m_res_heap.Reset();
+        m_sampler_heap.Reset();
+        m_cbv_scratch_used = 0;
+        const HRESULT diag_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+        LOG_ERROR(Render_D3D12, "DIAG draw {}: post-flush device reason {:#x}", diag_index,
+                  static_cast<u32>(diag_reason));
     }
 }
 
