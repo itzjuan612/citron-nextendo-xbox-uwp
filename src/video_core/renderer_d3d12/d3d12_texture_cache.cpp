@@ -1277,7 +1277,11 @@ u64 TextureCacheRuntime::GetDeviceLocalMemory() const {
     if (QueryLocalVideoMemoryInfo(device.GetDevice(), &info)) {
         return info.Budget;
     }
-    return 0;
+    // Fallback budget when the DXGI memory query is unavailable (Xbox). The shared texture
+    // cache derives its GC watermarks from this value: 1 GiB makes the cache evict under
+    // pressure (normal GC above 0, aggressive at >= 1 GiB) so host commit stays inside the
+    // UWP ceiling instead of growing without bound.
+    return 1024ull * 1024ull * 1024ull;
 }
 
 u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
@@ -1289,7 +1293,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryUsage() const {
 }
 
 bool TextureCacheRuntime::CanReportMemoryUsage() const {
-    return true;
+    // Xbox does not implement IDXGIAdapter3::QueryVideoMemoryInfo (it always fails), so the
+    // shared texture-cache GC cannot use the DXGI budget. Report false so the GC falls back
+    // to its own accounted usage (total_used_memory) for memory pressure.
+    return false;
 }
 
 bool TextureCacheRuntime::IsDepthStencilFormat(VideoCore::Surface::PixelFormat format) {

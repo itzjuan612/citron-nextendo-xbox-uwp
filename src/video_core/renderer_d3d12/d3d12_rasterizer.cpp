@@ -1553,6 +1553,17 @@ void RasterizerD3D12::FlushCommands() {
     m_res_heap.Reset();
     m_sampler_heap.Reset();
     m_cbv_scratch_used = 0;
+    // The frontend only ticks the caches on present (RendererD3D12::Composite), so a guest
+    // that stops presenting (loading screens, long non-rendering phases) would starve the
+    // texture-cache GC while uploads keep growing it. Tick here too, throttled so normal
+    // play does not advance the LRU model faster than the present path.
+    static u64 last_cache_tick = 0;
+    const u64 now = GetTickCount64();
+    if (now - last_cache_tick >= 100) {
+        last_cache_tick = now;
+        m_buffer_cache.TickFrame();
+        m_texture_cache.TickFrame();
+    }
 }
 void RasterizerD3D12::TickFrame() {
     // Detect a GPU hang/TDR before it can silently kill the process: D3D12 exposes the
