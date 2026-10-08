@@ -285,6 +285,13 @@ DXGI_FORMAT VertexFormat(Maxwell3D::Regs::VertexAttribute::Type type,
         }
         return pick(DXGI_FORMAT_R8_SINT, DXGI_FORMAT_R8G8_SINT, DXGI_FORMAT_R8G8B8A8_SINT);
     case Type::Float:
+        // 16-bit components are half floats: a Float attribute with R16* sizes must map to
+        // the FLOAT16 formats, not to the 32-bit ones (this misread half-float vertex data
+        // as full floats, producing garbage positions and no rasterized pixels at all).
+        if (is_16) {
+            return pick(DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16G16_FLOAT,
+                        DXGI_FORMAT_R16G16B16A16_FLOAT);
+        }
         return pick(DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT,
                     DXGI_FORMAT_R32G32B32A32_FLOAT);
     case Type::UnusedEnumDoNotUseBecauseItWillGoAway:

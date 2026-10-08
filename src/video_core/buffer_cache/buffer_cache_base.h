@@ -383,6 +383,9 @@ public:
 
     void BindHostIndexBuffer();
 
+    /// TEMP DIAGNOSTIC (session 12): guest device address of the bound vertex buffer slot.
+    [[nodiscard]] DAddr GetVertexBufferDeviceAddress(u32 index) const;
+
     void BindHostVertexBuffers();
 
     void BindHostDrawIndirectBuffers();

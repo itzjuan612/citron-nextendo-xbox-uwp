@@ -752,6 +752,14 @@ void BufferCache<P>::BindHostIndexBuffer() {
 }
 
 template <class P>
+DAddr BufferCache<P>::GetVertexBufferDeviceAddress(u32 index) const {
+    if (index >= NUM_VERTEX_BUFFERS) {
+        return 0;
+    }
+    return channel_state->vertex_buffers[index].device_addr;
+}
+
+template <class P>
 void BufferCache<P>::BindHostVertexBuffers() {
     HostBindings<typename P::Buffer> host_bindings;
     bool any_valid{false};

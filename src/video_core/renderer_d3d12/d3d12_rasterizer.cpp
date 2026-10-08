@@ -1339,6 +1339,78 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             LOG_WARNING(Render_D3D12, "Draw slots: total={} sampled={} flinger={}",
                         res_slots.size(), sampled_slots, flinger_draw ? 1 : 0);
         }
+        if (flinger_draw) {
+            // Diagnostic (session 12): attribute descriptors + raw vertex bytes of the
+            // composition quad, so a wrong slot/offset/format is visible from the data.
+            static u32 vb_dump_logs = 0;
+            if (vb_dump_logs < 3) {
+                ++vb_dump_logs;
+                const auto& pipe_state = stored.pipeline->State();
+                std::string attrs;
+                std::array<bool, 32> slot_seen{};
+                std::array<u32, 4> dump_slots{};
+                u32 dump_count = 0;
+                for (u32 i = 0; i < pipe_state.attributes.size(); ++i) {
+                    if (pipe_state.attributes[i].enabled == 0) {
+                        continue;
+                    }
+                    const u32 slot = pipe_state.attributes[i].buffer.Value();
+                    attrs += fmt::format("[a{}:s{}]", i, slot);
+                    if (slot < slot_seen.size() && !slot_seen[slot] &&
+                        dump_count < dump_slots.size()) {
+                        slot_seen[slot] = true;
+                        dump_slots[dump_count++] = slot;
+                    }
+                }
+                LOG_WARNING(Render_D3D12, "FLINGER attrs: {}", attrs);
+                const auto half_to_float = [](u16 h) -> f32 {
+                    const u32 sign = (h >> 15) & 1U;
+                    const u32 exp = (h >> 10) & 0x1FU;
+                    const u32 man = h & 0x3FFU;
+                    u32 bits = 0;
+                    if (exp == 0) {
+                        bits = sign << 31;
+                    } else if (exp == 0x1F) {
+                        bits = (sign << 31) | 0x7F800000U | (man << 13);
+                    } else {
+                        bits = (sign << 31) | ((exp - 15 + 127) << 23) | (man << 13);
+                    }
+                    f32 out = 0.0f;
+                    std::memcpy(&out, &bits, sizeof(out));
+                    return out;
+                };
+                for (u32 d = 0; d < dump_count; ++d) {
+                    const u32 slot = dump_slots[d];
+                    const auto& vb = m_runtime.GetVertexBindings()[slot];
+                    const DAddr vb_addr = m_buffer_cache.GetVertexBufferDeviceAddress(slot);
+                    std::array<u8, 32> vb_bytes{};
+                    const u32 read_size = std::min<u32>(static_cast<u32>(vb_bytes.size()),
+                                                        vb.SizeInBytes);
+                    std::string hex;
+                    std::string halfs;
+                    if (vb_addr != 0 && read_size >= 8) {
+                        const auto read = m_device_memory.ReadBlockUnsafe(
+                            vb_addr, vb_bytes.data(), read_size, "FLINGER.VBDump", false);
+                        if (read.fully_mapped) {
+                            for (u32 i = 0; i < read_size; ++i) {
+                                hex += fmt::format("{:02x}", vb_bytes[i]);
+                            }
+                            for (u32 i = 0; i + 1 < read_size; i += 2) {
+                                u16 h = 0;
+                                std::memcpy(&h, vb_bytes.data() + i, sizeof(h));
+                                halfs += fmt::format("{} ", half_to_float(h));
+                            }
+                        } else {
+                            halfs = "unmapped";
+                        }
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "FLINGER vb s{}: dev={:#x} size={} stride={} hex={} halves=[{}]",
+                                slot, static_cast<u64>(vb_addr), vb.SizeInBytes, vb.StrideInBytes,
+                                hex, halfs);
+                }
+            }
+        }
     }
 
     // Restore render targets to the home state for later copies/blits.
