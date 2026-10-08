@@ -36,7 +36,7 @@ struct ResourceProbe {
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     Microsoft::WRL::ComPtr<ID3D12Resource> calibration;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> calibration_rtv_heap;
-    std::array<bool, 4> armed{};
+    std::array<bool, 6> armed{};
     u32 logged = 0;
     u32 frames = 0;
 };
@@ -87,7 +87,7 @@ bool RecordResourceProbe(ID3D12Device* d3d, CommandList& command_list, u32 slot,
     constexpr u32 kMaxExtent = 16;
     constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     constexpr u64 kSlotBytes = kRowPitch * kMaxExtent;
-    constexpr u32 kSlots = 4;
+    constexpr u32 kSlots = 6;
     const u32 width = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Width));
     const u32 height = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Height));
     if (width == 0 || height == 0) {
@@ -187,8 +187,9 @@ void LogResourceProbes() {
     }
     constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     constexpr u64 kSlotBytes = kRowPitch * 16;
-    constexpr u64 kAllBytes = kSlotBytes * 4;
-    static constexpr const char* kSlotNames[] = {"display", "scene", "any_sample", "calib"};
+    constexpr u64 kAllBytes = kSlotBytes * 6;
+    static constexpr const char* kSlotNames[] = {"display", "scene", "any_sample", "calib",
+                                                 "blit_src", "blit_dst"};
     void* mapped = nullptr;
     const D3D12_RANGE read_range{0, kAllBytes};
     if (FAILED(g_resource_probe.readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
@@ -641,13 +642,19 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
         RecordResourceProbe(device.GetDevice(), command_list, 0, info.view->Resource());
         RecordResourceProbe(device.GetDevice(), command_list, 1, g_probe_scene.Get());
         RecordResourceProbe(device.GetDevice(), command_list, 2, g_probe_any_sampled.Get());
+        // TEMP DIAGNOSTIC (session 13): F2D blit source/destination content, to see whether
+        // the repeated 640x360 blit fills the texture the missing splash layer samples.
+        RecordResourceProbe(device.GetDevice(), command_list, 4, g_probe_blit_src.Get());
+        RecordResourceProbe(device.GetDevice(), command_list, 5, g_probe_blit_dst.Get());
         RecordCalibrationProbe(device.GetDevice(), command_list);
     }
 
     static u32 capture_present_counter = 0;
     const u32 capture_this = capture_present_counter++;
-    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 8 &&
-                               capture_this >= 300 && (capture_this % 300) == 0;
+    // TEMP DIAGNOSTIC (session 13): spread captures over long runs, so boot progress can be
+    // watched over time (newest kept by PruneCaptures).
+    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 32 &&
+                               capture_this >= 600 && (capture_this % 900) == 0;
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
     }

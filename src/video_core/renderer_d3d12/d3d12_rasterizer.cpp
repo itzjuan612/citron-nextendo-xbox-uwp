@@ -435,7 +435,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
             ++dbg_fd;
         }
-        if (rt_logs < 400 || rt_logs % 1000 == 0 || renders_to_display) {
+        // TEMP DIAGNOSTIC (session 13): stop logging every composition draw; the per-draw
+        // log volume on the console is large enough to slow the emulator down.
+        if (rt_logs < 400 || rt_logs % 1000 == 0) {
             const D3D12_VIEWPORT rt_vp = MakeViewport(maxwell3d->regs);
             const D3D12_RECT rt_sc = MakeScissor(maxwell3d->regs);
             LOG_WARNING(Render_D3D12,
@@ -500,11 +502,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 
     {
         static u32 dbg_a = 0;
+        static u32 fd_dbg_a = 0;
         const auto& dbg_ib = m_runtime.GetIndexBinding();
-        if (dbg_a < 4 || flinger_draw) {
-            if (dbg_a < 4) {
-                ++dbg_a;
-            }
+        const bool log_dbg_a = dbg_a < 4 || (flinger_draw && (fd_dbg_a % 256) == 0);
+        ++dbg_a;
+        if (flinger_draw) {
+            ++fd_dbg_a;
+        }
+        if (log_dbg_a) {
             LOG_WARNING(Render_D3D12,
                         "DBG-A: fd={} indexed={} ib_valid={} ib_supported={} ib_size={} fmt={:#x}",
                         flinger_draw ? 1 : 0, params.is_indexed ? 1 : 0, dbg_ib.valid,
@@ -1381,10 +1386,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 regs.zpass_pixel_count_enable != 0);
     {
         static u32 executing_logs = 0;
-        if (executing_logs < 4 || flinger_draw) {
-            if (executing_logs < 4) {
-                ++executing_logs;
-            }
+        static u32 fd_executing_logs = 0;
+        const bool log_executing =
+            executing_logs < 4 || (flinger_draw && (fd_executing_logs % 256) == 0);
+        ++executing_logs;
+        if (flinger_draw) {
+            ++fd_executing_logs;
+        }
+        if (log_executing) {
             LOG_WARNING(Render_D3D12,
                         "DBG-B: fd={} indexed={} verts={} first_idx={} base_vtx={} ib_valid={}",
                         flinger_draw ? 1 : 0, params.is_indexed ? 1 : 0, params.num_vertices,
@@ -1421,6 +1430,60 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             ++slot_logs;
             LOG_WARNING(Render_D3D12, "Draw slots: total={} sampled={} flinger={}",
                         res_slots.size(), sampled_slots, flinger_draw ? 1 : 0);
+        }
+        // TEMP DIAGNOSTIC (session 13): which textures each composition layer samples, so a
+        // missing/wrong layer (only one composition layer shows) is attributable.
+        // TEMP DIAGNOSTIC (session 13): does any draw sample the F2D-blitted animation
+        // texture (src 0x516170000 / dst 0x51b700000)? A missing sample means the splash
+        // layer is never composited.
+        {
+            static u32 anim_logs = 0;
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind != SlotKind::Sampled) {
+                    continue;
+                }
+                ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                const u64 gpu = static_cast<u64>(sv.GpuAddr());
+                if ((gpu == 0x516170000ULL || gpu == 0x51b700000ULL) && anim_logs < 16) {
+                    ++anim_logs;
+                    const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
+                                           ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                                           : 0;
+                    LOG_WARNING(Render_D3D12,
+                                "ANIM sample: rt={:#x} fd={} img={} gpu={:#x} {}x{} fmt={:#x} "
+                                "blend={}",
+                                rt_gpu, flinger_draw ? 1 : 0, sv.image_id.index, gpu,
+                                sv.size.width, sv.size.height, static_cast<u32>(sv.format),
+                                stored.pipeline->State().attachments[0].enable ? 1 : 0);
+                }
+            }
+        }
+        if (flinger_draw) {
+            static u32 flinger_tex_logs = 0;
+            const u32 flinger_tex_count = flinger_tex_logs++;
+            if (flinger_tex_count < 10 ||
+                (flinger_tex_count % 64 == 0 && flinger_tex_count < 400)) {
+                std::string texs;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled) {
+                        continue;
+                    }
+                    ImageView& sampled_view = m_texture_cache.GetImageView(slot.view);
+                    texs += fmt::format("[img={} gpu={:#x} {}x{} fmt={:#x} res={} samp={}]",
+                                        sampled_view.image_id.index,
+                                        static_cast<u64>(sampled_view.GpuAddr()),
+                                        sampled_view.size.width, sampled_view.size.height,
+                                        static_cast<u32>(sampled_view.format),
+                                        sampled_view.Resource() ? 1 : 0, slot.sampler.index);
+                }
+                const Shader::Info* ps_info = stored.infos[4];
+                LOG_WARNING(Render_D3D12,
+                            "FLINGER textures: {} (ps_tex={} ps_img={} ps_mask={:#x} blend={})",
+                            texs, ps_info ? Shader::NumDescriptors(ps_info->texture_descriptors) : 0,
+                            ps_info ? Shader::NumDescriptors(ps_info->image_descriptors) : 0,
+                            ps_info ? ps_info->constant_buffer_mask : 0,
+                            stored.pipeline->State().attachments[0].enable ? 1 : 0);
+            }
         }
         if (flinger_draw) {
             // Diagnostic (session 12): attribute descriptors + raw vertex bytes of the

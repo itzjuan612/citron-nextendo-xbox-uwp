@@ -523,6 +523,28 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
             }
         }
 
+        // TEMP DIAGNOSTIC (session 13): same for the first fragment stages, to inspect the
+        // composition PS (what it samples, whether it discards / writes alpha).
+        if (program.stage == Shader::Stage::Fragment && !code.empty()) {
+            static std::atomic<u32> ps_dumps{0};
+            const u32 dump_index = ps_dumps.fetch_add(1, std::memory_order_relaxed);
+            if (dump_index < 16) {
+                const std::string path = GetCaptureDirectory() + "\\ps_" +
+                                         std::to_string(dump_index) + ".spv";
+                std::ofstream out{path, std::ios::binary};
+                if (out) {
+                    out.write(reinterpret_cast<const char*>(code.data()),
+                              static_cast<std::streamsize>(code.size() * sizeof(u32)));
+                    LOG_WARNING(Render_D3D12,
+                                "PS dump written: {} (mask={:#x} textures={} images={} words={})",
+                                path, program.info.constant_buffer_mask,
+                                Shader::NumDescriptors(program.info.texture_descriptors),
+                                Shader::NumDescriptors(program.info.image_descriptors),
+                                code.size());
+                }
+            }
+        }
+
         // TEMP DIAGNOSTIC (session 13): forced shader substitution experiment. The guest
         // composition draws cover no pixels although VB/IB/input layout/state all check out;
         // swap in console-proven shaders (blit VS from gl_VertexIndex, constant red PS) to

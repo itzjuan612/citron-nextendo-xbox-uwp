@@ -58,11 +58,20 @@ void Fermi2D::ConsumeSinkImpl() {
 }
 
 void Fermi2D::Blit() {
-    const auto src_cpu = memory_manager.GpuToCpuAddress(regs.src.Address());
-    const auto dst_cpu = memory_manager.GpuToCpuAddress(regs.dst.Address());
-    LOG_DEBUG(HW_GPU,
-              "called. source address=0x{:x} (cpu=0x{:x}), destination address=0x{:x} (cpu=0x{:x})",
-              regs.src.Address(), src_cpu.value_or(0), regs.dst.Address(), dst_cpu.value_or(0));
+    // TEMP DIAGNOSTIC (session 13): the guest blits every frame; logging each call is a
+    // large console cost. Keep the first few and sample periodically.
+    static u64 blit_calls = 0;
+    const bool log_blit_call = blit_calls < 8 || (blit_calls % 500) == 0;
+    ++blit_calls;
+    if (log_blit_call) {
+        const auto src_cpu = memory_manager.GpuToCpuAddress(regs.src.Address());
+        const auto dst_cpu = memory_manager.GpuToCpuAddress(regs.dst.Address());
+        LOG_DEBUG(HW_GPU,
+                  "called. source address=0x{:x} (cpu=0x{:x}), destination address=0x{:x} "
+                  "(cpu=0x{:x})",
+                  regs.src.Address(), src_cpu.value_or(0), regs.dst.Address(),
+                  dst_cpu.value_or(0));
+    }
 
     if (regs.operation != Operation::SrcCopy) {
         LOG_WARNING(HW_GPU, "Operation is not SrcCopy ({}), skipping blit", static_cast<u32>(regs.operation));
