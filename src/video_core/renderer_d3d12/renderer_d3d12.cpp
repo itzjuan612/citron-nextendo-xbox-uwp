@@ -5,11 +5,17 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include "common/logging.h"
+#include "video_core/renderer_d3d12/d3d12_capture.h"
 #include "common/settings.h"
 #include "core/frontend/emu_window.h"
 #include "core/frontend/graphics_context.h"
@@ -219,7 +225,191 @@ void LogResourceProbes() {
     ++g_resource_probe.logged;
 }
 
+// TEMP DIAGNOSTIC (session 12): periodic full-frame BMP capture of the presented image so the
+// current frame can be fetched via Device Portal and inspected without a TV.
+struct FrameCapture {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    u32 width = 0;
+    u32 height = 0;
+    u32 index = 0;
+    bool is_bgra = false;
+    bool armed = false;
+};
+
+FrameCapture g_frame_capture;
+std::string g_capture_directory;
+
+bool CaptureWanted() {
+    if (g_capture_directory.empty() || !Settings::values.uwp_frame_capture.GetValue()) {
+        return false;
+    }
+    std::error_code ec;
+    return !std::filesystem::exists(g_capture_directory + "\\capture_off", ec);
+}
+
+void PruneCaptures() {
+    constexpr size_t kKeep = 5;
+    std::error_code ec;
+    std::vector<std::pair<u32, std::filesystem::path>> files;
+    for (const auto& entry : std::filesystem::directory_iterator{g_capture_directory, ec}) {
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("capture_", 0) != 0 || entry.path().extension() != ".bmp" ||
+            name.size() <= 12) {
+            continue;
+        }
+        u32 index = 0;
+        const std::string digits = name.substr(8, name.size() - 12);
+        const auto result = std::from_chars(digits.data(), digits.data() + digits.size(), index);
+        if (result.ec != std::errc{}) {
+            continue;
+        }
+        files.emplace_back(index, entry.path());
+    }
+    std::sort(files.begin(), files.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+    while (files.size() > kKeep) {
+        std::filesystem::remove(files.front().second, ec);
+        files.erase(files.begin());
+    }
+}
+
+bool RecordFrameCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src) {
+    if (!src || g_frame_capture.armed) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC desc = src->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 ||
+        desc.Height == 0) {
+        return false;
+    }
+    bool is_bgra = false;
+    switch (desc.Format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        is_bgra = true;
+        break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        is_bgra = false;
+        break;
+    default:
+        return false;
+    }
+    g_frame_capture.readback.Reset();
+    UINT64 total_bytes = 0;
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    d3d->GetCopyableFootprints(&desc, 0, 1, 0, &g_frame_capture.footprint, &rows, &row_size,
+                               &total_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&g_frame_capture.readback)))) {
+        return false;
+    }
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = g_frame_capture.readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = g_frame_capture.footprint;
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+    command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    g_frame_capture.width = static_cast<u32>(desc.Width);
+    g_frame_capture.height = desc.Height;
+    g_frame_capture.is_bgra = is_bgra;
+    g_frame_capture.armed = true;
+    return true;
+}
+
+void WriteFrameCapture() {
+    if (!g_frame_capture.armed || !g_frame_capture.readback) {
+        g_frame_capture.armed = false;
+        return;
+    }
+    g_frame_capture.armed = false;
+    const u32 width = g_frame_capture.width;
+    const u32 height = g_frame_capture.height;
+    const u32 pitch = g_frame_capture.footprint.Footprint.RowPitch;
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, static_cast<SIZE_T>(pitch) * height};
+    if (FAILED(g_frame_capture.readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(g_capture_directory, ec);
+    const std::string path =
+        g_capture_directory + "\\capture_" + std::to_string(g_frame_capture.index) + ".bmp";
+    const u32 row_bytes = width * 4;
+    const u32 file_size = 54 + row_bytes * height;
+    std::array<u8, 54> header{};
+    header[0] = 'B';
+    header[1] = 'M';
+    std::memcpy(header.data() + 2, &file_size, 4);
+    const u32 pixel_offset = 54;
+    std::memcpy(header.data() + 10, &pixel_offset, 4);
+    const u32 dib_size = 40;
+    std::memcpy(header.data() + 14, &dib_size, 4);
+    std::memcpy(header.data() + 18, &width, 4);
+    const s32 bmp_height = static_cast<s32>(height);
+    std::memcpy(header.data() + 22, &bmp_height, 4);
+    const u16 planes = 1;
+    std::memcpy(header.data() + 26, &planes, 2);
+    const u16 bpp = 32;
+    std::memcpy(header.data() + 28, &bpp, 2);
+    const u32 image_size = row_bytes * height;
+    std::memcpy(header.data() + 34, &image_size, 4);
+    std::ofstream out{path, std::ios::binary};
+    if (out) {
+        out.write(reinterpret_cast<const char*>(header.data()), header.size());
+        const u8* const base = static_cast<const u8*>(mapped);
+        std::vector<u8> row(row_bytes);
+        for (s32 y = static_cast<s32>(height) - 1; y >= 0; --y) {
+            const u8* const src_row = base + static_cast<size_t>(y) * pitch;
+            if (g_frame_capture.is_bgra) {
+                out.write(reinterpret_cast<const char*>(src_row), row_bytes);
+            } else {
+                for (u32 x = 0; x < row_bytes; x += 4) {
+                    row[x] = src_row[x + 2];
+                    row[x + 1] = src_row[x + 1];
+                    row[x + 2] = src_row[x];
+                    row[x + 3] = src_row[x + 3];
+                }
+                out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
+            }
+        }
+        LOG_WARNING(Render_D3D12, "Frame capture written: {} ({}x{})", path, width, height);
+        ++g_frame_capture.index;
+    }
+    g_frame_capture.readback->Unmap(0, nullptr);
+    // Keep console storage bounded: only the newest captures are retained.
+    PruneCaptures();
+}
+
 } // Anonymous namespace
+
+void SetCaptureDirectory(std::string directory) {
+    g_capture_directory = std::move(directory);
+}
 
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
                              Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
@@ -450,6 +640,14 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
         RecordCalibrationProbe(device.GetDevice(), command_list);
     }
 
+    static u32 capture_present_counter = 0;
+    const u32 capture_this = capture_present_counter++;
+    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 8 &&
+                               capture_this >= 300 && (capture_this % 300) == 0;
+    if (capture_frame) {
+        RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
+    }
+
     ID3D12Resource* back_buffer = swapchain.GetBackBuffer();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swapchain.GetBackBufferRtv();
 
@@ -539,6 +737,10 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     if (probe_frame) {
         device.WaitForIdle();
         LogResourceProbes();
+    }
+    if (capture_frame) {
+        device.WaitForIdle();
+        WriteFrameCapture();
     }
 }
 

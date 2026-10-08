@@ -34,6 +34,7 @@
 #include "hid_core/hid_core.h"
 #include "input_common/drivers/virtual_gamepad.h"
 #include "video_core/renderer_base.h"
+#include "video_core/renderer_d3d12/d3d12_capture.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace CitronUWP {
@@ -104,6 +105,10 @@ void EmulationSession::Initialize(const std::string& app_directory) {
 
     // All Citron paths (keys/, nand/, config/, log/, ...) are derived from this directory.
     Common::FS::SetAppDirectory(app_directory);
+
+    // TEMP DIAGNOSTIC (session 12): presented-frame BMP captures land in <app>\captures and
+    // are fetched over Device Portal for visual inspection without a TV.
+    D3D12::SetCaptureDirectory(app_directory + "\\captures");
 
     Common::Log::Initialize();
     Common::Log::SetColorConsoleBackendEnabled(false);

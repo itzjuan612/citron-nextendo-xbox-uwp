@@ -705,6 +705,11 @@ struct Values {
         false};
     Setting<bool> dump_macros{
         linkage, false, "dump_macros", Category::DebuggingGraphics, Specialization::Default, false};
+    // TEMP DIAGNOSTIC (session 12): periodically dump the presented D3D12 frame to BMP files
+    // under <app dir>\captures. Can also be disabled at runtime by creating a "capture_off"
+    // file in that directory.
+    Setting<bool> uwp_frame_capture{linkage, true, "uwp_frame_capture",
+                                    Category::DebuggingGraphics};
     Setting<bool> enable_fs_access_log{linkage, false, "enable_fs_access_log", Category::Debugging};
     Setting<bool> reporting_services{
         linkage, false, "reporting_services", Category::Debugging, Specialization::Default, false};
