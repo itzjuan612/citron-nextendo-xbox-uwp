@@ -44,6 +44,10 @@ constexpr bool kSkipConfigureDrawState = false;
 
 using Tegra::Texture::TexturePair;
 
+// TEMP DIAGNOSTIC (session 13): color render target of the first depth-tested 3D draw, set in
+// ConfigureDraw and probed by the present path (declared in d3d12_texture_cache.h).
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene3d;
+
 AccelerateDMA::AccelerateDMA(BufferCache& buffer_cache_) : buffer_cache{buffer_cache_} {}
 
 bool AccelerateDMA::BufferCopy(GPUVAddr src_address, GPUVAddr dest_address, u64 amount) {
@@ -404,6 +408,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         std::string rts;
         std::string rts_ids;
         std::string rts_att;
+        // TEMP DIAGNOSTIC (session 13): capture the color target of the first depth-tested 3D
+        // draw (the scene behind the UI) so the present path can prove whether that scene RT
+        // actually receives content, independent of the composition/FLINGER layers. The first
+        // depth-tested draw is an auxiliary pass (e.g. a 1600x1600 mask), so the visible scene
+        // is identified by its wide 16:9-ish render viewport instead of by draw order.
+        const D3D12_VIEWPORT probe_vp = MakeViewport(maxwell3d->regs);
+        const bool probe_wide_scene = probe_vp.Height > 0.0f && probe_vp.Width >= 640.0f &&
+                                      probe_vp.Width / probe_vp.Height > 1.6f &&
+                                      probe_vp.Width / probe_vp.Height < 1.85f;
+        static bool scene3d_probe_logged = false;
         for (size_t i = 0; i < num_rtvs; ++i) {
             const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
             const u64 addr = view ? static_cast<u64>(view->GpuAddr()) : 0;
@@ -419,6 +433,22 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             } else if (res != nullptr && view != nullptr && view->size.width >= 1920 &&
                        view->size.height >= 1080) {
                 g_probe_scene = res;
+            }
+            if (!scene3d_probe_logged && probe_wide_scene && res != nullptr &&
+                view != nullptr && depth_view != nullptr && depth_view->RenderTarget().ptr) {
+                scene3d_probe_logged = true;
+                g_probe_scene3d = res;
+                const D3D12_RESOURCE_DESC scene3d_desc = res->GetDesc();
+                ID3D12Resource* const scene3d_depth_res = depth_view->Resource();
+                const u32 dsv_fmt = scene3d_depth_res
+                                        ? static_cast<u32>(scene3d_depth_res->GetDesc().Format)
+                                        : 0;
+                LOG_WARNING(Render_D3D12,
+                            "Scene3D probe RT: gpu={:#x} fmt={:#x} {}x{} dsv_fmt={:#x} "
+                            "vp={}x{} aspect={:.3f}",
+                            addr, static_cast<u32>(scene3d_desc.Format), scene3d_desc.Width,
+                            scene3d_desc.Height, dsv_fmt, probe_vp.Width, probe_vp.Height,
+                            probe_vp.Width / probe_vp.Height);
             }
             rts += fmt::format("{}{:#x}", i == 0 ? "" : ",", addr);
             rts_ids += fmt::format("{}{}:{}", i == 0 ? "" : ",", view ? view->image_id.index : 0,
@@ -1485,6 +1515,57 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             stored.pipeline->State().attachments[0].enable ? 1 : 0);
             }
         }
+        // TEMP DIAGNOSTIC (session 13): the depth-tested 3D draws (the scene behind the UI)
+        // with their render target format and the textures they sample, so a black scene is
+        // attributable to the RT format/contents or to missing/wrong sampled textures.
+        if (depth_view != nullptr && depth_view->RenderTarget().ptr) {
+            static u32 scene3d_draw_logs = 0;
+            const u32 scene3d_index = scene3d_draw_logs++;
+            if (scene3d_index < 8 ||
+                (scene3d_index % 256 == 0 && scene3d_index < 8192)) {
+                std::string texs;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled) {
+                        continue;
+                    }
+                    ImageView& sampled_view = m_texture_cache.GetImageView(slot.view);
+                    texs += fmt::format("[img={} gpu={:#x} {}x{} fmt={:#x} res={}]",
+                                        sampled_view.image_id.index,
+                                        static_cast<u64>(sampled_view.GpuAddr()),
+                                        sampled_view.size.width, sampled_view.size.height,
+                                        static_cast<u32>(sampled_view.format),
+                                        sampled_view.Resource() ? 1 : 0);
+                }
+                const ImageView* scene3d_rt = nullptr;
+                for (size_t i = 0; i < num_rtvs; ++i) {
+                    const ImageView* cand = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+                    if (cand != nullptr && cand->Resource() != nullptr) {
+                        scene3d_rt = cand;
+                        break;
+                    }
+                }
+                const u64 rt_gpu = scene3d_rt ? static_cast<u64>(scene3d_rt->GpuAddr()) : 0;
+                const D3D12_VIEWPORT scene3d_vp = MakeViewport(maxwell3d->regs);
+                ID3D12Resource* const dsv_res = depth_view->Resource();
+                LOG_WARNING(Render_D3D12,
+                            "D3D draw: rt_gpu={:#x} fmt={:#x} {}x{} dsv_fmt={:#x} cull_en={} "
+                            "cull_face={} ff={} verts={} indexed={} textures={} "
+                            "vp=({},{},{},{})",
+                            rt_gpu,
+                            scene3d_rt
+                                ? static_cast<u32>(scene3d_rt->Resource()->GetDesc().Format)
+                                : 0,
+                            scene3d_rt ? scene3d_rt->Resource()->GetDesc().Width : 0,
+                            scene3d_rt ? scene3d_rt->Resource()->GetDesc().Height : 0,
+                            dsv_res ? static_cast<u32>(dsv_res->GetDesc().Format) : 0,
+                            stored.pipeline->State().cull_enable.Value(),
+                            static_cast<u32>(stored.pipeline->State().CullFaceMode()),
+                            static_cast<u32>(stored.pipeline->State().FrontFaceMode()),
+                            params.num_vertices, params.is_indexed ? 1 : 0, texs,
+                            scene3d_vp.TopLeftX, scene3d_vp.TopLeftY, scene3d_vp.Width,
+                            scene3d_vp.Height);
+            }
+        }
         if (flinger_draw) {
             // Diagnostic (session 12): attribute descriptors + raw vertex bytes of the
             // composition quad, so a wrong slot/offset/format is visible from the data.
@@ -2058,8 +2139,196 @@ std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
     };
 }
 
-void RasterizerD3D12::Clear(u32 layer_count) {}
-void RasterizerD3D12::DispatchCompute() {}
+void RasterizerD3D12::Clear(u32 layer_count) {
+    const auto& regs = maxwell3d->regs;
+    const bool use_color = regs.clear_surface.R || regs.clear_surface.G || regs.clear_surface.B ||
+                           regs.clear_surface.A;
+    const bool use_depth = regs.clear_surface.Z;
+    const bool use_stencil = regs.clear_surface.S;
+    if (!use_color && !use_depth && !use_stencil) {
+        return;
+    }
+
+    // TEMP DIAGNOSTIC (session 13): bounded proof of whether the guest actually clears and
+    // with which values, since a black screen can mean "no clear ever arrived" just as well
+    // as "the clear landed on the wrong target".
+    static u64 clear_calls = 0;
+    const u64 clear_index = clear_calls++;
+    if (clear_index < 16 || (clear_index % 4096) == 0) {
+        LOG_WARNING(Render_D3D12,
+                    "D3D12 Clear #{}: color={} depth={} stencil={} rt={} layer={} count={} "
+                    "scissor={} color0=({},{},{},{}) depth_val={}",
+                    clear_index, use_color, use_depth, use_stencil,
+                    regs.clear_surface.RT.Value(), regs.clear_surface.layer.Value(), layer_count,
+                    regs.clear_control.use_scissor ? 1 : 0, regs.clear_color[0],
+                    regs.clear_color[1], regs.clear_color[2], regs.clear_color[3],
+                    regs.clear_depth);
+    }
+
+    // The render-target walk resolves guest memory, so it must be coherent first
+    // (RasterizerVulkan::Clear calls gpu_memory->FlushCaching() here; the D3D12
+    // rasterizer reaches it through the same shared Tegra::MemoryManager pointer
+    // that ConfigureDraw and friends use, so guard for a missing GPU memory
+    // manager before flushing).
+    if (gpu_memory != nullptr) {
+        gpu_memory->FlushCaching();
+    }
+    m_query_cache.NotifySegment(true);
+    m_query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
+                                regs.zpass_pixel_count_enable != 0);
+
+    // Same cache locking as ConfigureDraw/DrawTexture.
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
+    m_texture_cache.UpdateRenderTargets(true);
+    Framebuffer* const framebuffer = m_texture_cache.GetFramebuffer();
+    if (!framebuffer) {
+        return;
+    }
+    const VideoCommon::Extent2D render_area = framebuffer->RenderArea();
+    if (render_area.width == 0 || render_area.height == 0) {
+        return;
+    }
+
+    // Full framebuffer area, or the guest scissor when the clear is scissor controlled.
+    D3D12_RECT clear_rect;
+    if (regs.clear_control.use_scissor) {
+        const D3D12_RECT scissor = MakeScissor(regs);
+        clear_rect.left = scissor.left;
+        clear_rect.top = scissor.top;
+        clear_rect.right = scissor.right;
+        clear_rect.bottom = scissor.bottom;
+    } else {
+        clear_rect.left = 0;
+        clear_rect.top = 0;
+        clear_rect.right = static_cast<s32>(render_area.width);
+        clear_rect.bottom = static_cast<s32>(render_area.height);
+    }
+    // Vulkan only clamps the extent to the render area; D3D12 additionally rejects rects
+    // reaching outside the cleared resource, so clamp the offsets as well.
+    clear_rect.left = std::max<s32>(clear_rect.left, 0);
+    clear_rect.top = std::max<s32>(clear_rect.top, 0);
+    clear_rect.right = std::min<s32>(clear_rect.right, static_cast<s32>(render_area.width));
+    clear_rect.bottom = std::min<s32>(clear_rect.bottom, static_cast<s32>(render_area.height));
+    if (clear_rect.right <= clear_rect.left || clear_rect.bottom <= clear_rect.top) {
+        return;
+    }
+    // D3D12 takes an array of clear rects; a full-area clear needs none.
+    D3D12_RECT clear_rects[1] = {clear_rect};
+    const D3D12_RECT* p_rects = regs.clear_control.use_scissor ? clear_rects : nullptr;
+    const UINT rect_count = regs.clear_control.use_scissor ? 1U : 0U;
+
+    // Array layers: the texture cache builds the framebuffer's RTV/DSV for the whole
+    // image and has no per-layer-slice views, so a clear that names a layer sub-range
+    // (regs.clear_surface.layer / layer_count) clears every layer of the view. Stated
+    // here rather than silently ignored.
+    if (regs.clear_surface.layer != 0 || layer_count != 1) {
+        static bool logged_layer_range{};
+        if (!logged_layer_range) {
+            logged_layer_range = true;
+            LOG_WARNING(Render_D3D12,
+                        "Clear with array layer range (layer={} count={}): the whole view is "
+                        "cleared (no per-layer RTV/DSV)",
+                        regs.clear_surface.layer.Value(), layer_count);
+        }
+    }
+
+    const u32 color_attachment = regs.clear_surface.RT;
+    if (use_color && color_attachment < VideoCommon::NUM_RT) {
+        const ImageView* const view = framebuffer->ColorBuffers()[color_attachment];
+        ID3D12Resource* const resource = view ? view->Resource() : nullptr;
+        if (view != nullptr && resource != nullptr && view->RenderTarget().ptr != 0) {
+            // Clear-value conversion mirrors RasterizerVulkan::Clear: regs.clear_color is
+            // a std::array<f32, 4>, so a non-integer render target takes its components
+            // verbatim while an integer target scales into the component range (uint:
+            // 2 * bit_size, sint: 2 * (bit_size - 1) minus a half step). D3D12 reads an
+            // integer RTV's clear color as raw u32/s32 lanes, so the integer result is
+            // reinterpreted into the f32 slot. A partial R/G/B/A mask has no D3D12
+            // equivalent (Vulkan does a masked blit here) and clears all four channels.
+            const auto format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(
+                regs.rt[color_attachment].format);
+            f32 color[4]{};
+            if (!VideoCore::Surface::IsPixelFormatInteger(format)) {
+                for (u32 i = 0; i < 4; ++i) {
+                    color[i] = regs.clear_color[i];
+                }
+            } else if (!VideoCore::Surface::IsPixelFormatSignedInteger(format)) {
+                const f32 scale = static_cast<f32>(
+                    static_cast<u64>(VideoCore::Surface::PixelComponentSizeBitsInteger(format)) <<
+                    1U);
+                for (u32 i = 0; i < 4; ++i) {
+                    const u32 value = static_cast<u32>(scale * regs.clear_color[i]);
+                    std::memcpy(&color[i], &value, sizeof(value));
+                }
+            } else {
+                const size_t bits = VideoCore::Surface::PixelComponentSizeBitsInteger(format);
+                const f32 scale = static_cast<f32>(static_cast<s64>(bits - 1) << 1);
+                for (u32 i = 0; i < 4; ++i) {
+                    const s32 value = static_cast<s32>(scale * (regs.clear_color[i] - 0.5f));
+                    std::memcpy(&color[i], &value, sizeof(value));
+                }
+            }
+            // COMMON -> RENDER_TARGET excursion, same as ConfigureDraw's transition_rt.
+            m_command_list.Transition(resource, D3D12_RESOURCE_STATE_COMMON,
+                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+            Diag::Push(Diag::CmdKind::ClearRtv, view->RenderTarget().ptr, rect_count);
+            m_command_list.Get()->ClearRenderTargetView(view->RenderTarget(), color,
+                                                        rect_count, p_rects);
+            m_command_list.Transition(resource, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                      D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
+
+    ImageView* const depth_view = framebuffer->DepthBuffer();
+    ID3D12Resource* const depth_resource = depth_view ? depth_view->Resource() : nullptr;
+    if ((use_depth || use_stencil) && depth_view != nullptr && depth_resource != nullptr &&
+        depth_view->RenderTarget().ptr != 0) {
+        // Only a DSV whose format carries a stencil plane accepts the stencil flag.
+        const VideoCore::Surface::PixelFormat depth_format = depth_view->format;
+        const bool has_stencil = depth_format == VideoCore::Surface::PixelFormat::D24_UNORM_S8_UINT ||
+                                 depth_format == VideoCore::Surface::PixelFormat::S8_UINT_D24_UNORM ||
+                                 depth_format == VideoCore::Surface::PixelFormat::D32_FLOAT_S8_UINT;
+        D3D12_CLEAR_FLAGS flags{};
+        if (use_depth) {
+            flags |= D3D12_CLEAR_FLAG_DEPTH;
+        }
+        if (use_stencil && has_stencil) {
+            flags |= D3D12_CLEAR_FLAG_STENCIL;
+        }
+        if (flags != 0) {
+            // regs.clear_depth is already an f32 in [0, 1]; the stencil clear value is
+            // narrowed to the UINT8 ClearDepthStencilView takes.
+            m_command_list.Transition(depth_resource, D3D12_RESOURCE_STATE_COMMON,
+                                      D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            Diag::Push(Diag::CmdKind::ClearDsv, depth_view->RenderTarget().ptr,
+                       static_cast<u64>(flags));
+            m_command_list.Get()->ClearDepthStencilView(depth_view->RenderTarget(), flags,
+                                                        regs.clear_depth,
+                                                        static_cast<u8>(regs.clear_stencil),
+                                                        rect_count, p_rects);
+            m_command_list.Transition(depth_resource, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                      D3D12_RESOURCE_STATE_COMMON);
+        }
+    }
+}
+void RasterizerD3D12::DispatchCompute() {
+    // TEMP DIAGNOSTIC (session 13): compute dispatches are currently dropped entirely (the
+    // D3D12 backend has no compute pipeline path). The missing 3D scene on the style screen
+    // is the prime suspect for guest compute usage, so log the dispatch rate and shape.
+    if (!kepler_compute) {
+        return;
+    }
+    const auto& qmd = kepler_compute->launch_description;
+    static u64 dispatch_total = 0;
+    const u64 dispatch_index = dispatch_total++;
+    if (dispatch_index < 8 || (dispatch_index % 1000) == 0) {
+        LOG_WARNING(Render_D3D12,
+                    "D3D12 compute dispatch #{}: program={:#x} grid=({},{},{}) "
+                    "cbuf_mask={:#x}",
+                    dispatch_index, qmd.program_start, qmd.grid_dim_x.Value(),
+                    qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
+                    qmd.const_buffer_enable_mask.Value());
+    }
+}
 void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {
     if (type != VideoCommon::QueryType::ZPassPixelCount64) {
         return;

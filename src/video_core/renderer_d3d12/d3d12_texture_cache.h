@@ -198,6 +198,10 @@ extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene;
 extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_sampled;
 extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
 
+/// TEMP DIAGNOSTIC (session 13): the render target of the first depth-tested 3D draw (the
+/// scene behind the UI), probed by the present path to show whether it holds pixels.
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene3d;
+
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
 
 /// Guest sampler state translated to a D3D12 sampler description. The draw translation

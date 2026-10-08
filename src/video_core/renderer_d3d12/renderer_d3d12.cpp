@@ -36,7 +36,7 @@ struct ResourceProbe {
     Microsoft::WRL::ComPtr<ID3D12Resource> readback;
     Microsoft::WRL::ComPtr<ID3D12Resource> calibration;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> calibration_rtv_heap;
-    std::array<bool, 6> armed{};
+    std::array<bool, 7> armed{};
     u32 logged = 0;
     u32 frames = 0;
 };
@@ -87,7 +87,7 @@ bool RecordResourceProbe(ID3D12Device* d3d, CommandList& command_list, u32 slot,
     constexpr u32 kMaxExtent = 16;
     constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     constexpr u64 kSlotBytes = kRowPitch * kMaxExtent;
-    constexpr u32 kSlots = 6;
+    constexpr u32 kSlots = 7;
     const u32 width = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Width));
     const u32 height = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Height));
     if (width == 0 || height == 0) {
@@ -187,9 +187,9 @@ void LogResourceProbes() {
     }
     constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
     constexpr u64 kSlotBytes = kRowPitch * 16;
-    constexpr u64 kAllBytes = kSlotBytes * 6;
+    constexpr u64 kAllBytes = kSlotBytes * 7;
     static constexpr const char* kSlotNames[] = {"display", "scene", "any_sample", "calib",
-                                                 "blit_src", "blit_dst"};
+                                                 "blit_src", "blit_dst", "scene3d"};
     void* mapped = nullptr;
     const D3D12_RANGE read_range{0, kAllBytes};
     if (FAILED(g_resource_probe.readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
@@ -239,6 +239,10 @@ struct FrameCapture {
 };
 
 FrameCapture g_frame_capture;
+// TEMP DIAGNOSTIC (session 13): same machinery, but for the visible 3D scene render target
+// (g_probe_scene3d): a 16x16 content probe cannot show whether the scene holds geometry, so
+// dump the whole target as a BMP. Only four files are written, then the probe stops.
+FrameCapture g_scene3d_capture;
 std::string g_capture_directory;
 
 bool CaptureWanted() {
@@ -342,6 +346,86 @@ bool RecordFrameCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Reso
     return true;
 }
 
+// TEMP DIAGNOSTIC (session 13): RecordFrameCapture for the scene3d probe RT. Same readback,
+// footprint and COMMON/COPY_SOURCE handling; the format table additionally accepts the wider
+// 4-bytes-per-pixel colour formats a scene render target can use, which take the RGBA path
+// (the BMP is colour-swizzled for those, but still shows whether the target holds pixels).
+bool RecordScene3dCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src) {
+    if (!src || g_scene3d_capture.armed) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC desc = src->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 ||
+        desc.Height == 0) {
+        return false;
+    }
+    bool is_bgra = false;
+    switch (desc.Format) {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        is_bgra = true;
+        break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        is_bgra = false;
+        break;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        // 4 bytes per pixel: copied through and written unswizzled.
+        is_bgra = false;
+        break;
+    default:
+        static bool scene3d_format_logged = false;
+        if (!scene3d_format_logged) {
+            scene3d_format_logged = true;
+            LOG_WARNING(Render_D3D12, "Scene3D capture: unsupported fmt={:#x} {}x{}",
+                        static_cast<u32>(desc.Format), desc.Width, desc.Height);
+        }
+        return false;
+    }
+    g_scene3d_capture.readback.Reset();
+    UINT64 total_bytes = 0;
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    d3d->GetCopyableFootprints(&desc, 0, 1, 0, &g_scene3d_capture.footprint, &rows, &row_size,
+                               &total_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&g_scene3d_capture.readback)))) {
+        return false;
+    }
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = g_scene3d_capture.readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = g_scene3d_capture.footprint;
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+    command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    g_scene3d_capture.width = static_cast<u32>(desc.Width);
+    g_scene3d_capture.height = desc.Height;
+    g_scene3d_capture.is_bgra = is_bgra;
+    g_scene3d_capture.armed = true;
+    return true;
+}
+
 void WriteFrameCapture() {
     if (!g_frame_capture.armed || !g_frame_capture.readback) {
         g_frame_capture.armed = false;
@@ -404,6 +488,72 @@ void WriteFrameCapture() {
     g_frame_capture.readback->Unmap(0, nullptr);
     // Keep console storage bounded: only the newest captures are retained.
     PruneCaptures();
+}
+
+// TEMP DIAGNOSTIC (session 13): WriteFrameCapture for the scene3d probe RT, writing
+// scene3d_<index>.bmp next to the presented-frame captures. Only four files are produced
+// (the trigger stops arming once index == 4), and PruneCaptures never matches them, so they
+// survive across runs until the next four overwrite the same names.
+void WriteScene3dCapture() {
+    if (!g_scene3d_capture.armed || !g_scene3d_capture.readback) {
+        g_scene3d_capture.armed = false;
+        return;
+    }
+    g_scene3d_capture.armed = false;
+    const u32 width = g_scene3d_capture.width;
+    const u32 height = g_scene3d_capture.height;
+    const u32 pitch = g_scene3d_capture.footprint.Footprint.RowPitch;
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, static_cast<SIZE_T>(pitch) * height};
+    if (FAILED(g_scene3d_capture.readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(g_capture_directory, ec);
+    const std::string path =
+        g_capture_directory + "\\scene3d_" + std::to_string(g_scene3d_capture.index) + ".bmp";
+    const u32 row_bytes = width * 4;
+    const u32 file_size = 54 + row_bytes * height;
+    std::array<u8, 54> header{};
+    header[0] = 'B';
+    header[1] = 'M';
+    std::memcpy(header.data() + 2, &file_size, 4);
+    const u32 pixel_offset = 54;
+    std::memcpy(header.data() + 10, &pixel_offset, 4);
+    const u32 dib_size = 40;
+    std::memcpy(header.data() + 14, &dib_size, 4);
+    std::memcpy(header.data() + 18, &width, 4);
+    const s32 bmp_height = static_cast<s32>(height);
+    std::memcpy(header.data() + 22, &bmp_height, 4);
+    const u16 planes = 1;
+    std::memcpy(header.data() + 26, &planes, 2);
+    const u16 bpp = 32;
+    std::memcpy(header.data() + 28, &bpp, 2);
+    const u32 image_size = row_bytes * height;
+    std::memcpy(header.data() + 34, &image_size, 4);
+    std::ofstream out{path, std::ios::binary};
+    if (out) {
+        out.write(reinterpret_cast<const char*>(header.data()), header.size());
+        const u8* const base = static_cast<const u8*>(mapped);
+        std::vector<u8> row(row_bytes);
+        for (s32 y = static_cast<s32>(height) - 1; y >= 0; --y) {
+            const u8* const src_row = base + static_cast<size_t>(y) * pitch;
+            if (g_scene3d_capture.is_bgra) {
+                out.write(reinterpret_cast<const char*>(src_row), row_bytes);
+            } else {
+                for (u32 x = 0; x < row_bytes; x += 4) {
+                    row[x] = src_row[x + 2];
+                    row[x + 1] = src_row[x + 1];
+                    row[x + 2] = src_row[x];
+                    row[x + 3] = src_row[x + 3];
+                }
+                out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
+            }
+        }
+        LOG_WARNING(Render_D3D12, "Scene3D capture written: {} ({}x{})", path, width, height);
+        ++g_scene3d_capture.index;
+    }
+    g_scene3d_capture.readback->Unmap(0, nullptr);
 }
 
 } // Anonymous namespace
@@ -646,6 +796,12 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
         // the repeated 640x360 blit fills the texture the missing splash layer samples.
         RecordResourceProbe(device.GetDevice(), command_list, 4, g_probe_blit_src.Get());
         RecordResourceProbe(device.GetDevice(), command_list, 5, g_probe_blit_dst.Get());
+        // TEMP DIAGNOSTIC (session 13): the render target of the first depth-tested 3D draw
+        // (the scene behind the UI), to show whether the 3D scene RT actually receives content.
+        RecordResourceProbe(device.GetDevice(), command_list, 6, g_probe_scene3d.Get());
+        // TEMP DIAGNOSTIC (session 13): the full BMP of the same target used to be taken here,
+        // but the probe frames run out long before the 3D scene is drawn, so the snapshots
+        // always came from before it. It now follows the presented-frame cadence below.
         RecordCalibrationProbe(device.GetDevice(), command_list);
     }
 
@@ -657,6 +813,13 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
                                capture_this >= 600 && (capture_this % 900) == 0;
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
+        // TEMP DIAGNOSTIC (session 13): take the scene3d BMP on the same cadence as the presented
+        // frame captures (every 900 presents), so a snapshot is recorded while the 3D scene is
+        // actually in the target instead of during the early probe frames. RecordScene3dCapture
+        // is a no-op when a previous readback is still armed, so this can never double-record.
+        if (g_scene3d_capture.index < 4) {
+            RecordScene3dCapture(device.GetDevice(), command_list, g_probe_scene3d.Get());
+        }
     }
 
     ID3D12Resource* back_buffer = swapchain.GetBackBuffer();
@@ -752,6 +915,12 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     if (capture_frame) {
         device.WaitForIdle();
         WriteFrameCapture();
+    }
+    // TEMP DIAGNOSTIC (session 13): the scene3d copy was recorded on the same list that just
+    // executed, so its readback is complete once the list (and the idle wait above) is done.
+    if (g_scene3d_capture.index < 4 && g_scene3d_capture.armed) {
+        device.WaitForIdle();
+        WriteScene3dCapture();
     }
 }
 

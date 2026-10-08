@@ -102,10 +102,11 @@ DXGI_FORMAT ResourceFormat(PixelFormat format) {
     case PixelFormat::A2B10G10R10_UINT:
         return DXGI_FORMAT_R10G10B10A2_TYPELESS;
     case PixelFormat::B10G11R11_FLOAT:
-        // DXGI has no RTV-capable R11G11B10 format, so the resource is allocated as
-        // typeless R10G10B10A2 and viewed as UNORM (legal typeless pair). The guest
-        // bit layout is reinterpreted rather than converted.
-        return DXGI_FORMAT_R10G10B10A2_TYPELESS;
+        // The resource is allocated typed as R11G11B10_FLOAT so the typed
+        // SRV/RTV views created from it match. This format is not UAV-capable,
+        // so the UAV flag is cleared by the whitelist below, which keys on the
+        // resolved resource format.
+        return DXGI_FORMAT_R11G11B10_FLOAT;
     case PixelFormat::BC7_UNORM:
     case PixelFormat::BC7_SRGB:
         return DXGI_FORMAT_BC7_TYPELESS;
@@ -224,7 +225,7 @@ DXGI_FORMAT SampledFormat(PixelFormat format) {
     case PixelFormat::A2B10G10R10_UINT:
         return DXGI_FORMAT_R10G10B10A2_UINT;
     case PixelFormat::B10G11R11_FLOAT:
-        return DXGI_FORMAT_R10G10B10A2_UNORM;
+        return DXGI_FORMAT_R11G11B10_FLOAT;
     case PixelFormat::BC7_UNORM:
         return DXGI_FORMAT_BC7_UNORM;
     case PixelFormat::BC7_SRGB:

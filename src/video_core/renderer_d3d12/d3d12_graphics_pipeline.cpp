@@ -4,6 +4,7 @@
 #include "video_core/renderer_d3d12/d3d12_graphics_pipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "common/cityhash.h"
@@ -359,6 +360,44 @@ const auto StageBytecode = [](const std::vector<u8>& bytecode)
     return D3D12_SHADER_BYTECODE{bytecode.data(), bytecode.size()};
 };
 
+// Per-format cache of the device's blend capability. The sentinel is -1, not 0:
+// C++20 value-initializes std::atomic to 0, which the lookup below would read as
+// an already-resolved "not blendable" answer and skip CheckFeatureSupport.
+struct BlendableFormatCache {
+    std::array<std::atomic<s32>, 256> entries;
+    BlendableFormatCache() {
+        for (auto& entry : entries) {
+            entry.store(-1, std::memory_order_relaxed);
+        }
+    }
+};
+
+// D3D12 (and the stricter Xbox runtime) rejects a PSO with E_INVALIDARG when a
+// render-target slot has blending enabled on a format that cannot blend, so the
+// capability has to be queried from the device instead of assumed.
+bool IsBlendableFormat(ID3D12Device* device, DXGI_FORMAT format) {
+    if (device == nullptr || format == DXGI_FORMAT_UNKNOWN) {
+        return false;
+    }
+    const u32 index = static_cast<u32>(format);
+    static BlendableFormatCache cache;
+    if (index >= cache.entries.size()) {
+        return false;
+    }
+    const s32 cached = cache.entries[index].load(std::memory_order_relaxed);
+    if (cached >= 0) {
+        return cached != 0;
+    }
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
+    support.Format = format;
+    const HRESULT hr = device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &support,
+                                                   sizeof(support));
+    const bool supported =
+        SUCCEEDED(hr) && (support.Support1 & D3D12_FORMAT_SUPPORT1_BLENDABLE) != 0;
+    cache.entries[index].store(supported ? 1 : 0, std::memory_order_relaxed);
+    return supported;
+}
+
 } // Anonymous namespace
 
 size_t GraphicsPipelineCacheKey::Hash() const noexcept {
@@ -453,7 +492,7 @@ DXGI_FORMAT SurfaceFormat(VideoSurface::PixelFormat format) {
     case VideoSurface::PixelFormat::R8G8_SINT:
         return DXGI_FORMAT_R8G8_SINT;
     case VideoSurface::PixelFormat::B10G11R11_FLOAT:
-        return DXGI_FORMAT_R10G10B10A2_UNORM;
+        return DXGI_FORMAT_R11G11B10_FLOAT;
     case VideoSurface::PixelFormat::A2B10G10R10_UNORM:
         return DXGI_FORMAT_R10G10B10A2_UNORM;
     case VideoSurface::PixelFormat::A2B10G10R10_UINT:
@@ -695,6 +734,23 @@ GraphicsPipeline::GraphicsPipeline(
             break;
         }
         desc.RTVFormats[i] = format;
+        // A render-target slot whose format cannot blend makes the (strict) Xbox
+        // runtime reject the whole PSO with E_INVALIDARG, so drop blending for
+        // that slot before handing the description over.
+        if (format != DXGI_FORMAT_UNKNOWN && !IsBlendableFormat(device, format)) {
+            static u32 logged_non_blendable = 0;
+            if (logged_non_blendable < 4) {
+                ++logged_non_blendable;
+                LOG_WARNING(Render_D3D12,
+                            "Disabling blend on non-blendable RT format {:#x} (slot {})",
+                            static_cast<u32>(format), i);
+            }
+            desc.BlendState.RenderTarget[i].BlendEnable = FALSE;
+            desc.BlendState.RenderTarget[i].LogicOpEnable = FALSE;
+            if (i == 0) {
+                desc.BlendState.AlphaToCoverageEnable = FALSE;
+            }
+        }
         if (format != DXGI_FORMAT_UNKNOWN) {
             render_target_count = i + 1;
         }
