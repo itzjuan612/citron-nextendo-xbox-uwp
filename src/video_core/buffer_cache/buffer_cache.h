@@ -707,12 +707,43 @@ void BufferCache<P>::BindHostIndexBuffer() {
             if (upload_staging.buffer &&
                 upload_staging.mapped_span.size() >= static_cast<size_t>(elements) * sizeof(u16)) {
                 std::vector<u8> tmp(elements);
-                device_memory.ReadBlockUnsafe(channel_state->index_buffer.device_addr,
-                                              tmp.data(), elements,
-                                              "BufferCache.BindHostIndexBuffer.u8expand");
+                const auto u8_read_result = device_memory.ReadBlockUnsafe(
+                    channel_state->index_buffer.device_addr, tmp.data(), elements,
+                    "BufferCache.BindHostIndexBuffer.u8expand");
                 u16* dst = reinterpret_cast<u16*>(upload_staging.mapped_span.data());
                 for (u32 i = 0; i < elements; ++i) {
                     dst[i] = static_cast<u16>(tmp[i]);
+                }
+                // TEMP DIAGNOSTIC (session 13): the composition draws expand u8 indices
+                // into staging; log the source read result and the staged indices, since a
+                // failed/unmapped source read would stage an all-zero index buffer and
+                // every triangle would be degenerate (draws execute, cover nothing).
+                {
+                    static std::atomic<u32> u8_ib_logs{0};
+                    const u32 u8_log = u8_ib_logs.fetch_add(1, std::memory_order_relaxed);
+                    if (u8_log < 8) {
+                        std::string src_hex;
+                        std::string dst_vals;
+                        for (u32 i = 0; i < elements && i < 24; ++i) {
+                            src_hex += fmt::format("{:02x}", tmp[i]);
+                        }
+                        for (u32 i = 0; i < elements && i < 24; ++i) {
+                            dst_vals += fmt::format("{} ", dst[i]);
+                        }
+                        LOG_WARNING(HW_Memory,
+                                    "u8 IB expand #{}: null_binding={} gpu={:#x} dev={:#x} "
+                                    "elems={} first={} count={} fully_mapped={} "
+                                    "first_unmapped={:#x} unmapped_bytes={} src=[{}] staged=[{}]",
+                                    u8_log,
+                                    channel_state->index_buffer.buffer_id == NULL_BUFFER_ID ? 1
+                                                                                            : 0,
+                                    static_cast<u64>(draw_state.index_buffer.StartAddress()),
+                                    channel_state->index_buffer.device_addr, elements,
+                                    draw_state.index_buffer.first, draw_state.index_buffer.count,
+                                    u8_read_result.fully_mapped ? 1 : 0,
+                                    u8_read_result.first_unmapped_address,
+                                    u8_read_result.unmapped_bytes, src_hex, dst_vals);
+                    }
                 }
                 buffer.MarkUsage(offset, size);
                 runtime.BindIndexBuffer(

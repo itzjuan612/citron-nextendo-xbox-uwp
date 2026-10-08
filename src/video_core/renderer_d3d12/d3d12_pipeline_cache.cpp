@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <fstream>
 #include <new>
 
 #ifndef NOMINMAX
@@ -21,6 +22,8 @@
 #include "shader_recompiler/runtime_info.h"
 #include "shader_recompiler/shader_info.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/renderer_d3d12/d3d12_blit_shaders.h"
+#include "video_core/renderer_d3d12/d3d12_capture.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_pipeline_cache.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
@@ -490,6 +493,62 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
         const auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage)};
         ConvertLegacyToGeneric(program, runtime_info);
         std::vector<u32> code = EmitSPIRV(profile, runtime_info, program, binding);
+
+        // TEMP DIAGNOSTIC (session 13): write the translated SPIR-V of the first vertex
+        // stages to the captures directory, so the composition VS can be disassembled
+        // offline (the executing draws still cover no pixels).
+        if ((program.stage == Shader::Stage::VertexA ||
+             program.stage == Shader::Stage::VertexB) &&
+            !code.empty()) {
+            static std::atomic<u32> vs_dumps{0};
+            const u32 dump_index = vs_dumps.fetch_add(1, std::memory_order_relaxed);
+            if (dump_index < 16) {
+                const std::string path = GetCaptureDirectory() + "\\vs_" +
+                                         std::to_string(dump_index) + ".spv";
+                std::ofstream out{path, std::ios::binary};
+                if (out) {
+                    out.write(reinterpret_cast<const char*>(code.data()),
+                              static_cast<std::streamsize>(code.size() * sizeof(u32)));
+                    std::string descs;
+                    for (const auto& desc : program.info.constant_buffer_descriptors) {
+                        descs += std::to_string(desc.index) + ":" +
+                                 std::to_string(desc.count) + " ";
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "Shader dump written: {} (stage={} mask={:#x} descs=[{}] "
+                                "words={})",
+                                path, static_cast<u32>(program.stage),
+                                program.info.constant_buffer_mask, descs, code.size());
+                }
+            }
+        }
+
+        // TEMP DIAGNOSTIC (session 13): forced shader substitution experiment. The guest
+        // composition draws cover no pixels although VB/IB/input layout/state all check out;
+        // swap in console-proven shaders (blit VS from gl_VertexIndex, constant red PS) to
+        // split "guest VS / vertex fetch is broken" from "the draw state path is broken".
+        // Revert with the black-screen investigation.
+        if (program.stage == Shader::Stage::Fragment) {
+            static constexpr bool kForceConstantPs = false;
+            if (kForceConstantPs) {
+                code.assign(CONST_FRAGMENT_SPIRV,
+                            CONST_FRAGMENT_SPIRV + sizeof(CONST_FRAGMENT_SPIRV) / sizeof(u32));
+            }
+        }
+        if (program.stage == Shader::Stage::VertexA ||
+            program.stage == Shader::Stage::VertexB) {
+            static constexpr bool kForceBlitVs = false;
+            if (kForceBlitVs) {
+                static bool logged_force = false;
+                if (!logged_force) {
+                    logged_force = true;
+                    LOG_WARNING(Render_D3D12,
+                                "TEMP: forcing blit VS + constant PS for all pipelines");
+                }
+                code.assign(BLIT_VERTEX_SPIRV,
+                            BLIT_VERTEX_SPIRV + sizeof(BLIT_VERTEX_SPIRV) / sizeof(u32));
+            }
+        }
 
         ShaderMetadata metadata{};
         std::vector<u8> dxil = compiler.Compile({code.data(), code.size()},

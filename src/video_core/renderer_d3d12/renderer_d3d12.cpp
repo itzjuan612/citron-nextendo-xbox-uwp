@@ -411,6 +411,10 @@ void SetCaptureDirectory(std::string directory) {
     g_capture_directory = std::move(directory);
 }
 
+std::string GetCaptureDirectory() {
+    return g_capture_directory;
+}
+
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
                              Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
                              std::unique_ptr<Core::Frontend::GraphicsContext> context_)

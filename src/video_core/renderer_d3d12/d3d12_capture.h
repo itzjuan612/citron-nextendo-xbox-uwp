@@ -11,4 +11,8 @@ namespace D3D12 {
 /// "capture_off" file in this directory; only the newest captures are kept.
 void SetCaptureDirectory(std::string directory);
 
+/// TEMP DIAGNOSTIC (session 13): the active capture directory, reused to write translated
+/// shader (SPIR-V) dumps next to the BMP captures for offline inspection.
+[[nodiscard]] std::string GetCaptureDirectory();
+
 } // namespace D3D12

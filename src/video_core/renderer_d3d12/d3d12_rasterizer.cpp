@@ -185,6 +185,7 @@ D3D_PRIMITIVE_TOPOLOGY ToD3DTopology(Tegra::Engines::Maxwell3D::Regs::PrimitiveT
     case Topology::LineStripAdjacency:
         return D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ;
     case Topology::Triangles:
+        return D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     case Topology::TriangleStrip:
         return D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
     case Topology::TrianglesAdjacency:
@@ -227,6 +228,13 @@ D3D12_VIEWPORT MakeViewport(const Tegra::Engines::Maxwell3D::Regs& regs) {
     viewport.Height = height != 0.0f ? height : 1.0f;
     viewport.MinDepth = std::clamp(src.translate_z - src.scale_z * reduce_z, 0.0f, 1.0f);
     viewport.MaxDepth = std::clamp(src.translate_z + src.scale_z, 0.0f, 1.0f);
+    // Xbox D3D12 rasterizes nothing with a negative-height viewport, so the Y flip is
+    // applied by the translated shaders (DXIL_SPIRV_Y_FLIP_UNCONDITIONAL). Mirror the
+    // viewport to a positive height; the combined screen mapping is unchanged.
+    if (viewport.Height < 0.0f) {
+        viewport.TopLeftY += viewport.Height;
+        viewport.Height = -viewport.Height;
+    }
     return viewport;
 }
 
@@ -433,7 +441,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             LOG_WARNING(Render_D3D12,
                         "Draw RTs{}: gpu=[{}] ids=[{}] att=[{}] verts={} indexed={} "
                         "vp=({},{},{},{}) sc=({},{},{},{}) depth={} dfunc={} dsv={} cull_en={} "
-                        "cull_face={} poly={} fd={}",
+                        "cull_face={} poly={} fd={} ff={}",
                         renders_to_display ? " (FLINGER)" : "", rts, rts_ids, rts_att,
                         params.num_vertices, params.is_indexed ? 1 : 0, rt_vp.TopLeftX,
                         rt_vp.TopLeftY, rt_vp.Width, rt_vp.Height, rt_sc.left, rt_sc.top,
@@ -443,6 +451,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         stored.pipeline->State().cull_enable.Value(),
                         static_cast<u32>(stored.pipeline->State().CullFaceMode()),
                         static_cast<u32>(stored.pipeline->State().PolygonModeMode()),
+                        static_cast<u32>(stored.pipeline->State().FrontFaceMode()),
                         flinger_draw ? 1 : 0);
         }
         ++rt_logs;
@@ -737,6 +746,63 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             LOG_ERROR(Render_D3D12, "Image-buffer/image bindings bind as null for now");
         }
         const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        // TEMP DIAGNOSTIC (session 13): the composition draws execute but cover no pixels.
+        // Dump the guest constant buffers the translated stage declares and their raw bytes,
+        // so the VS's expected transform constants can be correlated with what the guest wrote.
+        if (flinger_draw) {
+            static u32 fd_cbuf_logs = 0;
+            if (fd_cbuf_logs < 12) {
+                ++fd_cbuf_logs;
+                std::string used;
+                for (u32 ci = 0; ci < Shader::Info::MAX_CBUFS; ++ci) {
+                    if (((info->constant_buffer_mask >> ci) & 1) != 0) {
+                        used += fmt::format("{}:{} ", ci, info->constant_buffer_used_sizes[ci]);
+                    }
+                }
+                LOG_WARNING(Render_D3D12,
+                            "FLINGER stage {}: cbuf_mask={:#x} used=[{}] nvn_base={} "
+                            "nvn_used={:#x}",
+                            stage, info->constant_buffer_mask, used, info->nvn_buffer_base,
+                            static_cast<u64>(info->nvn_buffer_used.to_ulong()));
+                for (u32 ci = 0; ci < Shader::Info::MAX_CBUFS; ++ci) {
+                    if (((info->constant_buffer_mask >> ci) & 1) == 0) {
+                        continue;
+                    }
+                    const auto& cb = cbufs[ci];
+                    const auto dev = gpu_memory->GpuToCpuAddress(cb.address);
+                    std::string hex;
+                    std::string flts;
+                    if (dev) {
+                        std::array<u8, 64> bytes{};
+                        const u32 dump_size =
+                            std::min<u32>(static_cast<u32>(bytes.size()), cb.size);
+                        const auto read = m_device_memory.ReadBlockUnsafe(
+                            *dev, bytes.data(), dump_size, "FLINGER.CBVDump", false);
+                        if (read.fully_mapped) {
+                            for (u32 i = 0; i < dump_size; ++i) {
+                                hex += fmt::format("{:02x}", bytes[i]);
+                            }
+                            for (u32 i = 0; i + 3 < dump_size; i += 4) {
+                                f32 v = 0.0f;
+                                std::memcpy(&v, bytes.data() + i, sizeof(v));
+                                flts += fmt::format("{} ", v);
+                            }
+                        } else {
+                            flts = "unmapped";
+                        }
+                    } else {
+                        flts = "no-dev";
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "FLINGER cbuf s{} i{}: gpu={:#x} dev={:#x} size={} used={} "
+                                "enabled={} hex={} f32=[{}]",
+                                stage, ci, static_cast<u64>(cb.address),
+                                dev ? static_cast<u64>(*dev) : 0, cb.size,
+                                info->constant_buffer_used_sizes[ci], cb.enabled ? 1 : 0, hex,
+                                flts);
+                }
+            }
+        }
         std::vector<VideoCommon::ImageViewInOut> views;
         std::vector<VideoCommon::SamplerId> sampler_ids;
         const auto read_handle = [&](const auto& desc, u32 index) {
@@ -1263,6 +1329,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                  FALSE, dsv.ptr != 0 ? &dsv : nullptr);
     }
 
+    // TEMP DIAGNOSTIC (session 13): coverage detector. Clear the composition target to
+    // magenta right before the draw; if the probe/present still shows magenta afterwards
+    // the draw covered no pixels, otherwise it wrote color. Revert with the investigation.
+    if (flinger_draw) {
+        static constexpr bool kMagentaCoverageDetector = false;
+        static u32 magenta_logs = 0;
+        if (kMagentaCoverageDetector) {
+            const f32 magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+            m_command_list.ClearRenderTargetView(rtvs[0], magenta);
+            if (magenta_logs < 4) {
+                ++magenta_logs;
+                LOG_WARNING(Render_D3D12, "FLINGER magenta clear (coverage detector) rt0={:#x}",
+                            rtvs[0].ptr);
+            }
+        }
+    }
+
     // Input assembly.
     bool topology_supported = true;
     const D3D_PRIMITIVE_TOPOLOGY topology = ToD3DTopology(
@@ -1355,14 +1438,53 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         continue;
                     }
                     const u32 slot = pipe_state.attributes[i].buffer.Value();
-                    attrs += fmt::format("[a{}:s{}]", i, slot);
+                    const auto& attr = pipe_state.attributes[i];
+                    attrs += fmt::format("[a{}:s{} off={} type={} size={} div={}]", i, slot,
+                                         attr.offset.Value(), static_cast<u32>(attr.Type()),
+                                         static_cast<u32>(attr.Size()),
+                                         pipe_state.binding_divisors[slot]);
                     if (slot < slot_seen.size() && !slot_seen[slot] &&
                         dump_count < dump_slots.size()) {
                         slot_seen[slot] = true;
                         dump_slots[dump_count++] = slot;
                     }
                 }
-                LOG_WARNING(Render_D3D12, "FLINGER attrs: {}", attrs);
+                LOG_WARNING(Render_D3D12, "FLINGER attrs: {} vb_slots={} instances={}", attrs,
+                            m_runtime.MaxVertexSlot(), params.num_instances);
+                // TEMP DIAGNOSTIC (session 13): the composition quad's index buffer, so the
+                // actual vertex order / winding is visible from the data.
+                if (index_binding.device_addr != 0 && index_binding.size != 0 &&
+                    index_binding.size <= 64) {
+                    std::array<u8, 64> ib_bytes{};
+                    const auto ib_read = m_device_memory.ReadBlockUnsafe(
+                        index_binding.device_addr, ib_bytes.data(), index_binding.size,
+                        "FLINGER.IBDump", false);
+                    if (ib_read.fully_mapped) {
+                        std::string ib_hex;
+                        std::string ib_vals;
+                        for (u32 i = 0; i < index_binding.size; ++i) {
+                            ib_hex += fmt::format("{:02x}", ib_bytes[i]);
+                        }
+                        if (index_binding.format == DXGI_FORMAT_R16_UINT) {
+                            for (u32 i = 0; i + 1 < index_binding.size; i += 2) {
+                                u16 v = 0;
+                                std::memcpy(&v, ib_bytes.data() + i, sizeof(v));
+                                ib_vals += fmt::format("{} ", v);
+                            }
+                        } else if (index_binding.format == DXGI_FORMAT_R32_UINT) {
+                            for (u32 i = 0; i + 3 < index_binding.size; i += 4) {
+                                u32 v = 0;
+                                std::memcpy(&v, ib_bytes.data() + i, sizeof(v));
+                                ib_vals += fmt::format("{} ", v);
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "FLINGER ib: dev={:#x} size={} fmt={} hex={} indices=[{}]",
+                                    static_cast<u64>(index_binding.device_addr),
+                                    index_binding.size, static_cast<u32>(index_binding.format),
+                                    ib_hex, ib_vals);
+                    }
+                }
                 const auto half_to_float = [](u16 h) -> f32 {
                     const u32 sign = (h >> 15) & 1U;
                     const u32 exp = (h >> 10) & 0x1FU;
@@ -1408,6 +1530,55 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 "FLINGER vb s{}: dev={:#x} size={} stride={} hex={} halves=[{}]",
                                 slot, static_cast<u64>(vb_addr), vb.SizeInBytes, vb.StrideInBytes,
                                 hex, halfs);
+                    // TEMP DIAGNOSTIC (session 13): read back the host (uploaded) vertex
+                    // buffer, to prove whether the IA actually fetches the guest bytes.
+                    ID3D12Resource* const vb_res = m_runtime.GetVertexBindingResource(slot);
+                    if (vb_res != nullptr && vb.BufferLocation != 0) {
+                        D3D12_HEAP_PROPERTIES heap_props{};
+                        heap_props.Type = D3D12_HEAP_TYPE_READBACK;
+                        D3D12_RESOURCE_DESC res_desc{};
+                        res_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                        res_desc.Width = 64;
+                        res_desc.Height = 1;
+                        res_desc.DepthOrArraySize = 1;
+                        res_desc.MipLevels = 1;
+                        res_desc.SampleDesc.Count = 1;
+                        res_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                        ComPtr<ID3D12Resource> readback;
+                        if (SUCCEEDED(m_device.GetDevice()->CreateCommittedResource(
+                                &heap_props, D3D12_HEAP_FLAG_NONE, &res_desc,
+                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                IID_PPV_ARGS(&readback)))) {
+                            const u64 rel =
+                                static_cast<u64>(vb.BufferLocation) -
+                                static_cast<u64>(vb_res->GetGPUVirtualAddress());
+                            const u32 copy_bytes = std::min<u32>(64, vb.SizeInBytes);
+                            m_command_list.Transition(vb_res, D3D12_RESOURCE_STATE_COMMON,
+                                                      D3D12_RESOURCE_STATE_COPY_SOURCE);
+                            m_command_list.Get()->CopyBufferRegion(readback.Get(), 0, vb_res, rel,
+                                                                   copy_bytes);
+                            m_command_list.Transition(vb_res, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+                            m_command_list.Execute(m_device);
+                            m_device.WaitForIdle();
+                            m_command_list.Reset();
+                            m_res_heap.Reset();
+                            m_sampler_heap.Reset();
+                            m_cbv_scratch_used = 0;
+                            void* mapped = nullptr;
+                            if (SUCCEEDED(readback->Map(0, nullptr, &mapped))) {
+                                std::string host_hex;
+                                const u8* const host_bytes = static_cast<const u8*>(mapped);
+                                for (u32 i = 0; i < copy_bytes; ++i) {
+                                    host_hex += fmt::format("{:02x}", host_bytes[i]);
+                                }
+                                LOG_WARNING(Render_D3D12,
+                                            "FLINGER host vb s{}: rel={:#x} bytes={} hex={}", slot,
+                                            rel, copy_bytes, host_hex);
+                                readback->Unmap(0, nullptr);
+                            }
+                        }
+                    }
                 }
             }
         }

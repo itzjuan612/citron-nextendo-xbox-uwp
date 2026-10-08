@@ -143,6 +143,13 @@ D3D12_STENCIL_OP StencilOp(u32 packed) {
 }
 
 D3D12_CULL_MODE CullMode(const FixedPipelineState& state) {
+    // TEMP DIAGNOSTIC (session 13): force-disabled culling, to test whether the composition
+    // draws cover no pixels because the negative-height viewport flips their winding.
+    // Revert once the coverage question is settled.
+    static constexpr bool kForceCullNone = false;
+    if (kForceCullNone) {
+        return D3D12_CULL_MODE_NONE;
+    }
     if (state.cull_enable == 0) {
         return D3D12_CULL_MODE_NONE;
     }
@@ -596,8 +603,13 @@ GraphicsPipeline::GraphicsPipeline(
         break;
     }
     rasterizer_desc.CullMode = CullMode(state);
+    // The guest (NVN) front face is defined in a lower-left, y-up window space. The
+    // viewport Y flip is applied by the translated shaders (conf.yz_flip) on top of a
+    // positive-height D3D viewport, which mirrors the screen-space winding relative to
+    // the guest value. Verified with a PC D3D12 repro of the composition draw: with the
+    // direct mapping every triangle is culled; inverting it draws.
     rasterizer_desc.FrontCounterClockwise =
-        state.FrontFaceMode() == Maxwell3D::Regs::FrontFace::CounterClockWise;
+        state.FrontFaceMode() != Maxwell3D::Regs::FrontFace::CounterClockWise;
     rasterizer_desc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
     rasterizer_desc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
     rasterizer_desc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;

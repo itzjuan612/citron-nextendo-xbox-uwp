@@ -156,7 +156,14 @@ std::vector<u8> ShaderCompiler::Translate(std::span<const u32> spirv, ShaderStag
     conf.push_constant_cbv = {30, 0};
     conf.first_vertex_and_base_instance_mode = DXIL_SPIRV_SYSVAL_TYPE_ZERO;
     conf.workgroup_id_mode = DXIL_SPIRV_SYSVAL_TYPE_NATIVE;
-    conf.yz_flip.mode = DXIL_SPIRV_YZ_FLIP_NONE;
+    // The guest (NVN) viewports use a lower-left window origin. On Xbox a D3D12
+    // negative-height viewport rasterizes nothing (verified 1.0.189.0: the identical
+    // state renders on PC while the magenta clear survives on console). Flip Y in the
+    // translated shader instead and use a mirrored positive-height viewport: the
+    // combined screen mapping is identical to the negative viewport, and it covers.
+    conf.yz_flip.mode = DXIL_SPIRV_Y_FLIP_UNCONDITIONAL;
+    conf.yz_flip.y_mask = 1;
+    conf.yz_flip.z_mask = 0;
     conf.declared_read_only_images_as_srvs = true;
     conf.inferred_read_only_images_as_srvs = true;
     conf.force_sample_rate_shading = false;

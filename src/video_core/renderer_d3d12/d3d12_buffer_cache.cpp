@@ -439,6 +439,8 @@ void BufferCacheRuntime::BindVertexBuffers(VideoCommon::HostBindings<Buffer>& bi
         }
         const Buffer* buffer = bindings.buffers[i];
         const bool is_null = IsNullResource(buffer ? buffer->Handle() : nullptr);
+        vertex_binding_resources[index] =
+            is_null ? null_buffer.Get() : (buffer ? buffer->Handle() : nullptr);
         vertex_bindings[index] = D3D12_VERTEX_BUFFER_VIEW{
             .BufferLocation =
                 is_null ? NullBufferGpuAddr() +

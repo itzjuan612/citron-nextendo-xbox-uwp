@@ -207,6 +207,12 @@ public:
         return vertex_bindings;
     }
 
+    /// TEMP DIAGNOSTIC (session 13): host resource backing a bound vertex slot, so the
+    /// uploaded bytes can be read back and compared with the guest's vertex data.
+    [[nodiscard]] ID3D12Resource* GetVertexBindingResource(u32 slot) const noexcept {
+        return slot < MAX_VERTEX_BUFFERS ? vertex_binding_resources[slot] : nullptr;
+    }
+
     [[nodiscard]] const std::vector<ResourceBinding>& GetResourceBindings() const noexcept {
         return resource_bindings;
     }
@@ -241,6 +247,7 @@ private:
 
     IndexBinding index_binding;
     std::array<D3D12_VERTEX_BUFFER_VIEW, MAX_VERTEX_BUFFERS> vertex_bindings{};
+    std::array<ID3D12Resource*, MAX_VERTEX_BUFFERS> vertex_binding_resources{};
     u32 max_vertex_slot{};
     std::vector<ResourceBinding> resource_bindings;
 
