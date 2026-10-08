@@ -418,6 +418,9 @@ NvResult nvhost_as_gpu::MapBufferEx(IoctlMapBufferEx& params) {
         mapping_map[params.offset] = mapping;
     }
 
+    LOG_DEBUG(Service_NVDRV,
+              "MapBufferEx result: handle={:#x} gpu_va={:#x} dev={:#x} size={:#x} flags={:#x}",
+              params.handle, params.offset, device_address, size, params.flags);
     return NvResult::Success;
 }
 

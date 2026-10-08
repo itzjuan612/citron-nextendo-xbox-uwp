@@ -184,6 +184,17 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) 
 
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind,
                             bool is_big_pages) {
+    // Diagnostic (session 12): every GMMU mapping created by ANY caller, so the origin of
+    // the display/rendering VAs (e.g. 0x5158f0000) is visible.
+    if (gpu_addr >= 0x500000000 && gpu_addr <= 0x530000000) {
+        static u32 gmmu_map_logs = 0;
+        if (gmmu_map_logs < 120) {
+            LOG_WARNING(Render_D3D12, "GMMU map: gpu={:#x} dev={:#x} size={:#x} big={} kind={}",
+                        static_cast<u64>(gpu_addr), static_cast<u64>(dev_addr),
+                        static_cast<u64>(size), is_big_pages, static_cast<u32>(kind));
+        }
+        ++gmmu_map_logs;
+    }
     if (is_big_pages) [[likely]] {
         return BigPageTableOp<EntryType::Mapped>(gpu_addr, dev_addr, size, kind);
     }

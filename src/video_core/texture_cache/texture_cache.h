@@ -833,6 +833,27 @@ std::pair<typename P::ImageView*, bool> TextureCache<P>::TryFindFramebufferImage
         valid_image_ids.push_back(map.image_id);
     }
 
+    {
+        // Diagnostic: list every cache image registered at the displayed CPU page, so the
+        // guest display hand-off (flinger buffer device address vs render GPU VA) is traceable.
+        static u64 fb_lookup_logs = 0;
+        const u64 log_index = fb_lookup_logs++;
+        if (log_index < 8 || log_index % 400 == 0) {
+            LOG_WARNING(Render_D3D12, "FB lookup cpu_addr={:#x}: {} image(s), frame_tick={}",
+                        cpu_addr, valid_image_ids.size(), frame_tick);
+            for (const ImageId id : valid_image_ids) {
+                const ImageBase& image = slot_images[id];
+                LOG_WARNING(Render_D3D12,
+                            "  image id={} gpu={:#x} cpu={:#x} tick={} fmt={:#x} {}x{} "
+                            "pitch={} bytes={} flags={:#x}",
+                            id.index, image.gpu_addr, image.cpu_addr, image.modification_tick,
+                            static_cast<u32>(image.info.format), image.info.size.width,
+                            image.info.size.height, image.info.pitch, image.guest_size_bytes,
+                            static_cast<u32>(image.flags));
+            }
+        }
+    }
+
     const auto view_format = [&]() {
         switch (config.pixel_format) {
         case Service::android::PixelFormat::Rgb565:
@@ -1483,6 +1504,19 @@ ImageId TextureCache<P>::InsertImage(const ImageInfo& info, GPUVAddr gpu_addr,
 
 template <class P>
 ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DAddr cpu_addr) {
+    // Diagnostic (session 12): trace creation of large (framebuffer-sized) images, to see
+    // which GPU/CPU addresses the display buffers are born under.
+    if (CalculateGuestSizeInBytes(info) >= 4 * 1024 * 1024) {
+        static u32 big_image_logs = 0;
+        if (big_image_logs < 40 || big_image_logs % 200 == 0) {
+            LOG_WARNING(Render_D3D12,
+                        "Big image create: gpu={:#x} cpu={:#x} {}x{} fmt={:#x} bytes={}",
+                        static_cast<u64>(gpu_addr), static_cast<u64>(cpu_addr), info.size.width,
+                        info.size.height, static_cast<u32>(info.format),
+                        CalculateGuestSizeInBytes(info));
+        }
+        ++big_image_logs;
+    }
     ImageInfo new_info = info;
     const size_t size_bytes = CalculateGuestSizeInBytes(new_info);
     const bool broken_views = runtime.HasBrokenTextureViewFormats();

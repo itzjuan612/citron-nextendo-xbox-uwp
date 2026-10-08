@@ -560,6 +560,33 @@ void Image::UploadMemory(ID3D12Resource* buffer, u64 offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    {
+        // Diagnostic (session 12): is the CPU-side staging (guest texel data) actually
+        // non-zero? Black rendering with zero staging means the guest read/upload path.
+        static u32 upload_probe_logs = 0;
+        if (upload_probe_logs < 24 && map.mapped_span.size() >= 64) {
+            ++upload_probe_logs;
+            const std::span<u8> span = map.mapped_span;
+            u32 min_value = 255;
+            u32 max_value = 0;
+            u64 sum = 0;
+            u32 nonzero = 0;
+            const size_t count = std::min<size_t>(4096, span.size());
+            for (size_t i = 0; i < count; ++i) {
+                const u32 value = span[i];
+                min_value = value < min_value ? value : min_value;
+                max_value = value > max_value ? value : max_value;
+                sum += value;
+                if (value != 0) {
+                    ++nonzero;
+                }
+            }
+            LOG_WARNING(Render_D3D12,
+                        "Tex upload data #{}: fmt={:#x} bytes={} min={} max={} sum={} nonzero={}",
+                        upload_probe_logs, static_cast<u32>(info.format), span.size(), min_value,
+                        max_value, sum, nonzero);
+        }
+    }
     if (!map.buffer) {
         // Staging allocation failed; skip the upload (the caller's
         // CPU-side state is still updated).
@@ -1462,6 +1489,12 @@ void TextureCacheRuntime::CopyImageMSAA(Image&, Image&, std::span<const ImageCop
     }
 }
 
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_blit_src;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_blit_dst;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_sampled;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
+
 bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view,
                                     ImageView& src_view,
                                     const VideoCommon::Region2D& dst_region,
@@ -1605,6 +1638,8 @@ bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     }
     Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    g_probe_blit_src = src_resource;
+    g_probe_blit_dst = dst_resource;
     return true;
 }
 

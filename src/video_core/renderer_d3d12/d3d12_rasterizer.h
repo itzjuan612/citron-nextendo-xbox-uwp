@@ -131,6 +131,7 @@ private:
     static constexpr u64 CBV_SCRATCH_SIZE = 1024 * 1024;
 
     Tegra::GPU& m_gpu;
+    Tegra::MaxwellDeviceMemoryManager& m_device_memory;
     Device& m_device;
     StagingBufferPool m_staging_pool;
     CommandList m_command_list;

@@ -186,6 +186,18 @@ private:
 /// device removal).
 void DumpRecentTextureUploads();
 
+/// TEMP DIAGNOSTIC (session 12): resources of the last accelerated Fermi2D blit, probed by
+/// the present path to verify that GPU image writes actually land in the resources. Held by
+/// ComPtr so a cache eviction cannot leave a dangling resource in the probe path.
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_blit_src;
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_blit_dst;
+
+/// TEMP DIAGNOSTIC (session 12): last 1080p scene target and last texture sampled by the
+/// composition (FLINGER) draw, probed by the present path.
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene;
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_sampled;
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
+
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
 
 /// Guest sampler state translated to a D3D12 sampler description. The draw translation

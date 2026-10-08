@@ -270,6 +270,13 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
         map_low_area();
     }
 
+    LOG_DEBUG(Service_NVDRV,
+              "PinHandle: handle={:#x} low_area={} vaddr={:#x} daddr={:#x} pin_va={:#x} "
+              "size={:#x} pins={} in_heap={} session={}",
+              handle, low_area_pin, handle_description->address, handle_description->d_address,
+              handle_description->pin_virt_address, handle_description->aligned_size,
+              handle_description->pins, handle_description->in_heap,
+              handle_description->session_id.id);
     handle_description->pins++;
     if (low_area_pin) {
         return static_cast<DAddr>(handle_description->pin_virt_address);

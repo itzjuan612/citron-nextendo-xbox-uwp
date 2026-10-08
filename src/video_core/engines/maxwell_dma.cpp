@@ -56,6 +56,23 @@ void MaxwellDMA::CallMultiMethod(u32 method, const u32* base_start, u32 amount,
 }
 
 void MaxwellDMA::Launch() {
+    {
+        // Diagnostic (session 12): is the copy engine used for the display hand-off, and
+        // which addresses does it touch?
+        static u32 dma_logs = 0;
+        if (dma_logs < 40 || dma_logs % 500 == 0) {
+            LOG_WARNING(Render,
+                        "DMA launch #{}: in=0x{:x} out=0x{:x} len=0x{:x} lines={} "
+                        "pitch_in=0x{:x} pitch_out=0x{:x} multi_line={} remap={} dtt={}",
+                        dma_logs, static_cast<GPUVAddr>(regs.offset_in),
+                        static_cast<GPUVAddr>(regs.offset_out), regs.line_length_in,
+                        regs.line_count, regs.pitch_in, regs.pitch_out,
+                        regs.launch_dma.multi_line_enable.Value(),
+                        regs.launch_dma.remap_enable.Value(),
+                        static_cast<u32>(regs.launch_dma.data_transfer_type.Value()));
+        }
+        ++dma_logs;
+    }
     LOG_TRACE(Render, "DMA copy 0x{:x} -> 0x{:x}", static_cast<GPUVAddr>(regs.offset_in),
               static_cast<GPUVAddr>(regs.offset_out));
 

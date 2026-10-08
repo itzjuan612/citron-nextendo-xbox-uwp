@@ -46,7 +46,8 @@ void ApplyUwpRuntimeSettings() {
     Settings::values.sink_id.SetValue(Settings::AudioEngine::XAudio2);
     Settings::values.audio_output_device_id.SetValue("auto");
     Settings::values.audio_input_device_id.SetValue("null");
-    Settings::values.log_filter.SetValue("*:Info Render.D3D12:Debug HW.GPU:Debug");
+    Settings::values.log_filter.SetValue(
+        "*:Info Render.D3D12:Debug HW.GPU:Debug Service.NVDRV:Debug");
 
     // No GPU NVDEC/ASTC on the D3D12 backend yet, and fastmem is disabled on UWP.
     Settings::values.nvdec_emulation.SetValue(Settings::NvdecEmulation::Cpu);

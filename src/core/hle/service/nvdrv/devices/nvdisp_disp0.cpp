@@ -58,6 +58,21 @@ void nvdisp_disp0::OnOpen(NvCore::SessionId session_id, DeviceFD fd) {}
 void nvdisp_disp0::OnClose(DeviceFD fd) {}
 
 void nvdisp_disp0::Composite(std::span<const Nvnflinger::HwcLayer> sorted_layers) {
+    // Diagnostic: what the guest display hand-off is actually told to present.
+    static u32 composite_logs = 0;
+    if (composite_logs < 8 || composite_logs % 300 == 0) {
+        LOG_INFO(Service_NVDRV, "Composite: {} layer(s)", sorted_layers.size());
+        for (const auto& layer : sorted_layers) {
+            LOG_INFO(Service_NVDRV,
+                     "  layer handle={:#x} addr={:#x} offset={:#x} {}x{} stride={} fmt={} "
+                     "z={} applet={}",
+                     layer.buffer_handle, nvmap.GetHandleAddress(layer.buffer_handle), layer.offset,
+                     layer.width, layer.height, layer.stride, static_cast<u32>(layer.format),
+                     layer.z_index, layer.is_applet);
+        }
+    }
+    ++composite_logs;
+
     std::vector<Tegra::FramebufferConfig> output_layers;
     std::vector<Service::Nvidia::NvFence> output_fences;
     output_layers.reserve(sorted_layers.size());

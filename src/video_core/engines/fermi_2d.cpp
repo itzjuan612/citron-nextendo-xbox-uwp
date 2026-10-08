@@ -58,8 +58,11 @@ void Fermi2D::ConsumeSinkImpl() {
 }
 
 void Fermi2D::Blit() {
-    LOG_DEBUG(HW_GPU, "called. source address=0x{:x}, destination address=0x{:x}",
-              regs.src.Address(), regs.dst.Address());
+    const auto src_cpu = memory_manager.GpuToCpuAddress(regs.src.Address());
+    const auto dst_cpu = memory_manager.GpuToCpuAddress(regs.dst.Address());
+    LOG_DEBUG(HW_GPU,
+              "called. source address=0x{:x} (cpu=0x{:x}), destination address=0x{:x} (cpu=0x{:x})",
+              regs.src.Address(), src_cpu.value_or(0), regs.dst.Address(), dst_cpu.value_or(0));
 
     if (regs.operation != Operation::SrcCopy) {
         LOG_WARNING(HW_GPU, "Operation is not SrcCopy ({}), skipping blit", static_cast<u32>(regs.operation));
@@ -121,8 +124,24 @@ void Fermi2D::Blit() {
     }
 
     memory_manager.FlushCaching();
-    if (!rasterizer->AccelerateSurfaceCopy(src, regs.dst, config)) {
+    const bool accelerated = rasterizer->AccelerateSurfaceCopy(src, regs.dst, config);
+    if (!accelerated) {
         sw_blitter->Blit(src, regs.dst, config);
+    }
+    // Diagnostic: is the guest's composition blit running on the GPU or the CPU fallback?
+    static u64 blit_total = 0;
+    static u64 blit_accelerated = 0;
+    ++blit_total;
+    if (accelerated) {
+        ++blit_accelerated;
+    }
+    if (blit_total <= 8 || blit_total % 500 == 0) {
+        LOG_INFO(HW_GPU,
+                 "Blit result #{}: accelerated={} total_accelerated={} "
+                 "dst=({},{})-({},{}) src=({},{})-({},{}) filter={}",
+                 blit_total, accelerated, blit_accelerated, config.dst_x0, config.dst_y0,
+                 config.dst_x1, config.dst_y1, config.src_x0, config.src_y0, config.src_x1,
+                 config.src_y1, static_cast<u32>(config.filter));
     }
 }
 

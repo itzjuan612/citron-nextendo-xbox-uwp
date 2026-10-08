@@ -3,11 +3,11 @@
 
 #include "video_core/renderer_d3d12/renderer_d3d12.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
-#include <array>
-#include <stdexcept>
+#include <fmt/format.h>
 
 #include "common/logging.h"
 #include "common/settings.h"
@@ -20,6 +20,206 @@
 #include "video_core/renderer_d3d12/d3d12_blit_shaders.h"
 
 namespace D3D12 {
+
+namespace {
+
+// TEMP DIAGNOSTIC (session 12): read back a 64x64 corner of the sampled display image,
+// to separate "the guest never wrote the presented buffer" from "the blit/present path
+// loses the content". 32-bit color formats only; capped after a few probes.
+struct ResourceProbe {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    Microsoft::WRL::ComPtr<ID3D12Resource> calibration;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> calibration_rtv_heap;
+    std::array<bool, 4> armed{};
+    u32 logged = 0;
+    u32 frames = 0;
+};
+
+ResourceProbe g_resource_probe;
+
+bool ProbeFrameWanted() {
+    const u32 frame = g_resource_probe.frames++;
+    return g_resource_probe.logged < 24 && (frame < 4 || frame % 240 == 0);
+}
+
+bool RecordResourceProbe(ID3D12Device* d3d, CommandList& command_list, u32 slot,
+                         ID3D12Resource* src) {
+    if (!src || slot >= g_resource_probe.armed.size()) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC desc = src->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 ||
+        desc.Height == 0) {
+        return false;
+    }
+    switch (desc.Format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R32_TYPELESS:
+        break;
+    default: {
+        static u32 reject_logs = 0;
+        if (reject_logs < 8) {
+            ++reject_logs;
+            LOG_WARNING(Render_D3D12, "Content probe slot {}: unsupported fmt={:#x} dim={}", slot,
+                        static_cast<u32>(desc.Format), static_cast<u32>(desc.Dimension));
+        }
+        return false;
+    }
+    }
+    constexpr u32 kMaxExtent = 16;
+    constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    constexpr u64 kSlotBytes = kRowPitch * kMaxExtent;
+    constexpr u32 kSlots = 4;
+    const u32 width = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Width));
+    const u32 height = static_cast<u32>(std::min<u64>(kMaxExtent, desc.Height));
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    if (!g_resource_probe.readback) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer_desc{};
+        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer_desc.Width = kSlotBytes * kSlots;
+        buffer_desc.Height = 1;
+        buffer_desc.DepthOrArraySize = 1;
+        buffer_desc.MipLevels = 1;
+        buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+        buffer_desc.SampleDesc.Count = 1;
+        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&g_resource_probe.readback)))) {
+            g_resource_probe.logged = 24;
+            return false;
+        }
+    }
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = g_resource_probe.readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = static_cast<u64>(slot) * kSlotBytes;
+    dst.PlacedFootprint.Footprint.Format = desc.Format;
+    dst.PlacedFootprint.Footprint.Width = width;
+    dst.PlacedFootprint.Footprint.Height = height;
+    dst.PlacedFootprint.Footprint.Depth = 1;
+    dst.PlacedFootprint.Footprint.RowPitch = static_cast<u32>(kRowPitch);
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+    D3D12_BOX box{};
+    box.left = 0;
+    box.top = 0;
+    box.front = 0;
+    box.right = width;
+    box.bottom = height;
+    box.back = 1;
+    command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, &box);
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    g_resource_probe.armed[slot] = true;
+    return true;
+}
+
+bool RecordCalibrationProbe(ID3D12Device* d3d, CommandList& command_list) {
+    constexpr u32 kExtent = 16;
+    if (!g_resource_probe.calibration) {
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC texture_desc{};
+        texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        texture_desc.Width = kExtent;
+        texture_desc.Height = kExtent;
+        texture_desc.DepthOrArraySize = 1;
+        texture_desc.MipLevels = 1;
+        texture_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        texture_desc.SampleDesc.Count = 1;
+        texture_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        texture_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &texture_desc,
+                                                D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                IID_PPV_ARGS(&g_resource_probe.calibration)))) {
+            return false;
+        }
+        D3D12_DESCRIPTOR_HEAP_DESC heap_desc{};
+        heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap_desc.NumDescriptors = 1;
+        if (FAILED(d3d->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(
+                                                       &g_resource_probe.calibration_rtv_heap)))) {
+            return false;
+        }
+        d3d->CreateRenderTargetView(
+            g_resource_probe.calibration.Get(), nullptr,
+            g_resource_probe.calibration_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        g_resource_probe.calibration_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    command_list.Transition(g_resource_probe.calibration.Get(), D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const f32 color[4] = {0.1f, 0.6f, 0.9f, 1.0f};
+    command_list.ClearRenderTargetView(rtv, color);
+    command_list.Transition(g_resource_probe.calibration.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            D3D12_RESOURCE_STATE_COMMON);
+    return RecordResourceProbe(d3d, command_list, 3, g_resource_probe.calibration.Get());
+}
+
+void LogResourceProbes() {
+    if (!g_resource_probe.readback) {
+        return;
+    }
+    constexpr u64 kRowPitch = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
+    constexpr u64 kSlotBytes = kRowPitch * 16;
+    constexpr u64 kAllBytes = kSlotBytes * 4;
+    static constexpr const char* kSlotNames[] = {"display", "scene", "any_sample", "calib"};
+    void* mapped = nullptr;
+    const D3D12_RANGE read_range{0, kAllBytes};
+    if (FAILED(g_resource_probe.readback->Map(0, &read_range, &mapped)) || mapped == nullptr) {
+        return;
+    }
+    const auto* const base = static_cast<const u8*>(mapped);
+    for (u32 slot = 0; slot < g_resource_probe.armed.size(); ++slot) {
+        if (!g_resource_probe.armed[slot]) {
+            continue;
+        }
+        g_resource_probe.armed[slot] = false;
+        const u8* const bytes = base + static_cast<u64>(slot) * kSlotBytes;
+        u32 min_value = 255;
+        u32 max_value = 0;
+        u64 sum = 0;
+        u32 nonzero = 0;
+        for (u32 y = 0; y < 16; ++y) {
+            const u8* row = bytes + y * kRowPitch;
+            for (u32 x = 0; x < 16 * 4; ++x) {
+                const u32 value = row[x];
+                min_value = value < min_value ? value : min_value;
+                max_value = value > max_value ? value : max_value;
+                sum += value;
+                if (value != 0) {
+                    ++nonzero;
+                }
+            }
+        }
+        LOG_WARNING(Render_D3D12, "Content probe #{} ({}): min={} max={} sum={} nonzero={}/{}",
+                    g_resource_probe.logged, kSlotNames[slot], min_value, max_value, sum, nonzero,
+                    16 * 16 * 4);
+    }
+    g_resource_probe.readback->Unmap(0, nullptr);
+    ++g_resource_probe.logged;
+}
+
+} // Anonymous namespace
 
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
                              Tegra::MaxwellDeviceMemoryManager& device_memory_, Tegra::GPU& gpu_,
@@ -242,6 +442,14 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
 
     command_list.Reset();
 
+    const bool probe_frame = ProbeFrameWanted();
+    if (probe_frame) {
+        RecordResourceProbe(device.GetDevice(), command_list, 0, info.view->Resource());
+        RecordResourceProbe(device.GetDevice(), command_list, 1, g_probe_scene.Get());
+        RecordResourceProbe(device.GetDevice(), command_list, 2, g_probe_any_sampled.Get());
+        RecordCalibrationProbe(device.GetDevice(), command_list);
+    }
+
     ID3D12Resource* back_buffer = swapchain.GetBackBuffer();
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = swapchain.GetBackBufferRtv();
 
@@ -328,6 +536,10 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     command_list.Transition(back_buffer, D3D12_RESOURCE_STATE_RENDER_TARGET,
                             D3D12_RESOURCE_STATE_PRESENT);
     command_list.Execute(device);
+    if (probe_frame) {
+        device.WaitForIdle();
+        LogResourceProbes();
+    }
 }
 
 std::vector<u8> RendererD3D12::GetAppletCaptureBuffer() {

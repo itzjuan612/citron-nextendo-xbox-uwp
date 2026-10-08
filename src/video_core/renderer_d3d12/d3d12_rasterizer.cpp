@@ -4,8 +4,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <type_traits>
+
+#include <fmt/format.h>
 
 #include "common/alignment.h"
 #include "video_core/control/channel_state.h"
@@ -25,6 +28,10 @@ constexpr bool kSkipDraws = false;
 // Temporary diagnostic: localize the device removal to a single draw by flushing after the
 // first few draws and checking GetDeviceRemovedReason, dumping full bindings for each.
 std::atomic<u32> g_diag_draws{0};
+
+// TEMP DIAGNOSTIC (session 12): resources of the images the frontend presents; ConfigureDraw
+// tags draws that render into them so the composition path is unmissable in the log.
+std::array<ID3D12Resource*, 6> g_display_resources{};
 
 // TEMP DIAGNOSTIC (session 11): split ConfigureDraw's state recording from the rest of the
 // frame. When true, ConfigureDraw returns right after the upload/binding stage walk, before
@@ -52,7 +59,8 @@ bool AccelerateDMA::BufferClear(GPUVAddr dst_address, u64 amount, u32 value) {
 RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
                                  Tegra::MaxwellDeviceMemoryManager& device_memory, Device& device,
                                  ShaderCompiler& shader_compiler)
-    : m_gpu{gpu}, m_device{device}, m_staging_pool{device}, m_command_list{device.GetDevice()},
+    : m_gpu{gpu}, m_device_memory{device_memory}, m_device{device}, m_staging_pool{device},
+      m_command_list{device.GetDevice()},
       m_runtime{device, m_command_list, m_staging_pool}, m_buffer_cache{device_memory, m_runtime},
       m_texture_runtime{device, m_command_list, m_staging_pool},
       m_texture_cache{m_texture_runtime, device_memory},
@@ -373,6 +381,73 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
     }
 
+    bool flinger_draw = false;
+    {
+        static bool marker_logged = false;
+        if (!marker_logged) {
+            marker_logged = true;
+            LOG_WARNING(Render_D3D12, "ConfigureDraw build marker: 174-flinger-dbg");
+        }
+        // Diagnostic (session 12): which images draws render into. The flinger display
+        // buffer GPU VAs must appear here if the guest draws its composed frame straight
+        // into the queued buffer.
+        static u32 rt_logs = 0;
+        bool renders_to_display = false;
+        std::string rts;
+        std::string rts_ids;
+        std::string rts_att;
+        for (size_t i = 0; i < num_rtvs; ++i) {
+            const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
+            const u64 addr = view ? static_cast<u64>(view->GpuAddr()) : 0;
+            ID3D12Resource* const res = view ? view->Resource() : nullptr;
+            bool is_display = false;
+            for (ID3D12Resource* const display_res : g_display_resources) {
+                if (display_res != nullptr && display_res == res) {
+                    is_display = true;
+                }
+            }
+            if (is_display) {
+                renders_to_display = true;
+            } else if (res != nullptr && view != nullptr && view->size.width >= 1920 &&
+                       view->size.height >= 1080) {
+                g_probe_scene = res;
+            }
+            rts += fmt::format("{}{:#x}", i == 0 ? "" : ",", addr);
+            rts_ids += fmt::format("{}{}:{}", i == 0 ? "" : ",", view ? view->image_id.index : 0,
+                                   static_cast<const void*>(res));
+            rts_att += fmt::format("{}{:#x}", i == 0 ? "" : ",",
+                                   stored.pipeline->State().attachments[i].raw);
+        }
+        flinger_draw = renders_to_display;
+        {
+            static u32 dbg_fd = 0;
+            if (dbg_fd < 3 || dbg_fd % 500 == 0) {
+                LOG_WARNING(Render_D3D12, "DBG-FD: fd={} rtd={}", flinger_draw ? 1 : 0,
+                            renders_to_display ? 1 : 0);
+            }
+            ++dbg_fd;
+        }
+        if (rt_logs < 400 || rt_logs % 1000 == 0 || renders_to_display) {
+            const D3D12_VIEWPORT rt_vp = MakeViewport(maxwell3d->regs);
+            const D3D12_RECT rt_sc = MakeScissor(maxwell3d->regs);
+            LOG_WARNING(Render_D3D12,
+                        "Draw RTs{}: gpu=[{}] ids=[{}] att=[{}] verts={} indexed={} "
+                        "vp=({},{},{},{}) sc=({},{},{},{}) depth={} dfunc={} dsv={} cull_en={} "
+                        "cull_face={} poly={} fd={}",
+                        renders_to_display ? " (FLINGER)" : "", rts, rts_ids, rts_att,
+                        params.num_vertices, params.is_indexed ? 1 : 0, rt_vp.TopLeftX,
+                        rt_vp.TopLeftY, rt_vp.Width, rt_vp.Height, rt_sc.left, rt_sc.top,
+                        rt_sc.right, rt_sc.bottom, stored.pipeline->State().depth_test_enable.Value(),
+                        stored.pipeline->State().depth_test_func.Value(),
+                        depth_view && depth_view->RenderTarget().ptr ? 1 : 0,
+                        stored.pipeline->State().cull_enable.Value(),
+                        static_cast<u32>(stored.pipeline->State().CullFaceMode()),
+                        static_cast<u32>(stored.pipeline->State().PolygonModeMode()),
+                        flinger_draw ? 1 : 0);
+        }
+        ++rt_logs;
+    }
+
     // NOTE: the index/vertex-range guards stay below, AFTER the buffer-binding section.
     // ClearDrawBindings() above wipes the index/vertex bindings and only
     // UpdateGraphicsBuffers/BindHostGeometryBuffers repopulate them, so those guards would
@@ -414,12 +489,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     m_buffer_cache.BindHostGeometryBuffers(is_indexed);
     m_texture_cache.SynchronizeGraphicsDescriptors();
 
+    {
+        static u32 dbg_a = 0;
+        const auto& dbg_ib = m_runtime.GetIndexBinding();
+        if (dbg_a < 4 || flinger_draw) {
+            if (dbg_a < 4) {
+                ++dbg_a;
+            }
+            LOG_WARNING(Render_D3D12,
+                        "DBG-A: fd={} indexed={} ib_valid={} ib_supported={} ib_size={} fmt={:#x}",
+                        flinger_draw ? 1 : 0, params.is_indexed ? 1 : 0, dbg_ib.valid,
+                        dbg_ib.supported, dbg_ib.size, static_cast<u32>(dbg_ib.format));
+        }
+    }
+
     // Index/vertex-range guards. These read the index/vertex bindings populated by
     // UpdateGraphicsBuffers/BindHostGeometryBuffers above, and they still precede every
     // command_list recording below (descriptor tables, RT transitions, OMSet, input
     // assembly, Draw).
     const auto& index_binding = m_runtime.GetIndexBinding();
     if (params.is_indexed && (!index_binding.valid || !index_binding.supported)) {
+        if (flinger_draw) {
+            static u32 silent_guard_logs = 0;
+            if (silent_guard_logs < 8) {
+                ++silent_guard_logs;
+                LOG_WARNING(Render_D3D12,
+                            "FLINGER draw skipped: index binding invalid/unsupported (valid={} "
+                            "supported={})",
+                            index_binding.valid, index_binding.supported);
+            }
+        }
         return;
     }
 
@@ -433,6 +532,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         } else if (index_binding.format == DXGI_FORMAT_R32_UINT) {
             index_elem_size = 4;
         } else {
+            if (flinger_draw) {
+                static u32 silent_fmt_logs = 0;
+                if (silent_fmt_logs < 8) {
+                    ++silent_fmt_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "FLINGER draw skipped: unsupported index format {:#x}",
+                                static_cast<u32>(index_binding.format));
+                }
+            }
             return;
         }
         const u64 index_required =
@@ -446,6 +554,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                           "Draw with out-of-bounds index range (first_index={} num_vertices={} "
                           "index_size={}) skipped",
                           params.first_index, params.num_vertices, index_binding.size);
+            }
+            if (flinger_draw) {
+                static u32 fd_idx_logs = 0;
+                if (fd_idx_logs < 4) {
+                    ++fd_idx_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "FLINGER skip: index range first_index={} verts={} size={}",
+                                params.first_index, params.num_vertices, index_binding.size);
+                }
             }
             return;
         }
@@ -480,6 +597,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                               "Draw with empty vertex-shader input (num_vertices={}) skipped",
                               params.num_vertices);
                 }
+                if (flinger_draw) {
+                    static u32 fd_vin_logs = 0;
+                    if (fd_vin_logs < 4) {
+                        ++fd_vin_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "FLINGER skip: empty vertex-shader input verts={}",
+                                    params.num_vertices);
+                    }
+                }
                 return;
             }
         }
@@ -488,11 +614,61 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 continue;
             }
             const D3D12_VERTEX_BUFFER_VIEW& view = vertex_bindings[slot];
-            const u64 vertex_required =
-                (static_cast<u64>(params.base_vertex) + static_cast<u64>(params.num_vertices)) *
-                static_cast<u64>(view.StrideInBytes);
+            // The vertex fetch range is governed by the largest index in the draw, not by
+            // the index count: a fullscreen quad is 6 indices over 4 vertices, so using
+            // the index count rejected every composition draw (black TV). Read the (small)
+            // index range from guest memory and bound by the actual maximum index.
+            constexpr u32 kMaxGuardIndices = 4096;
+            u64 vertex_required = 0;
+            bool range_known = false;
+            if (params.is_indexed && index_binding.device_addr != 0 &&
+                params.num_vertices <= kMaxGuardIndices &&
+                (index_binding.format == DXGI_FORMAT_R16_UINT ||
+                 index_binding.format == DXGI_FORMAT_R32_UINT)) {
+                const u32 index_bytes = index_binding.format == DXGI_FORMAT_R16_UINT ? 2 : 4;
+                std::array<u8, kMaxGuardIndices * 4> index_data{};
+                const DAddr read_addr = index_binding.device_addr +
+                                        static_cast<DAddr>(params.first_index) * index_bytes;
+                const auto read_result = m_device_memory.ReadBlockUnsafe(
+                    read_addr, index_data.data(),
+                    static_cast<size_t>(params.num_vertices) * index_bytes,
+                    "RasterizerD3D12.VertexRangeGuard", false);
+                if (read_result.fully_mapped) {
+                    u64 max_index = 0;
+                    for (u32 i = 0; i < params.num_vertices; ++i) {
+                        u64 value = 0;
+                        if (index_bytes == 2) {
+                            u16 v{};
+                            std::memcpy(&v, index_data.data() + i * 2, sizeof(v));
+                            value = v;
+                        } else {
+                            u32 v{};
+                            std::memcpy(&v, index_data.data() + i * 4, sizeof(v));
+                            value = v;
+                        }
+                        max_index = std::max(max_index, value);
+                    }
+                    vertex_required = (static_cast<u64>(params.base_vertex) + max_index + 1) *
+                                      static_cast<u64>(view.StrideInBytes);
+                    range_known = true;
+                }
+            }
+            bool enforce_range = true;
+            if (!range_known) {
+                if (params.is_indexed) {
+                    // Indexed draw whose index data cannot be inspected (e.g. guest u8
+                    // indices expanded into staging): the index count is not a vertex
+                    // bound, so never reject it here; the index-range guard above still
+                    // protects the index fetch itself.
+                    enforce_range = false;
+                } else {
+                    vertex_required = (static_cast<u64>(params.base_vertex) +
+                                       static_cast<u64>(params.num_vertices)) *
+                                      static_cast<u64>(view.StrideInBytes);
+                }
+            }
             if (view.BufferLocation == 0 || view.SizeInBytes == 0 || view.StrideInBytes == 0 ||
-                vertex_required > static_cast<u64>(view.SizeInBytes)) {
+                (enforce_range && vertex_required > static_cast<u64>(view.SizeInBytes))) {
                 static bool logged_vertex_range{};
                 if (!logged_vertex_range) {
                     logged_vertex_range = true;
@@ -500,6 +676,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                               "Draw with degenerate vertex view on read slot={} stride={} "
                               "vertex_size={} skipped",
                               slot, view.StrideInBytes, view.SizeInBytes);
+                }
+                if (flinger_draw) {
+                    static u32 fd_vb_logs = 0;
+                    if (fd_vb_logs < 4) {
+                        ++fd_vb_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "FLINGER skip: degenerate vb slot={} loc={:#x} stride={} "
+                                    "size={} base_vtx={} verts={} range_known={} dev={:#x} req={}",
+                                    slot, static_cast<u64>(view.BufferLocation),
+                                    view.StrideInBytes, view.SizeInBytes, params.base_vertex,
+                                    params.num_vertices, range_known ? 1 : 0,
+                                    static_cast<u64>(index_binding.device_addr), vertex_required);
+                    }
                 }
                 return;
             }
@@ -832,6 +1021,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             LOG_ERROR(Render_D3D12, "Descriptor heap exhausted (cbv={} res={}); draw skipped",
                       num_cbv, num_res);
         }
+        if (flinger_draw) {
+            static u32 fd_heap_logs = 0;
+            if (fd_heap_logs < 4) {
+                ++fd_heap_logs;
+                LOG_WARNING(Render_D3D12,
+                            "FLINGER skip: descriptor heap exhausted cbv={} res={}", num_cbv,
+                            num_res);
+            }
+        }
         return;
     }
     const u32 cbv_slot_base = heap_base;
@@ -1053,6 +1251,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         rtvs[i] = view ? view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
         transition_rt(view ? view->Resource() : nullptr, D3D12_RESOURCE_STATE_RENDER_TARGET);
     }
+
     const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
         depth_view ? depth_view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
     transition_rt(depth_view ? depth_view->Resource() : nullptr,
@@ -1097,12 +1296,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 
     m_query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                 regs.zpass_pixel_count_enable != 0);
+    {
+        static u32 executing_logs = 0;
+        if (executing_logs < 4 || flinger_draw) {
+            if (executing_logs < 4) {
+                ++executing_logs;
+            }
+            LOG_WARNING(Render_D3D12,
+                        "DBG-B: fd={} indexed={} verts={} first_idx={} base_vtx={} ib_valid={}",
+                        flinger_draw ? 1 : 0, params.is_indexed ? 1 : 0, params.num_vertices,
+                        params.first_index, params.base_vertex, index_binding.valid ? 1 : 0);
+        }
+    }
     if (params.is_indexed && index_binding.valid) {
         m_command_list.DrawIndexed(params.num_vertices, params.num_instances, params.first_index,
                                    static_cast<s32>(params.base_vertex), params.base_instance);
     } else {
         m_command_list.Draw(params.num_vertices, params.num_instances, params.base_vertex,
                             params.base_instance);
+    }
+
+    {
+        // Diagnostic (session 12): remember the first texture this draw samples, and log
+        // the sampled-slot summary for composition draws.
+        u32 sampled_slots = 0;
+        for (const DrawSlot& slot : res_slots) {
+            if (slot.kind != SlotKind::Sampled) {
+                continue;
+            }
+            ++sampled_slots;
+            ImageView& sampled_view = m_texture_cache.GetImageView(slot.view);
+            if (sampled_view.Resource() != nullptr) {
+                g_probe_any_sampled = sampled_view.Resource();
+                if (flinger_draw && !g_probe_sampled) {
+                    g_probe_sampled = sampled_view.Resource();
+                }
+            }
+        }
+        static u32 slot_logs = 0;
+        if (slot_logs < 8) {
+            ++slot_logs;
+            LOG_WARNING(Render_D3D12, "Draw slots: total={} sampled={} flinger={}",
+                        res_slots.size(), sampled_slots, flinger_draw ? 1 : 0);
+        }
     }
 
     // Restore render targets to the home state for later copies/blits.
@@ -1254,7 +1490,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     }
 }
 
-void RasterizerD3D12::DrawTexture() {}
+void RasterizerD3D12::DrawTexture() {
+    // The guest presents a composed texture with DrawTexture (mirrors the Vulkan path):
+    // the source image is copied into the current render target, i.e. the queued flinger
+    // buffer. This was an empty stub, so those display buffers were never written.
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
+    m_texture_cache.UpdateRenderTargets(false);
+    m_texture_cache.SynchronizeGraphicsDescriptors();
+    const auto& state = maxwell3d->draw_manager->GetDrawTextureState();
+    Framebuffer* const framebuffer = m_texture_cache.GetFramebuffer();
+    ImageView* const dst_view = framebuffer ? framebuffer->ColorBuffers()[0] : nullptr;
+    if (!dst_view || !dst_view->RenderTarget().ptr) {
+        return;
+    }
+    ImageView& src_view = m_texture_cache.GetImageView(state.src_texture);
+    if (src_view.IsBuffer()) {
+        return;
+    }
+    const VideoCommon::Region2D dst_region{
+        VideoCommon::Offset2D{static_cast<s32>(state.dst_x0), static_cast<s32>(state.dst_y0)},
+        VideoCommon::Offset2D{static_cast<s32>(state.dst_x1), static_cast<s32>(state.dst_y1)}};
+    const VideoCommon::Region2D src_region{
+        VideoCommon::Offset2D{static_cast<s32>(state.src_x0), static_cast<s32>(state.src_y0)},
+        VideoCommon::Offset2D{static_cast<s32>(state.src_x1), static_cast<s32>(state.src_y1)}};
+    const bool accelerated = m_texture_runtime.BlitImage(
+        framebuffer, *dst_view, src_view, dst_region, src_region,
+        Tegra::Engines::Fermi2D::Filter::Bilinear, Tegra::Engines::Fermi2D::Operation::SrcCopy);
+    if (!accelerated) {
+        m_texture_runtime.ConvertImage(framebuffer, *dst_view, src_view);
+    }
+    static u32 draw_texture_logs = 0;
+    if (draw_texture_logs < 20 || draw_texture_logs % 300 == 0) {
+        LOG_WARNING(Render_D3D12,
+                    "DrawTexture #{}: src_idx={} src={:#x} {}x{} dst=({},{})-({},{}) "
+                    "src_region=({},{})-({},{}) accelerated={}",
+                    draw_texture_logs, state.src_texture,
+                    static_cast<u64>(src_view.GpuAddr()), src_view.size.width, src_view.size.height,
+                    state.dst_x0, state.dst_y0, state.dst_x1, state.dst_y1, state.src_x0,
+                    state.src_y0, state.src_x1, state.src_y1, accelerated ? 1 : 0);
+    }
+    ++draw_texture_logs;
+}
 
 std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
     const Tegra::FramebufferConfig& config, DAddr framebuffer_addr, u32 pixel_stride) {
@@ -1276,6 +1552,43 @@ std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
                       config.stride, static_cast<u32>(config.pixel_format),
                       image_view ? "HIT" : "MISS");
         }
+    }
+    {
+        // Diagnostic (session 12): does the guest's DRAM backing of the presented device
+        // address actually contain the frame? (The texture-cache image can be stale.)
+        static u32 cpu_probe_logs = 0;
+        if (cpu_probe_logs < 24 || cpu_probe_logs % 300 == 0) {
+            const u8* const cpu_bytes =
+                gpu_memory ? gpu_memory->GetPointer<u8>(static_cast<VAddr>(framebuffer_addr))
+                           : nullptr;
+            if (cpu_bytes != nullptr) {
+                const size_t row_pitch = static_cast<size_t>(config.stride) * 4;
+                u32 min_value = 255;
+                u32 max_value = 0;
+                u64 sum = 0;
+                u32 nonzero = 0;
+                for (u32 y = 0; y < 64; ++y) {
+                    const u8* const row = cpu_bytes + y * row_pitch;
+                    for (u32 x = 0; x < 64 * 4; ++x) {
+                        const u32 value = row[x];
+                        min_value = value < min_value ? value : min_value;
+                        max_value = value > max_value ? value : max_value;
+                        sum += value;
+                        if (value != 0) {
+                            ++nonzero;
+                        }
+                    }
+                }
+                LOG_WARNING(Render_D3D12,
+                            "Display CPU probe: addr={:#x} min={} max={} sum={} nonzero={}/{}",
+                            static_cast<u64>(framebuffer_addr), min_value, max_value, sum, nonzero,
+                            64 * 64 * 4);
+            } else {
+                LOG_WARNING(Render_D3D12, "Display CPU probe: addr={:#x} unmapped",
+                            static_cast<u64>(framebuffer_addr));
+            }
+        }
+        ++cpu_probe_logs;
     }
     if (!image_view) {
         // Miss fallback: CPU-blitted scanout buffers are only registered in the texture
@@ -1422,6 +1735,13 @@ std::optional<AccelerateDisplayInfo> RasterizerD3D12::AccelerateDisplay(
     }
     if (!image_view) {
         return {};
+    }
+    {
+        // Diagnostic (session 12): remember the resources the frontend presents.
+        static u32 display_register = 0;
+        g_display_resources[display_register % g_display_resources.size()] =
+            image_view->Resource();
+        ++display_register;
     }
     m_query_cache.NotifySegment(false);
     (void)scaled; // Resolution scaling is disabled on the D3D12 backend for now.

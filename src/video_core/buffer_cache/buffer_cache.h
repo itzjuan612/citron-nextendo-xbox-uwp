@@ -720,7 +720,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
                     Tegra::Engines::Maxwell3D::Regs::IndexFormat::UnsignedShort,
                     draw_state.index_buffer.first, draw_state.index_buffer.count,
                     upload_staging.buffer, static_cast<u32>(upload_staging.offset),
-                    static_cast<u32>(static_cast<size_t>(elements) * sizeof(u16)));
+                    static_cast<u32>(static_cast<size_t>(elements) * sizeof(u16)), 0);
                 return;
             }
         }
@@ -747,7 +747,7 @@ void BufferCache<P>::BindHostIndexBuffer() {
         buffer.MarkUsage(offset, size);
         runtime.BindIndexBuffer(draw_state.topology, draw_state.index_buffer.format,
                                 draw_state.index_buffer.first, draw_state.index_buffer.count,
-                                buffer, offset, size);
+                                buffer, offset, size, channel_state->index_buffer.device_addr);
     }
 }
 
@@ -1642,6 +1642,32 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
                         buffer.CpuAddr(), buffer.SizeBytes(), device_addr, copy.src_offset,
                         copy.dst_offset, copy.size, total_size_bytes,
                         read_result.first_unmapped_address, read_result.unmapped_bytes, count);
+                }
+            }
+
+            {
+                // Diagnostic (session 12): is the uploaded guest buffer data non-zero?
+                static u32 buffer_upload_probe = 0;
+                if (buffer_upload_probe < 24 && copy.size >= 16) {
+                    ++buffer_upload_probe;
+                    u32 min_value = 255;
+                    u32 max_value = 0;
+                    u32 nonzero = 0;
+                    u64 sum = 0;
+                    const size_t count = std::min<size_t>(256, copy.size);
+                    for (size_t i = 0; i < count; ++i) {
+                        const u32 value = src_pointer[i];
+                        min_value = value < min_value ? value : min_value;
+                        max_value = value > max_value ? value : max_value;
+                        sum += value;
+                        if (value != 0) {
+                            ++nonzero;
+                        }
+                    }
+                    LOG_WARNING(HW_Memory,
+                                "Buffer upload data #{}: size={} min={} max={} sum={} nonzero={}/{}",
+                                buffer_upload_probe, copy.size, min_value, max_value, sum, nonzero,
+                                count);
                 }
             }
 

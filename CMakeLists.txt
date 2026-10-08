@@ -7,6 +7,8 @@ cmake_minimum_required(VERSION 3.22)
 # Set minimum CMake policy version
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 project(citron)
 
 # clang-cl + Ninja needs an explicit generic ASM rule for .s/.S sources.

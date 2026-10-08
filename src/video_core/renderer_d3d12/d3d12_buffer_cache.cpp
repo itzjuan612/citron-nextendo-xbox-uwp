@@ -357,7 +357,7 @@ void BufferCacheRuntime::ClearBuffer(ID3D12Resource* dest_buffer, u32 offset, si
 
 void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat index_format,
                                          u32 base_vertex, u32 num_indices, ID3D12Resource* buffer,
-                                         u32 offset, u32 size) {
+                                         u32 offset, u32 size, DAddr device_addr) {
     bool supported = true;
     if (topology == PrimitiveTopology::Quads || topology == PrimitiveTopology::QuadStrip) {
         if (!logged_quad_index) {
@@ -395,6 +395,7 @@ void BufferCacheRuntime::BindIndexBuffer(PrimitiveTopology topology, IndexFormat
         IsNullResource(buffer) ? static_cast<u32>(std::min<u64>(size, NULL_BUFFER_SIZE / 2)) : size;
     index_binding = IndexBinding{
         .address = address,
+        .device_addr = device_addr,
         .size = clamped_size,
         .first_index = base_vertex,
         .num_indices = num_indices,
