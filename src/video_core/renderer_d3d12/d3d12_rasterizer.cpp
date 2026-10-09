@@ -1518,8 +1518,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         // scene source, to locate where the visible 3D scene is lost.
         {
             static u32 s15_rt_logs = 0;
+            static std::chrono::steady_clock::time_point s15_rt_start =
+                std::chrono::steady_clock::now();
+            static bool s15_src_dumped = false;
             for (const DrawSlot& slot : res_slots) {
-                if (slot.kind != SlotKind::Sampled || s15_rt_logs >= 16) {
+                if (slot.kind != SlotKind::Sampled) {
                     continue;
                 }
                 ImageView& sv = m_texture_cache.GetImageView(slot.view);
@@ -1528,15 +1531,33 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                        (sv.size.width == 960 || sv.size.width >= 1920)))) {
                     continue;
                 }
-                ++s15_rt_logs;
-                const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
-                                       ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
-                                       : 0;
-                LOG_WARNING(Render_D3D12,
-                            "S15 RT sample: rt={:#x} src_img={} src_gpu={:#x} {}x{} fmt={:#x} "
-                            "depth={}",
-                            rt_gpu, sv.image_id.index, gpu, sv.size.width, sv.size.height,
-                            static_cast<u32>(sv.format), depth_view != nullptr ? 1 : 0);
+                if (s15_rt_logs < 64) {
+                    ++s15_rt_logs;
+                    const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
+                                           ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                                           : 0;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 RT sample: rt={:#x} src_img={} src_gpu={:#x} {}x{} fmt={:#x} "
+                                "depth={}",
+                                rt_gpu, sv.image_id.index, gpu, sv.size.width, sv.size.height,
+                                static_cast<u32>(sv.format), depth_view != nullptr ? 1 : 0);
+                }
+                // TEMP DIAGNOSTIC (session 15): the 1080p scene source is finally sampled only
+                // once the game is fully loaded; force a dump and a mid-frame capture of it
+                // after 20 minutes, when the under-lit frame is actually on screen.
+                const bool s15_src_late =
+                    std::chrono::steady_clock::now() - s15_rt_start > std::chrono::minutes(20);
+                if (s15_src_late && !s15_src_dumped &&
+                    sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                    sv.size.width >= 1920 && sv.Resource() != nullptr) {
+                    s15_src_dumped = true;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, sv.Resource(),
+                        static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                        sv.image_id.index, true);
+                    D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list,
+                                                        sv.Resource());
+                }
             }
         }
         // TEMP DIAGNOSTIC (session 15): the final compositor draw samples the 1080p
@@ -1895,6 +1916,62 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     s15_info->constant_buffer_used_sizes[ci],
                                     cb.enabled ? 1 : 0, nonzero_byte_count, flts);
                     }
+                }
+            }
+            // TEMP DIAGNOSTIC (session 15): the scene's lighting LUTs are small B10G11R11 /
+            // R16G16_FLOAT textures; dump the first draw that samples them and probe their
+            // guest memory, independent of the larger draw-latched dump above.
+            {
+                static bool s15_lut_dumped = false;
+                u32 s15_lut_slots = 0;
+                for (const DrawSlot& slot : res_slots) {
+                    if (s15_lut_dumped || slot.kind != SlotKind::Sampled || s15_lut_slots >= 4) {
+                        continue;
+                    }
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    const bool is_lut =
+                        (sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                         sv.size.width <= 512) ||
+                        sv.format == VideoCore::Surface::PixelFormat::R16G16_FLOAT;
+                    if (!is_lut) {
+                        continue;
+                    }
+                    ++s15_lut_slots;
+                    if (sv.Resource() != nullptr) {
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                            static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                            sv.image_id.index, true);
+                    }
+                    const auto dev = gpu_memory->GpuToCpuAddress(static_cast<GPUVAddr>(sv.GpuAddr()));
+                    std::array<u8, 64> lut_bytes{};
+                    u32 lut_nonzero = 0;
+                    u32 lut_read = 0;
+                    std::string lut_hex;
+                    if (dev) {
+                        const auto read = m_device_memory.ReadBlockUnsafe(
+                            *dev, lut_bytes.data(), lut_bytes.size(), "S15.LutProbe", false);
+                        if (read.fully_mapped) {
+                            lut_read = static_cast<u32>(lut_bytes.size());
+                            for (u32 i = 0; i < lut_read; ++i) {
+                                if (lut_bytes[i] != 0) {
+                                    ++lut_nonzero;
+                                }
+                                if (i < 32) {
+                                    lut_hex += fmt::format("{:02x}", lut_bytes[i]);
+                                }
+                            }
+                        }
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} dev={:#x} "
+                                "nz={}/{} hex={}",
+                                sv.image_id.index, static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                sv.size.height, static_cast<u32>(sv.format),
+                                dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex);
+                }
+                if (!s15_lut_dumped && s15_lut_slots > 0) {
+                    s15_lut_dumped = true;
                 }
             }
             if (scene3d_index < 8 ||
