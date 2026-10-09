@@ -248,6 +248,24 @@ FrameCapture g_frame_capture;
 FrameCapture g_scene3d_capture;
 std::string g_capture_directory;
 
+// TEMP DIAGNOSTIC (session 15): the 3D scene renders near-black, so dump the sampled textures the
+// scene draws read (most of them BC-compressed) to a BMP to see whether the guest source data
+// holds anything at all. One dump per image, capped, and written once the list that carried the
+// readback copy retires.
+struct TextureContentDump {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    u32 width = 0;
+    u32 height = 0;
+    u32 dxgi_format = 0;
+    u32 guest_format = 0;
+    u64 guest_addr = 0;
+    u32 image_index = 0;
+    bool armed = false;
+};
+
+std::vector<TextureContentDump> g_texture_dumps;
+
 bool CaptureWanted() {
     if (g_capture_directory.empty() || !Settings::values.uwp_frame_capture.GetValue()) {
         return false;
@@ -259,7 +277,7 @@ bool CaptureWanted() {
 void PruneCaptures() {
     constexpr size_t kKeep = 5;
     std::error_code ec;
-    std::vector<std::pair<u32, std::filesystem::path>> files;
+    std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>> files;
     for (const auto& entry : std::filesystem::directory_iterator{g_capture_directory, ec}) {
         if (!entry.is_regular_file(ec)) {
             continue;
@@ -275,7 +293,12 @@ void PruneCaptures() {
         if (result.ec != std::errc{}) {
             continue;
         }
-        files.emplace_back(index, entry.path());
+        const std::filesystem::file_time_type write_time =
+            std::filesystem::last_write_time(entry.path(), ec);
+        if (ec) {
+            continue;
+        }
+        files.emplace_back(write_time, entry.path());
     }
     std::sort(files.begin(), files.end(),
               [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -657,6 +680,431 @@ void WriteScene3dCapture() {
     g_scene3d_capture.readback->Unmap(0, nullptr);
 }
 
+// TEMP DIAGNOSTIC (session 15): block-compressed formats are laid out as 4x4 blocks, so a
+// full-mip readback covers block rows instead of pixel rows, and a row of blocks is not padded
+// like a row of pixels. Only the row count matters to bound the mapped readback.
+bool TextureFormatIsBlockCompressed(u32 dxgi_format) {
+    switch (dxgi_format) {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC1_TYPELESS:
+    case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB:
+    case DXGI_FORMAT_BC2_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+    case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC5_TYPELESS:
+    case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC6H_UF16:
+    case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB:
+    case DXGI_FORMAT_BC7_TYPELESS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void DecodeTextureToBgra(u32 dxgi_format, u32 width, u32 height, u32 row_pitch, size_t src_bytes,
+                         const u8* src, std::vector<u8>& dst) {
+    dst.assign(static_cast<size_t>(width) * height * 4, 0);
+    const auto write_pixel = [&](u32 x, u32 y, u32 b, u32 g, u32 r, u32 a) {
+        if (x >= width || y >= height) {
+            return;
+        }
+        u8* const pixel = dst.data() + (static_cast<size_t>(y) * width + x) * 4;
+        pixel[0] = static_cast<u8>(b);
+        pixel[1] = static_cast<u8>(g);
+        pixel[2] = static_cast<u8>(r);
+        pixel[3] = static_cast<u8>(a);
+    };
+    const auto blend = [](u32 a, u32 b, u32 weight_a, u32 weight_b) -> u32 {
+        const u32 total_weight = weight_a + weight_b;
+        const auto mix_channel = [&](u32 shift) -> u32 {
+            return (((a >> shift) & 0xFFu) * weight_a + ((b >> shift) & 0xFFu) * weight_b) /
+                   total_weight;
+        };
+        return mix_channel(0) | (mix_channel(8) << 8) | (mix_channel(16) << 16) |
+               (mix_channel(24) << 24);
+    };
+    const auto expand565 = [](u16 value) -> u32 {
+        const u32 b = ((value & 0x1Fu) * 255u) / 31u;
+        const u32 g = (((value >> 5) & 0x3Fu) * 255u) / 63u;
+        const u32 r = (((value >> 11) & 0x1Fu) * 255u) / 31u;
+        return b | (g << 8) | (r << 16) | 0xFF000000u;
+    };
+    const auto read_u16 = [](const u8* bytes) -> u16 {
+        return static_cast<u16>(static_cast<u16>(bytes[0]) | (static_cast<u16>(bytes[1]) << 8));
+    };
+    const auto read_u32 = [](const u8* bytes) -> u32 {
+        return static_cast<u32>(bytes[0]) | (static_cast<u32>(bytes[1]) << 8) |
+               (static_cast<u32>(bytes[2]) << 16) | (static_cast<u32>(bytes[3]) << 24);
+    };
+    const auto read_u48 = [](const u8* bytes) -> u64 {
+        u64 value = 0;
+        for (u32 i = 0; i < 6; ++i) {
+            value |= static_cast<u64>(bytes[i]) << (8 * i);
+        }
+        return value;
+    };
+    const auto read_f32 = [](const u8* bytes) -> float {
+        float value = 0.0f;
+        std::memcpy(&value, bytes, sizeof(value));
+        return value;
+    };
+    const auto to_byte = [](float value) -> u8 {
+        if (value < 0.0f) {
+            value = 0.0f;
+        } else if (value > 1.0f) {
+            value = 1.0f;
+        }
+        return static_cast<u8>(value * 255.0f + 0.5f);
+    };
+    const auto decode_unsigned_float = [](u32 value_bits, u32 mantissa_bits) -> float {
+        const u32 exponent = value_bits >> mantissa_bits;
+        if (exponent == 0) {
+            return 0.0f;
+        }
+        const u32 mantissa = value_bits & ((1u << mantissa_bits) - 1u);
+        float value =
+            1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits);
+        s32 power = static_cast<s32>(exponent) - 15;
+        while (power > 0) {
+            value *= 2.0f;
+            --power;
+        }
+        while (power < 0) {
+            value *= 0.5f;
+            ++power;
+        }
+        return value;
+    };
+    const auto decode_half = [](u16 bits) -> float {
+        const u32 sign = static_cast<u32>(bits) >> 15;
+        const u32 exponent = (static_cast<u32>(bits) >> 10) & 0x1Fu;
+        const u32 mantissa = static_cast<u32>(bits) & 0x3FFu;
+        float value = 0.0f;
+        if (exponent == 0) {
+            value = static_cast<float>(mantissa) / 1024.0f * 0.5f;
+        } else if (exponent == 31) {
+            value = mantissa != 0 ? 1.0f : 65504.0f;
+        } else {
+            value = 1.0f + static_cast<float>(mantissa) / 1024.0f;
+            s32 power = static_cast<s32>(exponent) - 15;
+            while (power > 0) {
+                value *= 2.0f;
+                --power;
+            }
+            while (power < 0) {
+                value *= 0.5f;
+                ++power;
+            }
+        }
+        return sign != 0 ? -value : value;
+    };
+    // BC4/BC5 red block and the alpha block of BC3 share the 3-bit indexed interpolation table.
+    const auto greyscale_palette = [](const u8* bytes) -> std::array<u32, 8> {
+        const u32 low = bytes[0];
+        const u32 high = bytes[1];
+        std::array<u32, 8> palette{};
+        palette[0] = low;
+        palette[1] = high;
+        if (low > high) {
+            for (u32 i = 2; i < 8; ++i) {
+                palette[i] = (low * (8 - i) + high * (i - 1)) / 7u;
+            }
+        } else {
+            palette[2] = (low * 4u + high) / 5u;
+            palette[3] = (low * 3u + high * 2u) / 5u;
+            palette[4] = (low * 2u + high * 3u) / 5u;
+            palette[5] = (low + high * 4u) / 5u;
+            palette[6] = 0;
+            palette[7] = 255;
+        }
+        return palette;
+    };
+    const auto decode_block_rows = [&](u32 block_bytes, const auto& decode_block) {
+        const u32 blocks_per_row = (width + 3) / 4;
+        const u32 block_rows = (height + 3) / 4;
+        for (u32 block_y = 0; block_y < block_rows; ++block_y) {
+            const size_t row_begin = static_cast<size_t>(block_y) * row_pitch;
+            if (row_begin + static_cast<size_t>(blocks_per_row) * block_bytes > src_bytes) {
+                break;
+            }
+            const u8* const src_row = src + row_begin;
+            for (u32 block_x = 0; block_x < blocks_per_row; ++block_x) {
+                decode_block(src_row + static_cast<size_t>(block_x) * block_bytes, block_x,
+                             block_y);
+            }
+        }
+    };
+    const auto decode_unpacked_rows = [&](u32 pixel_bytes, const auto& decode_pixel) {
+        for (u32 y = 0; y < height; ++y) {
+            const size_t row_begin = static_cast<size_t>(y) * row_pitch;
+            if (row_begin + static_cast<size_t>(width) * pixel_bytes > src_bytes) {
+                break;
+            }
+            const u8* const src_row = src + row_begin;
+            for (u32 x = 0; x < width; ++x) {
+                const size_t offset = static_cast<size_t>(x) * pixel_bytes;
+                if (offset + pixel_bytes > row_pitch) {
+                    break;
+                }
+                const u32 color = decode_pixel(src_row + offset);
+                write_pixel(x, y, color & 0xFFu, (color >> 8) & 0xFFu, (color >> 16) & 0xFFu,
+                            (color >> 24) & 0xFFu);
+            }
+        }
+    };
+    const auto decode_bc1_block = [&](const u8* block, bool has_alpha_block, u32 block_x,
+                                      u32 block_y) {
+        const u8* const color_block = has_alpha_block ? block + 8 : block;
+        const u16 color0 = read_u16(color_block);
+        const u16 color1 = read_u16(color_block + 2);
+        std::array<u32, 8> alphas{};
+        u64 alpha_indices = 0;
+        if (has_alpha_block) {
+            alphas = greyscale_palette(block);
+            alpha_indices = read_u48(block + 2);
+        }
+        std::array<u32, 4> palette{};
+        palette[0] = expand565(color0);
+        palette[1] = expand565(color1);
+        if (color0 > color1) {
+            palette[2] = blend(palette[0], palette[1], 2u, 1u);
+            palette[3] = blend(palette[0], palette[1], 1u, 2u);
+        } else {
+            palette[2] = blend(palette[0], palette[1], 1u, 1u);
+            palette[3] = 0u;
+        }
+        u32 indices = read_u32(color_block + 4);
+        for (u32 y = 0; y < 4; ++y) {
+            for (u32 x = 0; x < 4; ++x) {
+                const u32 index = indices & 3u;
+                indices >>= 2;
+                u32 alpha = 0xFFu;
+                if (has_alpha_block) {
+                    alpha = alphas[alpha_indices & 7u];
+                    alpha_indices >>= 3;
+                } else if (color0 <= color1 && index == 3) {
+                    alpha = 0u;
+                }
+                const u32 color = (palette[index] & 0x00FFFFFFu) | (alpha << 24);
+                write_pixel(block_x * 4 + x, block_y * 4 + y, color & 0xFFu, (color >> 8) & 0xFFu,
+                            (color >> 16) & 0xFFu, (color >> 24) & 0xFFu);
+            }
+        }
+    };
+    switch (dxgi_format) {
+    case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB:
+    case DXGI_FORMAT_BC1_TYPELESS:
+        decode_block_rows(8, [&](const u8* block, u32 block_x, u32 block_y) {
+            decode_bc1_block(block, false, block_x, block_y);
+        });
+        return;
+    case DXGI_FORMAT_BC3_UNORM:
+    case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC3_TYPELESS:
+        decode_block_rows(16, [&](const u8* block, u32 block_x, u32 block_y) {
+            decode_bc1_block(block, true, block_x, block_y);
+        });
+        return;
+    case DXGI_FORMAT_BC4_UNORM:
+    case DXGI_FORMAT_BC4_SNORM:
+    case DXGI_FORMAT_BC4_TYPELESS:
+        decode_block_rows(8, [&](const u8* block, u32 block_x, u32 block_y) {
+            const std::array<u32, 8> values = greyscale_palette(block);
+            u64 indices = read_u48(block + 2);
+            for (u32 y = 0; y < 4; ++y) {
+                for (u32 x = 0; x < 4; ++x) {
+                    const u32 value = values[indices & 7u];
+                    indices >>= 3;
+                    write_pixel(block_x * 4 + x, block_y * 4 + y, value, value, value, 0xFFu);
+                }
+            }
+        });
+        return;
+    case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM:
+    case DXGI_FORMAT_BC5_TYPELESS:
+        decode_block_rows(16, [&](const u8* block, u32 block_x, u32 block_y) {
+            const std::array<u32, 8> red = greyscale_palette(block);
+            const std::array<u32, 8> green = greyscale_palette(block + 8);
+            u64 indices = read_u48(block + 2);
+            u64 green_indices = read_u48(block + 10);
+            for (u32 y = 0; y < 4; ++y) {
+                for (u32 x = 0; x < 4; ++x) {
+                    const u32 r = red[indices & 7u];
+                    const u32 g = green[green_indices & 7u];
+                    indices >>= 3;
+                    green_indices >>= 3;
+                    write_pixel(block_x * 4 + x, block_y * 4 + y, r, g, r, 0xFFu);
+                }
+            }
+        });
+        return;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        decode_unpacked_rows(4, [](const u8* pixel) -> u32 {
+            return static_cast<u32>(pixel[2]) | (static_cast<u32>(pixel[1]) << 8) |
+                   (static_cast<u32>(pixel[0]) << 16) | (static_cast<u32>(pixel[3]) << 24);
+        });
+        return;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+    case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        decode_unpacked_rows(4, [](const u8* pixel) -> u32 {
+            return static_cast<u32>(pixel[0]) | (static_cast<u32>(pixel[1]) << 8) |
+                   (static_cast<u32>(pixel[2]) << 16) | (static_cast<u32>(pixel[3]) << 24);
+        });
+        return;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        decode_unpacked_rows(4, [&](const u8* pixel) -> u32 {
+            const u32 raw = read_u32(pixel);
+            const u32 b = to_byte(decode_unsigned_float((raw >> 22) & 0x3FFu, 5u));
+            const u32 g = to_byte(decode_unsigned_float((raw >> 11) & 0x7FFu, 6u));
+            const u32 r = to_byte(decode_unsigned_float(raw & 0x7FFu, 6u));
+            return b | (g << 8) | (r << 16) | 0xFF000000u;
+        });
+        return;
+    case DXGI_FORMAT_R16G16_FLOAT:
+        decode_unpacked_rows(4, [&](const u8* pixel) -> u32 {
+            const u32 r = to_byte(decode_half(read_u16(pixel)));
+            const u32 g = to_byte(decode_half(read_u16(pixel + 2)));
+            return (g << 8) | (r << 16) | 0xFF000000u;
+        });
+        return;
+    case DXGI_FORMAT_R16_FLOAT:
+        decode_unpacked_rows(2, [&](const u8* pixel) -> u32 {
+            const u32 value = to_byte(decode_half(read_u16(pixel)));
+            return value | (value << 8) | (value << 16) | 0xFF000000u;
+        });
+        return;
+    case DXGI_FORMAT_R32_FLOAT:
+        decode_unpacked_rows(4, [&](const u8* pixel) -> u32 {
+            const u32 value = to_byte(read_f32(pixel));
+            return value | (value << 8) | (value << 16) | 0xFF000000u;
+        });
+        return;
+    case DXGI_FORMAT_R8_UNORM:
+        decode_unpacked_rows(1, [](const u8* pixel) -> u32 {
+            const u32 value = pixel[0];
+            return value | (value << 8) | (value << 16) | 0xFF000000u;
+        });
+        return;
+    default: {
+        static bool no_decoder_logged = false;
+        if (!no_decoder_logged) {
+            no_decoder_logged = true;
+            LOG_WARNING(Render_D3D12, "Texture dump: no decoder for dxgi fmt {:#x}", dxgi_format);
+        }
+        decode_unpacked_rows(4, [](const u8* pixel) -> u32 {
+            const u32 value = pixel[0];
+            return value | (value << 8) | (value << 16) | 0xFF000000u;
+        });
+        return;
+    }
+    }
+}
+
+// TEMP DIAGNOSTIC (session 15): WriteFrameCapture for sampled textures: every armed entry is
+// logged, decoded and written as texdump_<entry>_img<image>.bmp next to the frame captures.
+void WriteTextureContentDumps() {
+    if (g_texture_dumps.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(g_capture_directory, ec);
+    for (size_t i = 0; i < g_texture_dumps.size(); ++i) {
+        TextureContentDump& entry = g_texture_dumps[i];
+        if (!entry.armed || !entry.readback) {
+            entry.armed = false;
+            continue;
+        }
+        entry.armed = false;
+        const u32 width = entry.width;
+        const u32 height = entry.height;
+        const u32 row_pitch = entry.footprint.Footprint.RowPitch;
+        const u32 row_count =
+            TextureFormatIsBlockCompressed(entry.dxgi_format) ? (height + 3) / 4 : height;
+        const size_t total_bytes = static_cast<size_t>(row_pitch) * row_count;
+        void* mapped = nullptr;
+        const D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
+        const HRESULT s15_map_hr = entry.readback->Map(0, &read_range, &mapped);
+        if (FAILED(s15_map_hr) || mapped == nullptr) {
+            LOG_WARNING(Render_D3D12, "Texture dump #{}: Map failed hr={:#x} (img={})", i,
+                        static_cast<u32>(s15_map_hr), entry.image_index);
+            continue;
+        }
+        const u8* const base = static_cast<const u8*>(mapped);
+        u32 min_value = 255;
+        u32 max_value = 0;
+        u64 nonzero = 0;
+        for (size_t offset = 0; offset < total_bytes; ++offset) {
+            const u32 value = base[offset];
+            min_value = value < min_value ? value : min_value;
+            max_value = value > max_value ? value : max_value;
+            if (value != 0) {
+                ++nonzero;
+            }
+        }
+        LOG_WARNING(Render_D3D12,
+                    "Texture dump #{} img={} guest_fmt=0x{:x} dxgi=0x{:x} {}x{} bytes={} "
+                    "nonzero={} min={} max={}",
+                    i, entry.image_index, entry.guest_format, entry.dxgi_format, width, height,
+                    total_bytes, nonzero, min_value, max_value);
+        std::vector<u8> pixels;
+        DecodeTextureToBgra(entry.dxgi_format, width, height, row_pitch, total_bytes, base,
+                            pixels);
+        const std::string path = g_capture_directory + "\\texdump_" + std::to_string(i) + "_img" +
+                                 std::to_string(entry.image_index) + ".bmp";
+        const u32 row_bytes = width * 4;
+        const u32 file_size = 54 + row_bytes * height;
+        std::array<u8, 54> header{};
+        header[0] = 'B';
+        header[1] = 'M';
+        std::memcpy(header.data() + 2, &file_size, 4);
+        const u32 pixel_offset = 54;
+        std::memcpy(header.data() + 10, &pixel_offset, 4);
+        const u32 dib_size = 40;
+        std::memcpy(header.data() + 14, &dib_size, 4);
+        std::memcpy(header.data() + 18, &width, 4);
+        const s32 bmp_height = static_cast<s32>(height);
+        std::memcpy(header.data() + 22, &bmp_height, 4);
+        const u16 planes = 1;
+        std::memcpy(header.data() + 26, &planes, 2);
+        const u16 bpp = 32;
+        std::memcpy(header.data() + 28, &bpp, 2);
+        const u32 image_size = row_bytes * height;
+        std::memcpy(header.data() + 34, &image_size, 4);
+        std::ofstream out{path, std::ios::binary};
+        if (out) {
+            out.write(reinterpret_cast<const char*>(header.data()), header.size());
+            for (s32 y = static_cast<s32>(height) - 1; y >= 0; --y) {
+                out.write(reinterpret_cast<const char*>(pixels.data() +
+                                                        static_cast<size_t>(y) * row_bytes),
+                          row_bytes);
+            }
+            LOG_WARNING(Render_D3D12, "Texture dump written: {} ({}x{})", path, width, height);
+        }
+        entry.readback->Unmap(0, nullptr);
+    }
+    // Keep the dedupe list in RecordTextureContentDump so an image is never dumped twice.
+    g_texture_dumps.clear();
+}
+
 } // Anonymous namespace
 
 void SetCaptureDirectory(std::string directory) {
@@ -674,9 +1122,69 @@ Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_ui;
 
 void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
                                   ID3D12Resource* src) {
-    if (g_scene3d_capture.index < 8) {
+    if (g_scene3d_capture.index < 16) {
         RecordScene3dCapture(d3d, command_list, src);
     }
+}
+
+bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src,
+                              u32 guest_format, u64 guest_addr, u32 image_index, bool force) {
+    static std::vector<std::pair<u64, u32>> seen;
+    if (!src || g_texture_dumps.size() >= 24) {
+        return false;
+    }
+    if (!force &&
+        std::find(seen.begin(), seen.end(), std::make_pair(guest_addr, image_index)) !=
+            seen.end()) {
+        return false;
+    }
+    const D3D12_RESOURCE_DESC desc = src->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 ||
+        desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
+        return false;
+    }
+    TextureContentDump entry;
+    UINT64 total_bytes = 0;
+    UINT rows = 0;
+    UINT64 row_size = 0;
+    d3d->GetCopyableFootprints(&desc, 0, 1, 0, &entry.footprint, &rows, &row_size, &total_bytes);
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = total_bytes;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            IID_PPV_ARGS(&entry.readback)))) {
+        return false;
+    }
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dst{};
+    dst.pResource = entry.readback.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint = entry.footprint;
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    src_loc.pResource = src;
+    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src_loc.SubresourceIndex = 0;
+    command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+    command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    entry.width = static_cast<u32>(desc.Width);
+    entry.height = static_cast<u32>(desc.Height);
+    entry.dxgi_format = static_cast<u32>(desc.Format);
+    entry.guest_format = guest_format;
+    entry.guest_addr = guest_addr;
+    entry.image_index = image_index;
+    entry.armed = true;
+    seen.emplace_back(guest_addr, image_index);
+    g_texture_dumps.push_back(std::move(entry));
+    return true;
 }
 
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
@@ -1027,6 +1535,12 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     if (g_scene3d_capture.index < 8 && g_scene3d_capture.armed) {
         device.WaitForIdle();
         WriteScene3dCapture();
+    }
+    // TEMP DIAGNOSTIC (session 15): sampled-texture dumps are recorded mid-frame, so their
+    // readbacks are complete once the list that carried the copy has executed.
+    if (!g_texture_dumps.empty()) {
+        device.WaitForIdle();
+        WriteTextureContentDumps();
     }
 }
 

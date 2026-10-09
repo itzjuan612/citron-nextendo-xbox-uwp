@@ -22,4 +22,11 @@ void SetCaptureDirectory(std::string directory);
 void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
                                   ID3D12Resource* src);
 
+/// TEMP DIAGNOSTIC (session 15): records a full-mip0 readback of a sampled texture so its
+/// content can be dumped to BMP (black scene diagnosis). One dump per image, total capped.
+/// Returns true when a dump was armed.
+bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src,
+                              u32 guest_format, u64 guest_addr, u32 image_index,
+                              bool force = false);
+
 } // namespace D3D12

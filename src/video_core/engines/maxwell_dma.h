@@ -261,6 +261,9 @@ private:
 
     void ReleaseSemaphore();
 
+    /// Invalidates the texture/buffer caches over a CPU-written guest memory region.
+    void InvalidateWritten(GPUVAddr dest, u64 size);
+
     void ConsumeSinkImpl() override;
 
     Core::System& system;

@@ -1514,6 +1514,141 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
             }
         }
+        // TEMP DIAGNOSTIC (session 15): who samples the 960x540 scene RT and the 1080p
+        // scene source, to locate where the visible 3D scene is lost.
+        {
+            static u32 s15_rt_logs = 0;
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind != SlotKind::Sampled || s15_rt_logs >= 16) {
+                    continue;
+                }
+                ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                const u64 gpu = static_cast<u64>(sv.GpuAddr());
+                if (!((sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                       (sv.size.width == 960 || sv.size.width >= 1920)))) {
+                    continue;
+                }
+                ++s15_rt_logs;
+                const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
+                                       ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                                       : 0;
+                LOG_WARNING(Render_D3D12,
+                            "S15 RT sample: rt={:#x} src_img={} src_gpu={:#x} {}x{} fmt={:#x} "
+                            "depth={}",
+                            rt_gpu, sv.image_id.index, gpu, sv.size.width, sv.size.height,
+                            static_cast<u32>(sv.format), depth_view != nullptr ? 1 : 0);
+            }
+        }
+        // TEMP DIAGNOSTIC (session 15): the final compositor draw samples the 1080p
+        // B10G11R11 scene source; log it (any vertex count) and dump that source once.
+        {
+            ImageView* const s15_comp_rt =
+                framebuffer != nullptr ? framebuffer->ColorBuffers()[0] : nullptr;
+            ID3D12Resource* const s15_comp_res =
+                s15_comp_rt != nullptr ? s15_comp_rt->Resource() : nullptr;
+            bool s15_has_scene_source = false;
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind != SlotKind::Sampled) {
+                    continue;
+                }
+                ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                if (sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                    sv.size.width >= 1920) {
+                    s15_has_scene_source = true;
+                }
+            }
+            const bool s15_final_rt =
+                s15_comp_res != nullptr && s15_comp_res->GetDesc().Width >= 1920 &&
+                s15_comp_res->GetDesc().Format == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+            if (s15_comp_res != nullptr && (s15_final_rt || s15_has_scene_source)) {
+                static u32 s15_comp_logs = 0;
+                // TEMP DIAGNOSTIC (session 15): the early dumps below run in the first
+                // frames, when the compositor may still sample the pre-style scene source;
+                // the forced dump 20 minutes in re-reads whatever B10G11R11 source it
+                // samples then, ignoring the per-image dedupe in RecordTextureContentDump.
+                static std::chrono::steady_clock::time_point s15_comp_start =
+                    std::chrono::steady_clock::now();
+                static bool s15_comp_late_dumped = false;
+                const u32 s15_comp_n = s15_comp_logs++;
+                // Recording must not depend on the log budget below: the compositor's
+                // rate limit (8 logs + every 4096th) can exhaust the budget long before
+                // the scene source appears, so the 1080p B10G11R11 source is captured
+                // unconditionally. The duplicate call inside the logging loop is harmless
+                // because RecordTextureContentDump dedupes per image.
+                u32 s15_comp_dumps = 0;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled || s15_comp_dumps >= 2) {
+                        continue;
+                    }
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    if (sv.Resource() != nullptr &&
+                        sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                        sv.size.width >= 1920) {
+                        const bool s15_comp_force =
+                            !s15_comp_late_dumped &&
+                            std::chrono::steady_clock::now() - s15_comp_start >
+                                std::chrono::minutes(20);
+                        if (s15_comp_force) {
+                            s15_comp_late_dumped = true;
+                        }
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                            static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                            sv.image_id.index, s15_comp_force);
+                    }
+                }
+                // TEMP DIAGNOSTIC (session 15): capture the 1080p scene source the compositor
+                // samples itself, so its pixels can be inspected as a BMP independently of
+                // the texture-content readback path above.
+                static bool s15_comp_captured = false;
+                if (!s15_comp_captured && s15_has_scene_source) {
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                        if (sv.Resource() != nullptr &&
+                            sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                            sv.size.width >= 1920) {
+                            s15_comp_captured = true;
+                            D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(),
+                                                                m_command_list, sv.Resource());
+                            break;
+                        }
+                    }
+                }
+                if (s15_comp_n < 8 || (s15_comp_n % 4096 == 0 && s15_comp_n < 32768)) {
+                    std::string s15_texs;
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                        s15_texs += fmt::format("[img={} gpu={:#x} {}x{} fmt={:#x} res={}]",
+                                                sv.image_id.index,
+                                                static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                                sv.size.height, static_cast<u32>(sv.format),
+                                                sv.Resource() ? 1 : 0);
+                        if (sv.Resource() != nullptr &&
+                            sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
+                            sv.size.width >= 1920) {
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, sv.Resource(),
+                                static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                                sv.image_id.index);
+                        }
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "S15 compositor draw: rt_gpu={:#x} rt_fmt={:#x} rt={}x{} verts={} "
+                                "blend={} textures={}",
+                                static_cast<u64>(s15_comp_rt->GpuAddr()),
+                                static_cast<u32>(s15_comp_res->GetDesc().Format),
+                                s15_comp_res->GetDesc().Width, s15_comp_res->GetDesc().Height,
+                                params.num_vertices,
+                                stored.pipeline->State().attachments[0].enable ? 1 : 0, s15_texs);
+                }
+            }
+        }
         if (flinger_draw) {
             static u32 flinger_tex_logs = 0;
             const u32 flinger_tex_count = flinger_tex_logs++;
@@ -1547,6 +1682,221 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         if (depth_view != nullptr && depth_view->RenderTarget().ptr) {
             static u32 scene3d_draw_logs = 0;
             const u32 scene3d_index = scene3d_draw_logs++;
+            // TEMP DIAGNOSTIC (session 15): dump the sampled textures and constant buffers of the
+            // first scene draw and of one late (style-phase) scene draw.
+            static std::chrono::steady_clock::time_point s15_start =
+                std::chrono::steady_clock::now();
+            static bool s15_early_tex_dump_done = false;
+            static bool s15_late_dump_done = false;
+            // The slot counts must be computed before the dump decision: the late dump has to
+            // latch onto a draw that actually samples several textures (the visible scene), not
+            // onto the first depth-tested draw that happens after the 20-minute mark.
+            u32 s15_sampled = 0;
+            u32 s15_texel = 0;
+            u32 s15_image_buffer = 0;
+            u32 s15_storage = 0;
+            u32 s15_image = 0;
+            for (const DrawSlot& slot : res_slots) {
+                switch (slot.kind) {
+                case SlotKind::Sampled:
+                    ++s15_sampled;
+                    break;
+                case SlotKind::TexelBuffer:
+                    ++s15_texel;
+                    break;
+                case SlotKind::ImageBuffer:
+                    ++s15_image_buffer;
+                    break;
+                case SlotKind::Storage:
+                    ++s15_storage;
+                    break;
+                case SlotKind::Image:
+                    ++s15_image;
+                    break;
+                }
+            }
+            const bool s15_late_phase =
+                std::chrono::steady_clock::now() - s15_start > std::chrono::minutes(20);
+            const bool s15_dump_now =
+                scene3d_index == 0 || (s15_sampled >= 5 && !s15_early_tex_dump_done) ||
+                (s15_late_phase && !s15_late_dump_done && s15_sampled >= 5);
+            if (s15_dump_now) {
+                if (scene3d_index != 0 && s15_sampled >= 5) {
+                    s15_early_tex_dump_done = true;
+                }
+                if (scene3d_index != 0 && s15_late_phase) {
+                    s15_late_dump_done = true;
+                }
+                LOG_WARNING(Render_D3D12,
+                            "S15 scene slots: total={} sampled={} texbuf={} imgbuf={} storage={} "
+                            "image={} late={}",
+                            res_slots.size(), s15_sampled, s15_texel, s15_image_buffer,
+                            s15_storage, s15_image, s15_late_phase ? 1 : 0);
+                for (u32 s15_rt = 0; s15_rt < num_rtvs && s15_rt < 4; ++s15_rt) {
+                    const auto& s15_att = stored.pipeline->State().attachments[s15_rt];
+                    LOG_WARNING(Render_D3D12,
+                                "S15 scene om rt{}: enable={} src={:#x} dst={:#x} eq={:#x} "
+                                "srcA={:#x} dstA={:#x} eqA={:#x} mask={:x} raw={:#x}",
+                                s15_rt, s15_att.enable ? 1 : 0,
+                                static_cast<u32>(s15_att.SourceRGBFactor()),
+                                static_cast<u32>(s15_att.DestRGBFactor()),
+                                static_cast<u32>(s15_att.EquationRGB()),
+                                static_cast<u32>(s15_att.SourceAlphaFactor()),
+                                static_cast<u32>(s15_att.DestAlphaFactor()),
+                                static_cast<u32>(s15_att.EquationAlpha()),
+                                static_cast<u32>(s15_att.mask_r ? 1 : 0) |
+                                    static_cast<u32>(s15_att.mask_g ? 2 : 0) |
+                                    static_cast<u32>(s15_att.mask_b ? 4 : 0) |
+                                    static_cast<u32>(s15_att.mask_a ? 8 : 0),
+                                s15_att.raw);
+                }
+                // TEMP DIAGNOSTIC (session 15): the vertex attributes and the raw vertex bytes
+                // of the dumped scene draw, so a wrong attribute stride/format/offset or a
+                // zeroed vertex buffer is visible from the data (mirrors the FLINGER dump).
+                {
+                    const auto& s15_pipe = stored.pipeline->State();
+                    std::string s15_attrs;
+                    std::array<bool, 32> s15_slot_seen{};
+                    std::array<u32, 2> s15_dump_slots{};
+                    u32 s15_dump_count = 0;
+                    for (u32 i = 0; i < s15_pipe.attributes.size(); ++i) {
+                        if (s15_pipe.attributes[i].enabled == 0) {
+                            continue;
+                        }
+                        const auto& attr = s15_pipe.attributes[i];
+                        const u32 slot = attr.buffer.Value();
+                        s15_attrs += fmt::format("[a{}:s{} off={} type={} size={} div={}]", i, slot,
+                                                 attr.offset.Value(),
+                                                 static_cast<u32>(attr.Type()),
+                                                 static_cast<u32>(attr.Size()),
+                                                 s15_pipe.binding_divisors[slot]);
+                        if (slot < s15_slot_seen.size() && !s15_slot_seen[slot] &&
+                            s15_dump_count < s15_dump_slots.size()) {
+                            s15_slot_seen[slot] = true;
+                            s15_dump_slots[s15_dump_count++] = slot;
+                        }
+                    }
+                    LOG_WARNING(Render_D3D12, "S15 scene attrs: {} vb_slots={} instances={}",
+                                s15_attrs, m_runtime.MaxVertexSlot(), params.num_instances);
+                    for (u32 d = 0; d < s15_dump_count; ++d) {
+                        const u32 slot = s15_dump_slots[d];
+                        const auto& vb = m_runtime.GetVertexBindings()[slot];
+                        const DAddr vb_addr = m_buffer_cache.GetVertexBufferDeviceAddress(slot);
+                        std::array<u8, 32> vb_bytes{};
+                        const u32 read_size =
+                            std::min<u32>(static_cast<u32>(vb_bytes.size()), vb.SizeInBytes);
+                        std::string hex;
+                        std::string floats;
+                        if (vb_addr != 0 && read_size >= 8) {
+                            const auto read = m_device_memory.ReadBlockUnsafe(
+                                vb_addr, vb_bytes.data(), read_size, "S15.SceneVB", false);
+                            if (read.fully_mapped) {
+                                for (u32 i = 0; i < read_size; ++i) {
+                                    hex += fmt::format("{:02x}", vb_bytes[i]);
+                                }
+                                for (u32 i = 0; i + 3 < read_size; i += 4) {
+                                    f32 v = 0.0f;
+                                    std::memcpy(&v, vb_bytes.data() + i, sizeof(v));
+                                    floats += fmt::format("{} ", v);
+                                }
+                            } else {
+                                floats = "unmapped";
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 scene vb s{}: dev={:#x} size={} stride={} hex={} "
+                                    "f32=[{}]",
+                                    slot, static_cast<u64>(vb_addr), vb.SizeInBytes,
+                                    vb.StrideInBytes, hex, floats);
+                    }
+                }
+                u32 s15_sampled_seen = 0;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled || s15_sampled_seen >= 8) {
+                        continue;
+                    }
+                    ++s15_sampled_seen;
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    if (sv.Resource() != nullptr) {
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                            static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                            sv.image_id.index);
+                    }
+                    const auto dev = gpu_memory->GpuToCpuAddress(static_cast<GPUVAddr>(sv.GpuAddr()));
+                    std::array<u8, 64> bytes{};
+                    u32 bytes_read = 0;
+                    u32 nonzero_byte_count = 0;
+                    std::string hex;
+                    if (dev) {
+                        const auto read = m_device_memory.ReadBlockUnsafe(
+                            *dev, bytes.data(), bytes.size(), "S15.TexProbe", false);
+                        if (read.fully_mapped) {
+                            bytes_read = static_cast<u32>(bytes.size());
+                            for (u32 i = 0; i < bytes_read; ++i) {
+                                if (bytes[i] != 0) {
+                                    ++nonzero_byte_count;
+                                }
+                                if (i < 32) {
+                                    hex += fmt::format("{:02x}", bytes[i]);
+                                }
+                            }
+                        }
+                    }
+                    const u32 s15_dxgi =
+                        sv.Resource() ? static_cast<u32>(sv.Resource()->GetDesc().Format) : 0;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 texprobe img={} gpu={:#x} fmt={:#x} dxgi={:#x} dev={:#x} "
+                                "nz={}/{} hex={}",
+                                sv.image_id.index, static_cast<u64>(sv.GpuAddr()),
+                                static_cast<u32>(sv.format), s15_dxgi,
+                                dev ? static_cast<u64>(*dev) : 0, nonzero_byte_count, bytes_read,
+                                hex);
+                }
+                for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
+                    const Shader::Info* s15_info = stored.infos[stage];
+                    if (s15_info == nullptr) {
+                        continue;
+                    }
+                    const auto& s15_cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+                    for (u32 ci = 0; ci < Shader::Info::MAX_CBUFS; ++ci) {
+                        if (((s15_info->constant_buffer_mask >> ci) & 1) == 0) {
+                            continue;
+                        }
+                        const auto& cb = s15_cbufs[ci];
+                        const auto dev = gpu_memory->GpuToCpuAddress(cb.address);
+                        std::array<u8, 64> bytes{};
+                        u32 nonzero_byte_count = 0;
+                        u32 bytes_read = 0;
+                        std::string flts = "unmapped";
+                        if (dev) {
+                            const auto read = m_device_memory.ReadBlockUnsafe(
+                                *dev, bytes.data(), bytes.size(), "S15.SceneCBV", false);
+                            if (read.fully_mapped) {
+                                bytes_read = static_cast<u32>(bytes.size());
+                                for (u32 i = 0; i < bytes_read; ++i) {
+                                    if (bytes[i] != 0) {
+                                        ++nonzero_byte_count;
+                                    }
+                                }
+                                flts.clear();
+                                for (u32 i = 0; i + 3 < bytes_read; i += 4) {
+                                    f32 v = 0.0f;
+                                    std::memcpy(&v, bytes.data() + i, sizeof(v));
+                                    flts += fmt::format("{} ", v);
+                                }
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 scene cbv s{} i{}: gpu={:#x} dev={:#x} size={} used={} "
+                                    "enabled={} nz={} f32=[{}]",
+                                    stage, ci, static_cast<u64>(cb.address),
+                                    dev ? static_cast<u64>(*dev) : 0, cb.size,
+                                    s15_info->constant_buffer_used_sizes[ci],
+                                    cb.enabled ? 1 : 0, nonzero_byte_count, flts);
+                    }
+                }
+            }
             if (scene3d_index < 8 ||
                 (scene3d_index % 256 == 0 && scene3d_index < 8192)) {
                 std::string texs;
@@ -2988,8 +3338,20 @@ void RasterizerD3D12::InvalidateRegion(DAddr addr, u64 size, VideoCommon::CacheT
     }
 }
 bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
-    std::scoped_lock lock{m_buffer_cache.mutex};
-    return m_buffer_cache.OnCPUWrite(addr, size);
+    if (addr == 0 || size == 0) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{m_buffer_cache.mutex};
+        if (m_buffer_cache.OnCPUWrite(addr, size)) {
+            return true;
+        }
+    }
+    {
+        std::scoped_lock lock{m_texture_cache.mutex};
+        m_texture_cache.WriteMemory(addr, size);
+    }
+    return false;
 }
 void RasterizerD3D12::OnCacheInvalidation(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {

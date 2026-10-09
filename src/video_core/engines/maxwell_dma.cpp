@@ -61,7 +61,7 @@ void MaxwellDMA::Launch() {
         // which addresses does it touch?
         static u32 dma_logs = 0;
         if (dma_logs < 40 || dma_logs % 500 == 0) {
-            LOG_WARNING(Render,
+            LOG_WARNING(Render_D3D12,
                         "DMA launch #{}: in=0x{:x} out=0x{:x} len=0x{:x} lines={} "
                         "pitch_in=0x{:x} pitch_out=0x{:x} multi_line={} remap={} dtt={}",
                         dma_logs, static_cast<GPUVAddr>(regs.offset_in),
@@ -110,6 +110,9 @@ void MaxwellDMA::Launch() {
                     regs.offset_out + static_cast<size_t>(line) * regs.pitch_out;
                 memory_manager.CopyBlock(dest_line, source_line, regs.line_length_in);
             }
+            InvalidateWritten(regs.offset_out,
+                              static_cast<u64>(regs.pitch_out) * regs.line_count +
+                                  regs.line_length_in);
         } else {
             if (!is_src_pitch && is_dst_pitch) {
                 CopyBlockLinearToPitch();
@@ -158,6 +161,7 @@ void MaxwellDMA::Launch() {
             }
 
             memory_manager.WriteBlockUnsafe(regs.offset_out, buffer_ptr, total_size);
+            InvalidateWritten(regs.offset_out, total_size);
         } else {
             memory_manager.FlushCaching();
             const auto convert_linear_2_blocklinear_addr = [](u64 address) {
@@ -181,6 +185,7 @@ void MaxwellDMA::Launch() {
                                          16, &read_buffer);
                     tmp_write_buffer.SetAddressAndSize(regs.offset_out + offset, 16);
                 }
+                InvalidateWritten(regs.offset_out, regs.line_length_in);
             } else if (is_src_pitch && !is_dst_pitch) {
                 UNIMPLEMENTED_IF(regs.line_length_in % 16 != 0);
                 UNIMPLEMENTED_IF(regs.offset_in % 16 != 0);
@@ -193,19 +198,36 @@ void MaxwellDMA::Launch() {
                     tmp_write_buffer.SetAddressAndSize(
                         convert_linear_2_blocklinear_addr(regs.offset_out + offset), 16);
                 }
+                InvalidateWritten(regs.offset_out, regs.line_length_in);
             } else {
                 if (!accelerate.BufferCopy(regs.offset_in, regs.offset_out, regs.line_length_in)) {
-                    Tegra::Memory::GpuGuestMemoryScoped<
-                        u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
-                        tmp_write_buffer(memory_manager, regs.offset_in, regs.line_length_in,
-                                         &read_buffer);
-                    tmp_write_buffer.SetAddressAndSize(regs.offset_out, regs.line_length_in);
+                    {
+                        Tegra::Memory::GpuGuestMemoryScoped<
+                            u8, Tegra::Memory::GuestMemoryFlags::SafeReadCachedWrite>
+                            tmp_write_buffer(memory_manager, regs.offset_in, regs.line_length_in,
+                                             &read_buffer);
+                        tmp_write_buffer.SetAddressAndSize(regs.offset_out, regs.line_length_in);
+                    }
                 }
+                InvalidateWritten(regs.offset_out, regs.line_length_in);
             }
         }
     }
 
     ReleaseSemaphore();
+}
+
+void MaxwellDMA::InvalidateWritten(GPUVAddr dest, u64 size) {
+    if (rasterizer == nullptr || size == 0) {
+        return;
+    }
+    const auto cpu_addr = memory_manager.GpuToCpuAddress(dest);
+    if (!cpu_addr) {
+        return;
+    }
+    rasterizer->InvalidateRegion(*cpu_addr, size,
+                                 VideoCommon::CacheType::TextureCache |
+                                     VideoCommon::CacheType::BufferCache);
 }
 
 void MaxwellDMA::CopyBlockLinearToPitch() {
@@ -275,6 +297,7 @@ void MaxwellDMA::CopyBlockLinearToPitch() {
     UnswizzleSubrect(tmp_write_buffer, tmp_read_buffer, bytes_per_pixel, width, height, depth,
                      x_offset, src_params.origin.y, x_elements, regs.line_count, block_height,
                      block_depth, dst_operand.pitch);
+    InvalidateWritten(dst_operand.address, dst_size);
 }
 
 void MaxwellDMA::CopyPitchToBlockLinear() {
@@ -340,6 +363,7 @@ void MaxwellDMA::CopyPitchToBlockLinear() {
     SwizzleSubrect(tmp_write_buffer, tmp_read_buffer, bytes_per_pixel, width, height, depth,
                    x_offset, dst_params.origin.y, x_elements, regs.line_count, block_height,
                    block_depth, regs.pitch_in);
+    InvalidateWritten(dst_addr, dst_size);
 }
 
 void MaxwellDMA::CopyBlockLinearToBlockLinear() {
@@ -397,6 +421,7 @@ void MaxwellDMA::CopyBlockLinearToBlockLinear() {
     SwizzleSubrect(tmp_write_buffer, intermediate_buffer, bytes_per_pixel, dst_width, dst.height,
                    dst.depth, dst_x_offset, dst.origin.y, x_elements, regs.line_count,
                    dst.block_size.height, dst.block_size.depth, pitch);
+    InvalidateWritten(regs.offset_out, dst_size);
 }
 
 void MaxwellDMA::ReleaseSemaphore() {
