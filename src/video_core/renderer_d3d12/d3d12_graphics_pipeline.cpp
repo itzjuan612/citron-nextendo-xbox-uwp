@@ -146,7 +146,7 @@ D3D12_STENCIL_OP StencilOp(u32 packed) {
 D3D12_CULL_MODE CullMode(const FixedPipelineState& state) {
     // TEMP DIAGNOSTIC (session 13): force-disabled culling, to test whether the composition
     // draws cover no pixels because the negative-height viewport flips their winding.
-    // Revert once the coverage question is settled.
+    // Session 14: tested true -> the 960x540 scene RT stayed black, so culling is not the cause.
     static constexpr bool kForceCullNone = false;
     if (kForceCullNone) {
         return D3D12_CULL_MODE_NONE;
@@ -665,6 +665,12 @@ GraphicsPipeline::GraphicsPipeline(
     depth_stencil_desc.DepthWriteMask =
         state.depth_write_enable != 0 ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     depth_stencil_desc.DepthFunc = ComparisonOp(state.depth_test_func.Value());
+    // TEMP DIAGNOSTIC (session 14): tested true -> the 960x540 scene RT stayed black, so the
+    // depth path is not the cause. Left disabled.
+    static constexpr bool kForceDepthAlways = false;
+    if (kForceDepthAlways && depth_stencil_desc.DepthEnable) {
+        depth_stencil_desc.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    }
     depth_stencil_desc.StencilEnable = state.stencil_enable != 0;
     depth_stencil_desc.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
     depth_stencil_desc.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;

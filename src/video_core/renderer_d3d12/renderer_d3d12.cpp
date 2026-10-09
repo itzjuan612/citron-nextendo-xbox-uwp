@@ -235,6 +235,8 @@ struct FrameCapture {
     u32 height = 0;
     u32 index = 0;
     u32 bytes_per_pixel = 4;
+    u32 dxgi_format = 0; // resource format, for packed-format decoding in the writer
+    const void* resource_ptr = nullptr;
     bool is_bgra = false;
     bool armed = false;
 };
@@ -366,6 +368,8 @@ bool RecordScene3dCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Re
     case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
     case DXGI_FORMAT_B8G8R8A8_TYPELESS:
         is_bgra = true;
+        g_scene3d_capture.bytes_per_pixel = 4;
+        g_scene3d_capture.dxgi_format = static_cast<u32>(desc.Format);
         break;
     case DXGI_FORMAT_R8G8B8A8_UNORM:
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -433,7 +437,9 @@ bool RecordScene3dCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Re
     command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     g_scene3d_capture.width = static_cast<u32>(desc.Width);
     g_scene3d_capture.height = desc.Height;
+    g_scene3d_capture.dxgi_format = static_cast<u32>(desc.Format);
     g_scene3d_capture.is_bgra = is_bgra;
+    g_scene3d_capture.resource_ptr = src;
     g_scene3d_capture.armed = true;
     return true;
 }
@@ -549,6 +555,79 @@ void WriteScene3dCapture() {
         const u8* const base = static_cast<const u8*>(mapped);
         std::vector<u8> row(row_bytes);
         const u32 pixel_bytes = g_scene3d_capture.bytes_per_pixel;
+        // Packed 4-byte colour formats (R11G11B10_FLOAT, R10G10B10A2, ...) cannot be byte-swizzled
+        // the way R8G8B8A8 can, so decode each pixel per the stored format into BMP-order B,G,R,A.
+        const u32 capture_format = g_scene3d_capture.dxgi_format;
+        // value_bits packs a 5-bit exponent above mantissa_bits; bias is 15 for both 11- and
+        // 10-bit unsuffixed floats. Subnormals are flushed to zero.
+        const auto decode_unsigned_float = [](u32 value_bits, u32 mantissa_bits) -> float {
+            const u32 exponent = value_bits >> mantissa_bits;
+            if (exponent == 0) {
+                return 0.0f;
+            }
+            const u32 mantissa = value_bits & ((1u << mantissa_bits) - 1u);
+            float value =
+                1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits);
+            s32 power = static_cast<s32>(exponent) - 15;
+            while (power > 0) {
+                value *= 2.0f;
+                --power;
+            }
+            while (power < 0) {
+                value *= 0.5f;
+                ++power;
+            }
+            return value;
+        };
+        const auto to_byte = [](float value) -> u8 {
+            if (value < 0.0f) {
+                value = 0.0f;
+            } else if (value > 1.0f) {
+                value = 1.0f;
+            }
+            return static_cast<u8>(value * 255.0f + 0.5f);
+        };
+        const auto convert_4bpp = [&](const u8* src, u8* dst) {
+            const u32 raw = static_cast<u32>(src[0]) | (static_cast<u32>(src[1]) << 8) |
+                            (static_cast<u32>(src[2]) << 16) |
+                            (static_cast<u32>(src[3]) << 24);
+            switch (capture_format) {
+            case DXGI_FORMAT_R11G11B10_FLOAT: {
+                const u32 r11 = raw & 0x7FFu;
+                const u32 g11 = (raw >> 11) & 0x7FFu;
+                const u32 b10 = (raw >> 22) & 0x3FFu;
+                dst[0] = to_byte(decode_unsigned_float(b10, 5u));
+                dst[1] = to_byte(decode_unsigned_float(g11, 6u));
+                dst[2] = to_byte(decode_unsigned_float(r11, 6u));
+                dst[3] = static_cast<u8>(255);
+                break;
+            }
+            case DXGI_FORMAT_R10G10B10A2_UNORM:
+            case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+            case DXGI_FORMAT_R10G10B10A2_UINT: {
+                const u32 r10 = raw & 0x3FFu;
+                const u32 g10 = (raw >> 10) & 0x3FFu;
+                const u32 b10 = (raw >> 20) & 0x3FFu;
+                const u32 a2 = (raw >> 30) & 0x3u;
+                dst[0] = static_cast<u8>(b10 * 255u / 1023u);
+                dst[1] = static_cast<u8>(g10 * 255u / 1023u);
+                dst[2] = static_cast<u8>(r10 * 255u / 1023u);
+                dst[3] = static_cast<u8>(a2 * 255u / 3u);
+                break;
+            }
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+                break;
+            default:
+                std::memcpy(dst, src, 4);
+                break;
+            }
+        };
         for (s32 y = static_cast<s32>(height) - 1; y >= 0; --y) {
             const u8* const src_row = base + static_cast<size_t>(y) * pitch;
             if (pixel_bytes == 8) {
@@ -564,17 +643,15 @@ void WriteScene3dCapture() {
             } else if (g_scene3d_capture.is_bgra) {
                 out.write(reinterpret_cast<const char*>(src_row), row_bytes);
             } else {
-                for (u32 x = 0; x < row_bytes; x += 4) {
-                    row[x] = src_row[x + 2];
-                    row[x + 1] = src_row[x + 1];
-                    row[x + 2] = src_row[x];
-                    row[x + 3] = src_row[x + 3];
+                for (u32 x = 0; x < width; ++x) {
+                    convert_4bpp(src_row + static_cast<size_t>(x) * 4, row.data() + x * 4);
                 }
                 out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
             }
         }
-        LOG_WARNING(Render_D3D12, "Scene3D capture written: {} ({}x{} bpp={})", path, width, height,
-                    pixel_bytes);
+        LOG_WARNING(Render_D3D12, "Scene3D capture written: {} ({}x{} bpp={} fmt={:#x} res={})",
+                    path, width, height, pixel_bytes, g_scene3d_capture.dxgi_format,
+                    g_scene3d_capture.resource_ptr);
         ++g_scene3d_capture.index;
     }
     g_scene3d_capture.readback->Unmap(0, nullptr);
@@ -588,6 +665,18 @@ void SetCaptureDirectory(std::string directory) {
 
 std::string GetCaptureDirectory() {
     return g_capture_directory;
+}
+
+// TEMP DIAGNOSTIC (session 14): render target of the latest fullscreen 6-vertex 1920x1080
+// draw (the compositor/UI target), set in ConfigureDraw and dumped by the mid-frame scene3d
+// capture (declared in d3d12_texture_cache.h).
+Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_ui;
+
+void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
+                                  ID3D12Resource* src) {
+    if (g_scene3d_capture.index < 8) {
+        RecordScene3dCapture(d3d, command_list, src);
+    }
 }
 
 RendererD3D12::RendererD3D12(Core::Frontend::EmuWindow& emu_window,
@@ -837,14 +926,6 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
                                capture_this >= 600 && (capture_this % 900) == 0;
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
-        // TEMP DIAGNOSTIC (session 14): the visible 3D scene only appears ~25 minutes into the
-        // boot, so the previous four snapshots (taken before present 3600) always came from the
-        // loading phase. Take up to 8 scene3d BMPs spaced every 3600 presents, starting at
-        // present 3600, so the visible-scene phase is sampled. RecordScene3dCapture is a no-op
-        // when a previous readback is still armed, so this can never double-record.
-        if (g_scene3d_capture.index < 8 && capture_this >= 3600 && (capture_this % 3600) == 0) {
-            RecordScene3dCapture(device.GetDevice(), command_list, g_probe_scene3d.Get());
-        }
     }
 
     ID3D12Resource* back_buffer = swapchain.GetBackBuffer();

@@ -15,6 +15,7 @@
 #include "video_core/dirty_flags.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_capture.h"
 #include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
@@ -453,6 +454,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 probe_vp.Width / probe_vp.Height);
                 }
             }
+            // TEMP DIAGNOSTIC (session 14): the 6-vertex 1920x1080 fullscreen draws are the
+            // compositor passes; track their render target so the mid-frame capture can dump it.
+            if (res != nullptr && params.num_vertices == 6 && probe_vp.Width >= 1900.0f &&
+                probe_vp.Height >= 1060.0f) {
+                g_probe_ui = res;
+            }
             rts += fmt::format("{}{:#x}", i == 0 ? "" : ",", addr);
             rts_ids += fmt::format("{}{}:{}", i == 0 ? "" : ",", view ? view->image_id.index : 0,
                                    static_cast<const void*>(res));
@@ -594,13 +601,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             (static_cast<u64>(params.first_index) + static_cast<u64>(params.num_vertices)) *
             static_cast<u64>(index_elem_size);
         if (index_required > static_cast<u64>(index_binding.size)) {
-            static bool logged_index_range{};
-            if (!logged_index_range) {
-                logged_index_range = true;
+            static u32 index_range_skips{};
+            if ((index_range_skips++ % 256) == 0) {
                 LOG_ERROR(Render_D3D12,
                           "Draw with out-of-bounds index range (first_index={} num_vertices={} "
-                          "index_size={}) skipped",
-                          params.first_index, params.num_vertices, index_binding.size);
+                          "index_size={}) skipped (count {})",
+                          params.first_index, params.num_vertices, index_binding.size,
+                          index_range_skips);
             }
             if (flinger_draw) {
                 static u32 fd_idx_logs = 0;
@@ -637,12 +644,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         if (num_read_slots == 0) {
             if (params.num_vertices > 0) {
-                static bool logged_empty_vs_input{};
-                if (!logged_empty_vs_input) {
-                    logged_empty_vs_input = true;
+                static u32 empty_vs_input_skips{};
+                if ((empty_vs_input_skips++ % 256) == 0) {
                     LOG_ERROR(Render_D3D12,
-                              "Draw with empty vertex-shader input (num_vertices={}) skipped",
-                              params.num_vertices);
+                              "Draw with empty vertex-shader input (num_vertices={}) skipped "
+                              "(count {})",
+                              params.num_vertices, empty_vs_input_skips);
                 }
                 if (flinger_draw) {
                     static u32 fd_vin_logs = 0;
@@ -716,13 +723,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
             if (view.BufferLocation == 0 || view.SizeInBytes == 0 || view.StrideInBytes == 0 ||
                 (enforce_range && vertex_required > static_cast<u64>(view.SizeInBytes))) {
-                static bool logged_vertex_range{};
-                if (!logged_vertex_range) {
-                    logged_vertex_range = true;
+                static u32 vertex_range_skips{};
+                if ((vertex_range_skips++ % 256) == 0) {
                     LOG_ERROR(Render_D3D12,
                               "Draw with degenerate vertex view on read slot={} stride={} "
-                              "vertex_size={} skipped",
-                              slot, view.StrideInBytes, view.SizeInBytes);
+                              "vertex_size={} skipped (count {})",
+                              slot, view.StrideInBytes, view.SizeInBytes, vertex_range_skips);
                 }
                 if (flinger_draw) {
                     static u32 fd_vb_logs = 0;
@@ -1089,6 +1095,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         return;
     }
 
+    {
+        // TEMP DIAGNOSTIC (session 14): count draws that passed the pre-state guards and are
+        // about to be recorded against the tracked scene RT, to split "guards skip the scene"
+        // from "the scene draws execute but write nothing".
+        static std::atomic<u32> scene_draw_passed{0};
+        ID3D12Resource* const scene_rt =
+            framebuffer != nullptr && num_rtvs > 0 && framebuffer->ColorBuffers()[0] != nullptr
+                ? framebuffer->ColorBuffers()[0]->Resource()
+                : nullptr;
+        if (scene_rt != nullptr && scene_rt == g_probe_scene3d.Get()) {
+            const u32 passed = scene_draw_passed.fetch_add(1, std::memory_order_relaxed);
+            if (passed < 8 || passed % 256 == 0) {
+                LOG_WARNING(Render_D3D12, "Scene RT draw passed guards #{} verts={} indexed={}",
+                            passed, params.num_vertices, params.is_indexed ? 1 : 0);
+            }
+        }
+    }
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
     m_command_list.SetPipelineState(pipeline->Get());
     ID3D12DescriptorHeap* heaps[] = {m_res_heap.Get(), m_sampler_heap.Get()};
@@ -1878,6 +1901,27 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         LOG_ERROR(Render_D3D12, "DIAG draw {}: post-flush device reason {:#x}", diag_index,
                   static_cast<u32>(diag_reason));
     }
+
+    {
+        // TEMP DIAGNOSTIC (session 14): record a scene3d readback copy right after a scene draw
+        // (mid-frame), so the copy executes before any post-composite clear of the scene RT.
+        // Alternate between the scene RT and the compositor's 1080p target.
+        static u32 scene3d_midframe_tick = 0;
+        static u32 scene3d_midframe_alt = 0;
+        ID3D12Resource* const midframe_scene_rt =
+            framebuffer != nullptr && num_rtvs > 0 && framebuffer->ColorBuffers()[0] != nullptr
+                ? framebuffer->ColorBuffers()[0]->Resource()
+                : nullptr;
+        if (midframe_scene_rt != nullptr && midframe_scene_rt == g_probe_scene3d.Get()) {
+            if ((scene3d_midframe_tick++ % 65536) == 0) {
+                ID3D12Resource* const target =
+                    (scene3d_midframe_alt++ % 2) == 0 ? midframe_scene_rt : g_probe_ui.Get();
+                if (target != nullptr) {
+                    RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list, target);
+                }
+            }
+        }
+    }
 }
 
 void RasterizerD3D12::DrawTexture() {
@@ -2357,9 +2401,10 @@ void RasterizerD3D12::DispatchCompute() {
     m_runtime.ClearDrawBindings();
     m_texture_cache.SynchronizeComputeDescriptors();
 
-    // Stage 1 compute binding: CBVs + storage buffers (raw SRV/UAV) only. Texture/image
-    // buffers, sampled textures and storage images bind as null placeholders for now, so
-    // the table order matches the shader's set-1 register allocation.
+    // Compute binding mirrors Vulkan::ComputePipeline::Configure: CBVs + storage buffers
+    // (raw SRV/UAV), texture/image buffers through the buffer cache, sampled textures from
+    // the compute TIC walk and storage images, so the tables line up with the shader's
+    // set-1 register allocation.
     VideoCommon::ComputeUniformBufferSizes sizes{};
     for (size_t i = 0; i < sizes.size(); ++i) {
         sizes[i] = info.constant_buffer_used_sizes[i];
@@ -2372,7 +2417,124 @@ void RasterizerD3D12::DispatchCompute() {
         m_buffer_cache.BindComputeStorageBuffer(ssbo_index++, desc.cbuf_index, desc.cbuf_offset,
                                                 desc.is_written);
     }
+
+    // Set-1 resource walk. The texture handles are read from the COMPUTE const buffers
+    // (the launch description's const buffer config, not the graphics shader stages),
+    // resolved into image views, and the texture/image buffers are bound through the
+    // buffer cache BEFORE the host-stage walk so their Texel records are appended in
+    // the shader's binding order.
+    const auto& cbufs = qmd.const_buffer_config;
+    const bool via_header = qmd.linked_tsc != 0;
+    const auto read_handle = [&](const auto& desc, u32 index) {
+        // The QMD only carries eight const buffers; a descriptor past that reads as an
+        // unbound handle instead of walking off the launch description.
+        if (desc.cbuf_index >= cbufs.size()) [[unlikely]] {
+            return TexturePair(u32{0}, via_header);
+        }
+        const u32 index_offset = index << desc.size_shift;
+        const u32 offset = desc.cbuf_offset + index_offset;
+        const GPUVAddr addr = cbufs[desc.cbuf_index].Address() + offset;
+        if constexpr (std::is_same_v<decltype(desc), const Shader::TextureDescriptor&> ||
+                      std::is_same_v<decltype(desc), const Shader::TextureBufferDescriptor&>) {
+            if (desc.has_secondary) {
+                if (desc.secondary_cbuf_index >= cbufs.size()) [[unlikely]] {
+                    return TexturePair(u32{0}, via_header);
+                }
+                const u32 second_offset = desc.secondary_cbuf_offset + index_offset;
+                const GPUVAddr separate_addr =
+                    cbufs[desc.secondary_cbuf_index].Address() + second_offset;
+                const u32 lhs_raw = gpu_memory->Read<u32>(addr) << desc.shift_left;
+                const u32 rhs_raw =
+                    gpu_memory->Read<u32>(separate_addr) << desc.secondary_shift_left;
+                const u32 raw = lhs_raw | rhs_raw;
+                return TexturePair(raw, via_header);
+            }
+        }
+        return TexturePair(gpu_memory->Read<u32>(addr), via_header);
+    };
+    std::vector<VideoCommon::ImageViewInOut> views;
+    std::vector<VideoCommon::SamplerId> sampler_ids;
+    u32 texbuf_total = 0;
+    u32 texbuf_resolved = 0;
+    u32 imgbuf_total = 0;
+    u32 imgbuf_resolved = 0;
+    u32 tex_total = 0;
+    u32 tex_resolved = 0;
+    u32 img_total = 0;
+    u32 img_resolved = 0;
+    const auto add_image = [&](const auto& desc, bool blacklist) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            views.push_back({
+                .index = handle.first,
+                .blacklist = blacklist,
+                .id = {},
+            });
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        texbuf_total += desc.count;
+        add_image(desc, false);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        imgbuf_total += desc.count;
+        add_image(desc, false);
+    }
+    const size_t sampled_views_begin = views.size();
+    for (const auto& desc : info.texture_descriptors) {
+        for (u32 index = 0; index < desc.count; ++index) {
+            const auto handle = read_handle(desc, index);
+            views.push_back(VideoCommon::ImageViewInOut{.index = handle.first});
+            sampler_ids.push_back(handle.first == 0
+                                       ? VideoCommon::NULL_SAMPLER_ID
+                                       : m_texture_cache.GetComputeSamplerId(handle.second));
+            ++tex_total;
+        }
+    }
+    const size_t sampled_views_end = views.size();
+    for (const auto& desc : info.image_descriptors) {
+        img_total += desc.count;
+        add_image(desc, desc.is_written);
+    }
+    m_texture_cache.FillComputeImageViews(std::span(views.data(), views.size()));
+    {
+        // Per-category resolved counts for the bind diagnostic below.
+        const auto count_resolved = [&](size_t begin, size_t end) {
+            u32 resolved = 0;
+            for (size_t i = begin; i < end && i < views.size(); ++i) {
+                if (views[i].id != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                    ++resolved;
+                }
+            }
+            return resolved;
+        };
+        texbuf_resolved = count_resolved(0, texbuf_total);
+        imgbuf_resolved = count_resolved(texbuf_total, texbuf_total + imgbuf_total);
+        tex_resolved = count_resolved(sampled_views_begin, sampled_views_end);
+        img_resolved = count_resolved(sampled_views_end, views.size());
+    }
+
     m_buffer_cache.UnbindComputeTextureBuffers();
+    size_t tbo_index = 0;
+    const auto add_buffer = [&](const auto& desc, bool is_image) {
+        bool is_written = false;
+        if constexpr (std::is_same_v<decltype(desc), const Shader::ImageBufferDescriptor&>) {
+            is_written = desc.is_written;
+        }
+        for (u32 i = 0; i < desc.count; ++i) {
+            const ImageView& buffer_view = m_texture_cache.GetImageView(views[tbo_index].id);
+            m_buffer_cache.BindComputeTextureBuffer(tbo_index, buffer_view.GpuAddr(),
+                                                   buffer_view.BufferSize(), buffer_view.format,
+                                                   is_written, is_image);
+            ++tbo_index;
+        }
+    };
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        add_buffer(desc, false);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        add_buffer(desc, true);
+    }
 
     m_buffer_cache.UpdateComputeBuffers();
     m_buffer_cache.BindHostComputeBuffers();
@@ -2381,6 +2543,7 @@ void RasterizerD3D12::DispatchCompute() {
     std::vector<u32> cbv_records;
     std::vector<u32> storage_records;
     std::vector<bool> storage_written;
+    std::vector<u32> texel_records;
     for (size_t i = 0; i < bindings.size(); ++i) {
         const auto& record = bindings[i];
         if (record.kind == BufferCacheRuntime::BindingKind::Uniform) {
@@ -2388,31 +2551,82 @@ void RasterizerD3D12::DispatchCompute() {
         } else if (record.kind == BufferCacheRuntime::BindingKind::Storage) {
             storage_records.push_back(static_cast<u32>(i));
             storage_written.push_back(record.is_written);
+        } else {
+            texel_records.push_back(static_cast<u32>(i));
         }
     }
 
-    // Set-1 slot order: storage buffers first (records in bind order), then null
-    // placeholders for texture buffers, image buffers, sampled textures, storage images.
-    // This is the order CreateComputePipeline built the root signature from, so the SRV
-    // and UAV tables line up with the shader's space-1 registers.
+    // Set-1 slot order, following the shader's binding allocation: storage buffers first
+    // (records in bind order), then texture buffers (buffer-cache Texel records), image
+    // buffers, sampled textures (views + samplers from the compute TIC/TSC walk) and
+    // storage images. This is the order CreateComputePipeline built the root signature
+    // from, so the SRV and UAV tables line up with the shader's space-1 registers.
+    enum class ResKind : u8 {
+        Storage,     // SSBO: SRV when read-only, UAV when written
+        TexelBuffer, // texture buffer bound through the buffer cache
+        ImageBuffer, // image buffer bound through the buffer cache
+        Sampled,     // sampled texture from the compute TIC walk
+        Image,       // storage image
+    };
     struct ResSlot {
-        u32 record{0xFFFFFFFFu}; // index into bindings for storage; 0xFFFFFFFF = null
+        ResKind kind{};
+        u32 record{0xFFFFFFFFu}; // index into bindings for storage/texel; 0xFFFFFFFF = null
         bool is_written{};
-        bool is_image{}; // needs a UAV descriptor rather than an SRV (null either way here)
+        VideoCommon::ImageViewId view{VideoCommon::NULL_IMAGE_VIEW_ID};
+        VideoCommon::SamplerId sampler{VideoCommon::NULL_SAMPLER_ID};
     };
     std::vector<ResSlot> res_slots;
     for (size_t i = 0; i < storage_records.size(); ++i) {
-        res_slots.push_back(ResSlot{storage_records[i], storage_written[i], false});
+        res_slots.push_back(ResSlot{
+            .kind = ResKind::Storage,
+            .record = storage_records[i],
+            .is_written = storage_written[i],
+        });
     }
-    const auto add_null_slots = [&](size_t count, bool is_image) {
-        for (size_t i = 0; i < count; ++i) {
-            res_slots.push_back(ResSlot{0xFFFFFFFFu, is_image, is_image});
+    // BindHostComputeTextureBuffers appends the Texel records in const-buffer order:
+    // texture buffers first, then image buffers.
+    size_t texel_cursor = 0;
+    for (const auto& desc : info.texture_buffer_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            res_slots.push_back(ResSlot{
+                .kind = ResKind::TexelBuffer,
+                .record = texel_cursor < texel_records.size() ? texel_records[texel_cursor]
+                                                             : 0xFFFFFFFFu,
+            });
+            ++texel_cursor;
         }
-    };
-    add_null_slots(Shader::NumDescriptors(info.texture_buffer_descriptors), false);
-    add_null_slots(Shader::NumDescriptors(info.image_buffer_descriptors), true);
-    add_null_slots(Shader::NumDescriptors(info.texture_descriptors), false);
-    add_null_slots(Shader::NumDescriptors(info.image_descriptors), true);
+    }
+    for (const auto& desc : info.image_buffer_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            res_slots.push_back(ResSlot{
+                .kind = ResKind::ImageBuffer,
+                .record = texel_cursor < texel_records.size() ? texel_records[texel_cursor]
+                                                             : 0xFFFFFFFFu,
+                .is_written = desc.is_written,
+            });
+            ++texel_cursor;
+        }
+    }
+    for (size_t i = sampled_views_begin; i < sampled_views_end; ++i) {
+        res_slots.push_back(ResSlot{
+            .kind = ResKind::Sampled,
+            .view = views[i].id,
+            .sampler = sampler_ids[i - sampled_views_begin],
+        });
+    }
+    u32 image_cursor = 0;
+    for (const auto& desc : info.image_descriptors) {
+        for (u32 i = 0; i < desc.count; ++i) {
+            res_slots.push_back(ResSlot{
+                .kind = ResKind::Image,
+                .is_written = desc.is_written,
+                .view = image_cursor < views.size() - sampled_views_end
+                            ? views[sampled_views_end + image_cursor].id
+                            : VideoCommon::NULL_IMAGE_VIEW_ID,
+            });
+            ++image_cursor;
+        }
+    }
 
     const RootSignature& root_sig = pipeline->root_signature;
     const u32 num_cbv = static_cast<u32>(cbv_records.size());
@@ -2438,18 +2652,55 @@ void RasterizerD3D12::DispatchCompute() {
     const u32 uav_slot_base = heap_base + num_cbv + num_res;
     ID3D12Device* const d3d = m_device.GetDevice();
 
-    // UAV state transitions: every real storage-buffer resource that is written goes
-    // COMMON -> UNORDERED_ACCESS before the dispatch, and back afterwards.
+    // UAV state transitions: every real storage-buffer resource that is written, and
+    // every storage image whose host resource is known, goes COMMON -> UNORDERED_ACCESS
+    // before the dispatch, and back afterwards.
+    const auto slot_resource = [&](const ResSlot& slot) -> ID3D12Resource* {
+        if (slot.kind == ResKind::Image) {
+            return slot.view != VideoCommon::NULL_IMAGE_VIEW_ID
+                       ? m_texture_cache.GetImageView(slot.view).Resource()
+                       : nullptr;
+        }
+        if (slot.record == 0xFFFFFFFFu) {
+            return nullptr;
+        }
+        const auto& record = bindings[slot.record];
+        return m_runtime.IsNullResource(record.resource) ? nullptr : record.resource;
+    };
+    const auto wants_uav_access = [&](const ResSlot& slot) {
+        if (slot.kind == ResKind::Image) {
+            return slot.view != VideoCommon::NULL_IMAGE_VIEW_ID;
+        }
+        return slot.is_written && slot.record != 0xFFFFFFFFu;
+    };
     const auto transition_uav = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        // Deduplicate: several slots can alias one resource and a second
+        // COMMON -> UNORDERED_ACCESS barrier would use the wrong before-state.
+        ID3D12Resource* done[32]{};
+        size_t done_count = 0;
         for (size_t i = 0; i < res_slots.size(); ++i) {
             const ResSlot& slot = res_slots[i];
-            if (slot.record == 0xFFFFFFFFu || !slot.is_written) {
+            if (!wants_uav_access(slot)) {
                 continue;
             }
-            const auto& record = bindings[slot.record];
-            if (!m_runtime.IsNullResource(record.resource)) {
-                m_command_list.Transition(record.resource, before, after);
+            ID3D12Resource* resource = slot_resource(slot);
+            if (!resource) {
+                continue;
             }
+            bool seen = false;
+            for (size_t d = 0; d < done_count; ++d) {
+                if (done[d] == resource) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) {
+                continue;
+            }
+            if (done_count < 32) {
+                done[done_count++] = resource;
+            }
+            m_command_list.Transition(resource, before, after);
         }
     };
 
@@ -2500,8 +2751,13 @@ void RasterizerD3D12::DispatchCompute() {
         ID3D12Resource* resource = nullptr;
         u64 offset = 0;
         u64 size = 0;
+        D3D12_CPU_DESCRIPTOR_HANDLE prebuilt{};
+        D3D12_CPU_DESCRIPTOR_HANDLE uav_prebuilt{};
+        bool have_prebuilt = false;
+        bool have_uav_prebuilt = false;
         bool want_uav = false;
-        if (slot.record != 0xFFFFFFFFu) {
+        switch (slot.kind) {
+        case ResKind::Storage: {
             const auto& record = bindings[slot.record];
             if (!m_runtime.IsNullResource(record.resource) && (record.offset % 4) == 0 &&
                 record.size >= 4) {
@@ -2510,8 +2766,41 @@ void RasterizerD3D12::DispatchCompute() {
                 size = record.size;
             }
             want_uav = slot.is_written;
+            break;
         }
-        if (resource) {
+        case ResKind::TexelBuffer:
+        case ResKind::ImageBuffer:
+            // Texture/image buffers bind through the buffer cache: the Texel record's
+            // prebuilt SRV is copied into the table like SlotKind::TexelBuffer in
+            // ConfigureDraw. Image-buffer writes stay null UAVs (no write path yet).
+            if (slot.record < bindings.size() && slot.record != 0xFFFFFFFFu &&
+                bindings[slot.record].kind == BufferCacheRuntime::BindingKind::Texel &&
+                bindings[slot.record].view.ptr != 0) {
+                prebuilt = bindings[slot.record].view;
+                have_prebuilt = true;
+            }
+            break;
+        case ResKind::Sampled:
+            if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                prebuilt = m_texture_cache.GetImageView(slot.view).Sampled();
+                have_prebuilt = prebuilt.ptr != 0;
+            }
+            break;
+        case ResKind::Image:
+            // Storage image: copy the resolved image view's prebuilt storage (UAV)
+            // descriptor into the UAV table slot; null UAV when the image view has no
+            // UAV-capable storage view.
+            if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                uav_prebuilt = m_texture_cache.GetImageView(slot.view).Storage();
+                have_uav_prebuilt = uav_prebuilt.ptr != 0;
+            }
+            want_uav = true;
+            break;
+        }
+        if (have_prebuilt) {
+            d3d->CopyDescriptorsSimple(1, m_res_heap.CpuHandle(srv_slot_base + k), prebuilt,
+                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else if (resource) {
             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
             srv.Format = DXGI_FORMAT_R32_TYPELESS;
             srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
@@ -2531,7 +2820,10 @@ void RasterizerD3D12::DispatchCompute() {
             d3d->CreateShaderResourceView(nullptr, &null_srv,
                                           m_res_heap.CpuHandle(srv_slot_base + k));
         }
-        if (want_uav && resource) {
+        if (have_uav_prebuilt) {
+            d3d->CopyDescriptorsSimple(1, m_res_heap.CpuHandle(uav_slot_base + k), uav_prebuilt,
+                                       D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        } else if (want_uav && resource) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
             uav.Format = DXGI_FORMAT_R32_TYPELESS;
             uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -2551,20 +2843,25 @@ void RasterizerD3D12::DispatchCompute() {
                                            m_res_heap.CpuHandle(uav_slot_base + k));
         }
         // Samplers: one per set-1 binding so sN always pairs with tN. Slots without a
-        // host texture get a default sampler instead of leaving garbage in the table.
-        D3D12_SAMPLER_DESC default_sampler{};
-        default_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-        default_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        default_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        default_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-        // ComparisonFunc and MaxAnisotropy are validated enums on Xbox; D3D12's
-        // zero-initialized values (0) are invalid and make the whole sampler
-        // descriptor invalid, which faults the GPU when a shader uses it.
-        default_sampler.MaxAnisotropy = 1;
-        default_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-        default_sampler.MinLOD = 0.0f;
-        default_sampler.MaxLOD = D3D12_FLOAT32_MAX;
-        d3d->CreateSampler(&default_sampler, m_sampler_heap.CpuHandle(sampler_base + k));
+        // resolved sampler get a default sampler instead of leaving garbage in the table.
+        if (slot.kind == ResKind::Sampled && slot.sampler != VideoCommon::NULL_SAMPLER_ID) {
+            const Sampler& sampler = m_texture_cache.GetSampler(slot.sampler);
+            d3d->CreateSampler(&sampler.Desc(), m_sampler_heap.CpuHandle(sampler_base + k));
+        } else {
+            D3D12_SAMPLER_DESC default_sampler{};
+            default_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            default_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            default_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            default_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            // ComparisonFunc and MaxAnisotropy are validated enums on Xbox; D3D12's
+            // zero-initialized values (0) are invalid and make the whole sampler
+            // descriptor invalid, which faults the GPU when a shader uses it.
+            default_sampler.MaxAnisotropy = 1;
+            default_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            default_sampler.MinLOD = 0.0f;
+            default_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            d3d->CreateSampler(&default_sampler, m_sampler_heap.CpuHandle(sampler_base + k));
+        }
     }
 
     // UAV transitions before the dispatch so the resources are writable.
@@ -2604,21 +2901,24 @@ void RasterizerD3D12::DispatchCompute() {
     const u32 gz = qmd.grid_dim_z.Value();
     if (dispatch_index < 8) {
         LOG_WARNING(Render_D3D12,
-                    "D3D12 compute bind #{}: cbv={} res={} ssbo={} null_slots={} grid=({},{},{})",
+                    "D3D12 compute bind #{}: cbv={} res={} ssbo={} null_slots={} "
+                    "texbuf={}/{} img={}/{} tex={}/{} imgdesc={}/{} grid=({},{},{})",
                     dispatch_index, num_cbv, num_res, storage_records.size(),
-                    res_slots.size() - storage_records.size(), gx, gy, gz);
+                    res_slots.size() - storage_records.size(), texbuf_resolved, texbuf_total,
+                    imgbuf_resolved, imgbuf_total, tex_resolved, tex_total, img_resolved,
+                    img_total, gx, gy, gz);
     }
     m_command_list.Dispatch(gx, gy, gz);
 
     // Make the UAV writes visible before the resources return to COMMON.
     for (size_t i = 0; i < res_slots.size(); ++i) {
         const ResSlot& slot = res_slots[i];
-        if (slot.record == 0xFFFFFFFFu || !slot.is_written) {
+        if (!wants_uav_access(slot)) {
             continue;
         }
-        const auto& record = bindings[slot.record];
-        if (!m_runtime.IsNullResource(record.resource)) {
-            m_command_list.UAVBarrier(record.resource);
+        ID3D12Resource* resource = slot_resource(slot);
+        if (resource) {
+            m_command_list.UAVBarrier(resource);
         }
     }
     transition_uav(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);

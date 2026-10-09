@@ -202,6 +202,10 @@ extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
 /// scene behind the UI), probed by the present path to show whether it holds pixels.
 extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene3d;
 
+/// TEMP DIAGNOSTIC (session 14): render target of the latest fullscreen 6-vertex 1920x1080
+/// draw (the compositor/UI target), captured mid-frame to see whether the 3D scene reaches it.
+extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_ui;
+
 class ImageAlloc : public VideoCommon::ImageAllocBase {};
 
 /// Guest sampler state translated to a D3D12 sampler description. The draw translation
