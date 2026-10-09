@@ -445,13 +445,16 @@ bool IsUavCompatibleFormat(ID3D12Device* device, DXGI_FORMAT format) {
         return false;
     }
     const u32 index = static_cast<u32>(format);
-    static std::array<std::atomic<s32>, 256> cache{};
-    if (index >= cache.size()) {
+    if (index >= 256) {
         return false;
     }
-    const s32 cached = cache[index].load(std::memory_order_relaxed);
-    if (cached >= 0) {
-        return cached != 0;
+    // 0 = unknown, 1 = unsupported, 2 = supported. The old value-initialized atomic array
+    // always read back 0 and the `cached >= 0` sentinel returned false without ever querying
+    // the device; IsBlendableFormat hit the same bug and was fixed with an explicit sentinel.
+    static std::array<std::atomic<u8>, 256> cache{};
+    const u8 cached = cache[index].load(std::memory_order_relaxed);
+    if (cached != 0) {
+        return cached == 2;
     }
     D3D12_FEATURE_DATA_FORMAT_SUPPORT support{};
     support.Format = format;
@@ -460,7 +463,7 @@ bool IsUavCompatibleFormat(ID3D12Device* device, DXGI_FORMAT format) {
     const bool supported =
         SUCCEEDED(hr) &&
         (support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0;
-    cache[index].store(supported ? 1 : 0, std::memory_order_relaxed);
+    cache[index].store(supported ? 2 : 1, std::memory_order_relaxed);
     return supported;
 }
 

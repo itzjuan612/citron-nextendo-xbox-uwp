@@ -58,6 +58,17 @@ void KeplerCompute::CallMethod(u32 method, u32 method_argument, bool is_last_cal
     case KEPLER_COMPUTE_REG_INDEX(launch): {
         const GPUVAddr launch_desc_loc = regs.launch_desc_loc.Address();
 
+        static u32 launch_diag_count = 0;
+        if (launch_diag_count < 8) {
+            ++launch_diag_count;
+            LOG_WARNING(HW_GPU, "Compute launch: desc_loc={:#x} raw={:#x} uploads={}",
+                        launch_desc_loc, regs.launch_desc_loc.address, uploads.size());
+            for (const auto& data : uploads) {
+                LOG_WARNING(HW_GPU, "Compute launch upload: exec={:#x} src={:#x} size={}",
+                            data.exec_address, data.upload_address, data.copy_size);
+            }
+        }
+
         for (auto& data : uploads) {
             const GPUVAddr offset = data.exec_address - launch_desc_loc;
             if (offset / sizeof(u32) == LAUNCH_REG_INDEX(grid_dim_x) &&

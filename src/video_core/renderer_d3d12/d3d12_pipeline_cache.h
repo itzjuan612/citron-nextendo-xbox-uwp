@@ -12,6 +12,7 @@
 #include <d3d12.h>
 #include <wrl/client.h>
 
+#include "common/cityhash.h"
 #include "common/common_types.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -34,6 +35,10 @@ class Device;
 
 using Microsoft::WRL::ComPtr;
 
+/// `ShaderCache` identifies guest shaders by `VideoCommon::ShaderInfo`; mirror the Vulkan
+/// backend's alias so the compute entry points can use the short name.
+using VideoCommon::ShaderInfo;
+
 struct ShaderPools {
     void ReleaseContents() {
         flow_block.ReleaseContents();
@@ -50,6 +55,28 @@ struct PipelineKeyHash {
     size_t operator()(const GraphicsPipelineCacheKey& key) const noexcept {
         return key.Hash();
     }
+};
+
+/// Key identifying a compute pipeline: the shader program hash plus the launch
+/// geometry that affects the compiled PSO / root signature.
+struct ComputePipelineCacheKey {
+    u64 unique_hash{};
+    u32 shared_memory_size{};
+    std::array<u32, 3> workgroup_size{};
+    bool operator==(const ComputePipelineCacheKey& rhs) const noexcept = default;
+};
+struct ComputePipelineKeyHash {
+    size_t operator()(const ComputePipelineCacheKey& key) const noexcept {
+        return static_cast<size_t>(
+            Common::CityHash64(reinterpret_cast<const char*>(&key), sizeof(key)));
+    }
+};
+
+/// A compiled compute pipeline: PSO + root signature + the translated shader's Info.
+struct StoredComputePipeline {
+    ComPtr<ID3D12PipelineState> pipeline;
+    RootSignature root_signature;
+    Shader::Info info;
 };
 
 /// On-demand translator from Maxwell programs to signed D3D12 graphics pipelines.
@@ -81,10 +108,17 @@ public:
     /// Same as above but also exposes the stored shader infos for descriptor setup.
     [[nodiscard]] StoredPipeline* CurrentStoredPipeline();
 
+    /// Returns the compute pipeline for the currently bound Maxwell compute state,
+    /// building it on a miss. Returns nullptr when the shader is invalid or
+    /// translation/compilation fails.
+    [[nodiscard]] StoredComputePipeline* CurrentComputePipeline();
+
 private:
     [[nodiscard]] StoredPipeline* CurrentPipelineSlowPath();
     [[nodiscard]] std::unique_ptr<StoredPipeline> CreatePipeline(
         const GraphicsPipelineCacheKey& key);
+    [[nodiscard]] std::unique_ptr<StoredComputePipeline> CreateComputePipeline(
+        const ComputePipelineCacheKey& key, const ShaderInfo* shader);
 
     Device& device;
     ShaderCompiler& compiler;
@@ -97,6 +131,12 @@ private:
     size_t compiled_stage_bytes{};
     std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<StoredPipeline>, PipelineKeyHash>
         cache;
+    /// Compute pipelines, keyed by shader hash plus the launch geometry that changes the
+    /// compiled PSO or root signature. Deliberately uncapped (like the Vulkan backend):
+    /// each guest compute program is compiled once.
+    std::unordered_map<ComputePipelineCacheKey, std::unique_ptr<StoredComputePipeline>,
+                       ComputePipelineKeyHash>
+        compute_cache;
     /// Keys that deterministically cannot produce a PSO (e.g. unrepresentable RT formats).
     /// Cached so a guest retrying the draw every frame cannot re-run translation or flood
     /// the log (observed: 21k failed PSO creations and 15 MB of log in one run).

@@ -92,6 +92,11 @@ void CommandList::SetRootSignature(ID3D12RootSignature* root_signature) {
     list->SetGraphicsRootSignature(root_signature);
 }
 
+void CommandList::SetComputeRootSignature(ID3D12RootSignature* root_signature) {
+    Diag::Push(Diag::CmdKind::StateSignal, 10, reinterpret_cast<u64>(root_signature));
+    list->SetComputeRootSignature(root_signature);
+}
+
 void CommandList::SetPipelineState(ID3D12PipelineState* pipeline) {
     Diag::Push(Diag::CmdKind::StateSignal, 2, reinterpret_cast<u64>(pipeline));
     list->SetPipelineState(pipeline);

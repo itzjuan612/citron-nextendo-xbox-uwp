@@ -65,6 +65,8 @@ public:
     // State and draw helpers. These are thin wrappers to keep call sites readable.
 
     void SetRootSignature(ID3D12RootSignature* root_signature);
+    /// Binds a root signature for compute dispatches (mirrors `SetRootSignature`).
+    void SetComputeRootSignature(ID3D12RootSignature* root_signature);
     void SetPipelineState(ID3D12PipelineState* pipeline);
     void SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology);
     void SetViewport(const D3D12_VIEWPORT& viewport);

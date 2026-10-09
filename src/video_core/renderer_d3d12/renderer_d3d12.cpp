@@ -234,6 +234,7 @@ struct FrameCapture {
     u32 width = 0;
     u32 height = 0;
     u32 index = 0;
+    u32 bytes_per_pixel = 4;
     bool is_bgra = false;
     bool armed = false;
 };
@@ -241,7 +242,7 @@ struct FrameCapture {
 FrameCapture g_frame_capture;
 // TEMP DIAGNOSTIC (session 13): same machinery, but for the visible 3D scene render target
 // (g_probe_scene3d): a 16x16 content probe cannot show whether the scene holds geometry, so
-// dump the whole target as a BMP. Only four files are written, then the probe stops.
+// dump the whole target as a BMP. Up to eight files are written, then the probe stops.
 FrameCapture g_scene3d_capture;
 std::string g_capture_directory;
 
@@ -370,12 +371,23 @@ bool RecordScene3dCapture(ID3D12Device* d3d, CommandList& command_list, ID3D12Re
     case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
     case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         is_bgra = false;
+        g_scene3d_capture.bytes_per_pixel = 4;
         break;
     case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+    case DXGI_FORMAT_R10G10B10A2_UINT:
     case DXGI_FORMAT_R11G11B10_FLOAT:
         // 4 bytes per pixel: copied through and written unswizzled.
         is_bgra = false;
+        g_scene3d_capture.bytes_per_pixel = 4;
+        break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+        // 8 bytes per pixel: the writer truncates each 16-bit channel to its low byte.
+        is_bgra = false;
+        g_scene3d_capture.bytes_per_pixel = 8;
         break;
     default:
         static bool scene3d_format_logged = false;
@@ -491,9 +503,9 @@ void WriteFrameCapture() {
 }
 
 // TEMP DIAGNOSTIC (session 13): WriteFrameCapture for the scene3d probe RT, writing
-// scene3d_<index>.bmp next to the presented-frame captures. Only four files are produced
-// (the trigger stops arming once index == 4), and PruneCaptures never matches them, so they
-// survive across runs until the next four overwrite the same names.
+// scene3d_<index>.bmp next to the presented-frame captures. Up to eight files are produced
+// (the trigger stops arming once index == 8), and PruneCaptures never matches them, so they
+// survive across runs until the next eight overwrite the same names.
 void WriteScene3dCapture() {
     if (!g_scene3d_capture.armed || !g_scene3d_capture.readback) {
         g_scene3d_capture.armed = false;
@@ -536,9 +548,20 @@ void WriteScene3dCapture() {
         out.write(reinterpret_cast<const char*>(header.data()), header.size());
         const u8* const base = static_cast<const u8*>(mapped);
         std::vector<u8> row(row_bytes);
+        const u32 pixel_bytes = g_scene3d_capture.bytes_per_pixel;
         for (s32 y = static_cast<s32>(height) - 1; y >= 0; --y) {
             const u8* const src_row = base + static_cast<size_t>(y) * pitch;
-            if (g_scene3d_capture.is_bgra) {
+            if (pixel_bytes == 8) {
+                for (u32 x = 0; x < width; ++x) {
+                    const u8* const src_px = src_row + static_cast<size_t>(x) * 8;
+                    // R16G16B16A16 -> BGRA, keeping each channel's low byte.
+                    row[x * 4 + 0] = src_px[4];
+                    row[x * 4 + 1] = src_px[2];
+                    row[x * 4 + 2] = src_px[0];
+                    row[x * 4 + 3] = src_px[6];
+                }
+                out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
+            } else if (g_scene3d_capture.is_bgra) {
                 out.write(reinterpret_cast<const char*>(src_row), row_bytes);
             } else {
                 for (u32 x = 0; x < row_bytes; x += 4) {
@@ -550,7 +573,8 @@ void WriteScene3dCapture() {
                 out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
             }
         }
-        LOG_WARNING(Render_D3D12, "Scene3D capture written: {} ({}x{})", path, width, height);
+        LOG_WARNING(Render_D3D12, "Scene3D capture written: {} ({}x{} bpp={})", path, width, height,
+                    pixel_bytes);
         ++g_scene3d_capture.index;
     }
     g_scene3d_capture.readback->Unmap(0, nullptr);
@@ -809,15 +833,16 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     const u32 capture_this = capture_present_counter++;
     // TEMP DIAGNOSTIC (session 13): spread captures over long runs, so boot progress can be
     // watched over time (newest kept by PruneCaptures).
-    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 32 &&
+    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 40 &&
                                capture_this >= 600 && (capture_this % 900) == 0;
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
-        // TEMP DIAGNOSTIC (session 13): take the scene3d BMP on the same cadence as the presented
-        // frame captures (every 900 presents), so a snapshot is recorded while the 3D scene is
-        // actually in the target instead of during the early probe frames. RecordScene3dCapture
-        // is a no-op when a previous readback is still armed, so this can never double-record.
-        if (g_scene3d_capture.index < 4) {
+        // TEMP DIAGNOSTIC (session 14): the visible 3D scene only appears ~25 minutes into the
+        // boot, so the previous four snapshots (taken before present 3600) always came from the
+        // loading phase. Take up to 8 scene3d BMPs spaced every 3600 presents, starting at
+        // present 3600, so the visible-scene phase is sampled. RecordScene3dCapture is a no-op
+        // when a previous readback is still armed, so this can never double-record.
+        if (g_scene3d_capture.index < 8 && capture_this >= 3600 && (capture_this % 3600) == 0) {
             RecordScene3dCapture(device.GetDevice(), command_list, g_probe_scene3d.Get());
         }
     }
@@ -918,7 +943,7 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     }
     // TEMP DIAGNOSTIC (session 13): the scene3d copy was recorded on the same list that just
     // executed, so its readback is complete once the list (and the idle wait above) is done.
-    if (g_scene3d_capture.index < 4 && g_scene3d_capture.armed) {
+    if (g_scene3d_capture.index < 8 && g_scene3d_capture.armed) {
         device.WaitForIdle();
         WriteScene3dCapture();
     }

@@ -408,16 +408,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         std::string rts;
         std::string rts_ids;
         std::string rts_att;
-        // TEMP DIAGNOSTIC (session 13): capture the color target of the first depth-tested 3D
-        // draw (the scene behind the UI) so the present path can prove whether that scene RT
-        // actually receives content, independent of the composition/FLINGER layers. The first
-        // depth-tested draw is an auxiliary pass (e.g. a 1600x1600 mask), so the visible scene
-        // is identified by its wide 16:9-ish render viewport instead of by draw order.
+        // TEMP DIAGNOSTIC (session 14): track the color target of the latest depth-tested wide
+        // 3D draw (the scene behind the UI) so the scene3d BMP captures can prove whether that
+        // scene RT receives content, independent of the composition/FLINGER layers. Session 13
+        // armed this only once, which latched an auxiliary RT (0x5109f0000) that is black during
+        // the style screen; the visible scene draws into 0x5103e0000 (960x540) continuously.
         const D3D12_VIEWPORT probe_vp = MakeViewport(maxwell3d->regs);
         const bool probe_wide_scene = probe_vp.Height > 0.0f && probe_vp.Width >= 640.0f &&
                                       probe_vp.Width / probe_vp.Height > 1.6f &&
                                       probe_vp.Width / probe_vp.Height < 1.85f;
-        static bool scene3d_probe_logged = false;
+        static u32 scene3d_probe_switches = 0;
         for (size_t i = 0; i < num_rtvs; ++i) {
             const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
             const u64 addr = view ? static_cast<u64>(view->GpuAddr()) : 0;
@@ -434,21 +434,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                        view->size.height >= 1080) {
                 g_probe_scene = res;
             }
-            if (!scene3d_probe_logged && probe_wide_scene && res != nullptr &&
-                view != nullptr && depth_view != nullptr && depth_view->RenderTarget().ptr) {
-                scene3d_probe_logged = true;
+            if (probe_wide_scene && res != nullptr && view != nullptr &&
+                depth_view != nullptr && depth_view->RenderTarget().ptr &&
+                g_probe_scene3d.Get() != res) {
                 g_probe_scene3d = res;
-                const D3D12_RESOURCE_DESC scene3d_desc = res->GetDesc();
-                ID3D12Resource* const scene3d_depth_res = depth_view->Resource();
-                const u32 dsv_fmt = scene3d_depth_res
-                                        ? static_cast<u32>(scene3d_depth_res->GetDesc().Format)
-                                        : 0;
-                LOG_WARNING(Render_D3D12,
-                            "Scene3D probe RT: gpu={:#x} fmt={:#x} {}x{} dsv_fmt={:#x} "
-                            "vp={}x{} aspect={:.3f}",
-                            addr, static_cast<u32>(scene3d_desc.Format), scene3d_desc.Width,
-                            scene3d_desc.Height, dsv_fmt, probe_vp.Width, probe_vp.Height,
-                            probe_vp.Width / probe_vp.Height);
+                if (scene3d_probe_switches < 16) {
+                    ++scene3d_probe_switches;
+                    const D3D12_RESOURCE_DESC scene3d_desc = res->GetDesc();
+                    ID3D12Resource* const scene3d_depth_res = depth_view->Resource();
+                    const u32 dsv_fmt = scene3d_depth_res
+                                            ? static_cast<u32>(scene3d_depth_res->GetDesc().Format)
+                                            : 0;
+                    LOG_WARNING(Render_D3D12,
+                                "Scene3D probe RT: gpu={:#x} fmt={:#x} {}x{} dsv_fmt={:#x} "
+                                "vp={}x{} aspect={:.3f}",
+                                addr, static_cast<u32>(scene3d_desc.Format), scene3d_desc.Width,
+                                scene3d_desc.Height, dsv_fmt, probe_vp.Width, probe_vp.Height,
+                                probe_vp.Width / probe_vp.Height);
+                }
             }
             rts += fmt::format("{}{:#x}", i == 0 ? "" : ",", addr);
             rts_ids += fmt::format("{}{}:{}", i == 0 ? "" : ",", view ? view->image_id.index : 0,
@@ -2328,6 +2331,297 @@ void RasterizerD3D12::DispatchCompute() {
                     qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
                     qmd.const_buffer_enable_mask.Value());
     }
+
+    StoredComputePipeline* const pipeline = m_pipeline_cache.CurrentComputePipeline();
+    if (!pipeline) {
+        static bool logged_no_compute_pipeline = false;
+        if (!logged_no_compute_pipeline) {
+            logged_no_compute_pipeline = true;
+            LOG_ERROR(Render_D3D12,
+                      "D3D12 compute dispatch dropped: no pipeline (translation/PSO failed)");
+        }
+        return;
+    }
+    if (kepler_compute->GetIndirectComputeAddress()) {
+        static bool logged_indirect_compute = false;
+        if (!logged_indirect_compute) {
+            logged_indirect_compute = true;
+            LOG_ERROR(Render_D3D12, "D3D12 indirect compute dispatch not implemented; dropped");
+        }
+        return;
+    }
+
+    const Shader::Info& info = pipeline->info;
+    std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
+
+    m_runtime.ClearDrawBindings();
+    m_texture_cache.SynchronizeComputeDescriptors();
+
+    // Stage 1 compute binding: CBVs + storage buffers (raw SRV/UAV) only. Texture/image
+    // buffers, sampled textures and storage images bind as null placeholders for now, so
+    // the table order matches the shader's set-1 register allocation.
+    VideoCommon::ComputeUniformBufferSizes sizes{};
+    for (size_t i = 0; i < sizes.size(); ++i) {
+        sizes[i] = info.constant_buffer_used_sizes[i];
+    }
+    m_buffer_cache.SetComputeUniformBufferState(info.constant_buffer_mask, &sizes);
+
+    m_buffer_cache.UnbindComputeStorageBuffers();
+    u32 ssbo_index = 0;
+    for (const auto& desc : info.storage_buffers_descriptors) {
+        m_buffer_cache.BindComputeStorageBuffer(ssbo_index++, desc.cbuf_index, desc.cbuf_offset,
+                                                desc.is_written);
+    }
+    m_buffer_cache.UnbindComputeTextureBuffers();
+
+    m_buffer_cache.UpdateComputeBuffers();
+    m_buffer_cache.BindHostComputeBuffers();
+
+    const auto& bindings = m_runtime.GetResourceBindings();
+    std::vector<u32> cbv_records;
+    std::vector<u32> storage_records;
+    std::vector<bool> storage_written;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        const auto& record = bindings[i];
+        if (record.kind == BufferCacheRuntime::BindingKind::Uniform) {
+            cbv_records.push_back(static_cast<u32>(i));
+        } else if (record.kind == BufferCacheRuntime::BindingKind::Storage) {
+            storage_records.push_back(static_cast<u32>(i));
+            storage_written.push_back(record.is_written);
+        }
+    }
+
+    // Set-1 slot order: storage buffers first (records in bind order), then null
+    // placeholders for texture buffers, image buffers, sampled textures, storage images.
+    // This is the order CreateComputePipeline built the root signature from, so the SRV
+    // and UAV tables line up with the shader's space-1 registers.
+    struct ResSlot {
+        u32 record{0xFFFFFFFFu}; // index into bindings for storage; 0xFFFFFFFF = null
+        bool is_written{};
+        bool is_image{}; // needs a UAV descriptor rather than an SRV (null either way here)
+    };
+    std::vector<ResSlot> res_slots;
+    for (size_t i = 0; i < storage_records.size(); ++i) {
+        res_slots.push_back(ResSlot{storage_records[i], storage_written[i], false});
+    }
+    const auto add_null_slots = [&](size_t count, bool is_image) {
+        for (size_t i = 0; i < count; ++i) {
+            res_slots.push_back(ResSlot{0xFFFFFFFFu, is_image, is_image});
+        }
+    };
+    add_null_slots(Shader::NumDescriptors(info.texture_buffer_descriptors), false);
+    add_null_slots(Shader::NumDescriptors(info.image_buffer_descriptors), true);
+    add_null_slots(Shader::NumDescriptors(info.texture_descriptors), false);
+    add_null_slots(Shader::NumDescriptors(info.image_descriptors), true);
+
+    const RootSignature& root_sig = pipeline->root_signature;
+    const u32 num_cbv = static_cast<u32>(cbv_records.size());
+    const u32 num_res = static_cast<u32>(res_slots.size());
+    // Contiguous table regions, same layout as ConfigureDraw: [0, num_cbv) CBV,
+    // [num_cbv, +num_res) SRV, [num_cbv + num_res, +num_res) UAV, samplers [0, num_res).
+    const u32 heap_total = num_cbv + num_res * 2;
+    const u32 heap_base = heap_total != 0 ? m_res_heap.Allocate(heap_total) : 0;
+    const u32 sampler_base = num_res != 0 ? m_sampler_heap.Allocate(num_res) : 0;
+    if ((heap_total != 0 && heap_base == DescriptorHeap::INVALID_INDEX) ||
+        (num_res != 0 && sampler_base == DescriptorHeap::INVALID_INDEX)) {
+        static bool logged_compute_heap_exhausted = false;
+        if (!logged_compute_heap_exhausted) {
+            logged_compute_heap_exhausted = true;
+            LOG_ERROR(Render_D3D12,
+                      "Compute descriptor heap exhausted (cbv={} res={}); dispatch dropped",
+                      num_cbv, num_res);
+        }
+        return;
+    }
+    const u32 cbv_slot_base = heap_base;
+    const u32 srv_slot_base = heap_base + num_cbv;
+    const u32 uav_slot_base = heap_base + num_cbv + num_res;
+    ID3D12Device* const d3d = m_device.GetDevice();
+
+    // UAV state transitions: every real storage-buffer resource that is written goes
+    // COMMON -> UNORDERED_ACCESS before the dispatch, and back afterwards.
+    const auto transition_uav = [&](D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after) {
+        for (size_t i = 0; i < res_slots.size(); ++i) {
+            const ResSlot& slot = res_slots[i];
+            if (slot.record == 0xFFFFFFFFu || !slot.is_written) {
+                continue;
+            }
+            const auto& record = bindings[slot.record];
+            if (!m_runtime.IsNullResource(record.resource)) {
+                m_command_list.Transition(record.resource, before, after);
+            }
+        }
+    };
+
+    for (u32 slot = 0; slot < num_cbv; ++slot) {
+        const auto& record = bindings[cbv_records[slot]];
+        D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
+        u64 cbv_size = record.size != 0 ? record.size : u64{256};
+        if (m_runtime.IsNullResource(record.resource) || record.size == 0) {
+            // Unbound/disabled uniform: read zeros.
+            address = m_zero_address;
+            cbv_size = 256;
+        } else if ((address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) != 0) {
+            // Root/table CBVs require 256-byte aligned addresses; copy the range into
+            // the aligned DEFAULT-heap scratch. (The old UPLOAD staging target was
+            // illegal: UPLOAD heap can never be a copy destination.)
+            const u64 aligned_size =
+                Common::AlignUp<u64>(record.size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            const u64 scratch_offset =
+                Common::AlignUp<u64>(m_cbv_scratch_used,
+                                     D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+            if (!m_cbv_scratch || scratch_offset + aligned_size > CBV_SCRATCH_SIZE) {
+                if (!logged_unaligned_uniform) {
+                    logged_unaligned_uniform = true;
+                    LOG_ERROR(Render_D3D12, "CBV scratch exhausted; uniform reads as zero");
+                }
+                address = m_zero_address;
+                cbv_size = 256;
+            } else {
+                const std::array copies{VideoCommon::BufferCopy{
+                    .src_offset = record.offset,
+                    .dst_offset = scratch_offset,
+                    .size = record.size,
+                }};
+                m_runtime.CopyBuffer(m_cbv_scratch.Get(), record.resource, copies, true);
+                address = m_cbv_scratch->GetGPUVirtualAddress() + scratch_offset;
+                m_cbv_scratch_used = scratch_offset + aligned_size;
+            }
+        }
+        D3D12_CONSTANT_BUFFER_VIEW_DESC cbv{};
+        cbv.BufferLocation = address;
+        cbv.SizeInBytes = static_cast<UINT>(Common::AlignUp<u64>(
+            std::min<u64>(cbv_size, 64 * 1024), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT));
+        d3d->CreateConstantBufferView(&cbv, m_res_heap.CpuHandle(cbv_slot_base + slot));
+    }
+
+    for (u32 k = 0; k < num_res; ++k) {
+        const ResSlot& slot = res_slots[k];
+        ID3D12Resource* resource = nullptr;
+        u64 offset = 0;
+        u64 size = 0;
+        bool want_uav = false;
+        if (slot.record != 0xFFFFFFFFu) {
+            const auto& record = bindings[slot.record];
+            if (!m_runtime.IsNullResource(record.resource) && (record.offset % 4) == 0 &&
+                record.size >= 4) {
+                resource = record.resource;
+                offset = record.offset;
+                size = record.size;
+            }
+            want_uav = slot.is_written;
+        }
+        if (resource) {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Buffer.FirstElement = offset / 4;
+            srv.Buffer.NumElements = static_cast<UINT>(std::max<u64>(size / 4, 1));
+            srv.Buffer.StructureByteStride = 0;
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            d3d->CreateShaderResourceView(resource, &srv, m_res_heap.CpuHandle(srv_slot_base + k));
+        } else {
+            D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
+            null_srv.Format = DXGI_FORMAT_R32_UINT;
+            null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            null_srv.Buffer.FirstElement = 0;
+            null_srv.Buffer.NumElements = 1;
+            d3d->CreateShaderResourceView(nullptr, &null_srv,
+                                          m_res_heap.CpuHandle(srv_slot_base + k));
+        }
+        if (want_uav && resource) {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = DXGI_FORMAT_R32_TYPELESS;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            uav.Buffer.FirstElement = offset / 4;
+            uav.Buffer.NumElements = static_cast<UINT>(std::max<u64>(size / 4, 1));
+            uav.Buffer.StructureByteStride = 0;
+            uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
+            d3d->CreateUnorderedAccessView(resource, nullptr, &uav,
+                                           m_res_heap.CpuHandle(uav_slot_base + k));
+        } else {
+            D3D12_UNORDERED_ACCESS_VIEW_DESC null_uav{};
+            null_uav.Format = DXGI_FORMAT_R32_UINT;
+            null_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+            null_uav.Buffer.FirstElement = 0;
+            null_uav.Buffer.NumElements = 1;
+            d3d->CreateUnorderedAccessView(nullptr, nullptr, &null_uav,
+                                           m_res_heap.CpuHandle(uav_slot_base + k));
+        }
+        // Samplers: one per set-1 binding so sN always pairs with tN. Slots without a
+        // host texture get a default sampler instead of leaving garbage in the table.
+        D3D12_SAMPLER_DESC default_sampler{};
+        default_sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        default_sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        default_sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        default_sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        // ComparisonFunc and MaxAnisotropy are validated enums on Xbox; D3D12's
+        // zero-initialized values (0) are invalid and make the whole sampler
+        // descriptor invalid, which faults the GPU when a shader uses it.
+        default_sampler.MaxAnisotropy = 1;
+        default_sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        default_sampler.MinLOD = 0.0f;
+        default_sampler.MaxLOD = D3D12_FLOAT32_MAX;
+        d3d->CreateSampler(&default_sampler, m_sampler_heap.CpuHandle(sampler_base + k));
+    }
+
+    // UAV transitions before the dispatch so the resources are writable.
+    transition_uav(D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    m_command_list.SetComputeRootSignature(root_sig.Get());
+    m_command_list.SetPipelineState(pipeline->pipeline.Get());
+    ID3D12DescriptorHeap* compute_heaps[] = {m_res_heap.Get(), m_sampler_heap.Get()};
+    m_command_list.Get()->SetDescriptorHeaps(2, compute_heaps);
+    if (num_cbv > 0 && root_sig.GetCbvTableIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootDescriptorTable(root_sig.GetCbvTableIndex(),
+                                                    m_res_heap.GpuHandle(cbv_slot_base));
+    }
+    if (num_res > 0 && root_sig.GetSrvTableIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootDescriptorTable(root_sig.GetSrvTableIndex(),
+                                                    m_res_heap.GpuHandle(srv_slot_base));
+    }
+    if (num_res > 0 && root_sig.GetUavTableIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootDescriptorTable(root_sig.GetUavTableIndex(),
+                                                    m_res_heap.GpuHandle(uav_slot_base));
+    }
+    if (num_res > 0 && root_sig.GetSamplerTableIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootDescriptorTable(root_sig.GetSamplerTableIndex(),
+                                                    m_sampler_heap.GpuHandle(sampler_base));
+    }
+    if (root_sig.GetPushConstantIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootConstantBufferView(root_sig.GetPushConstantIndex(),
+                                                        m_zero_address);
+    }
+    if (root_sig.GetRuntimeDataIndex() != RootSignature::INVALID_PARAMETER) {
+        m_command_list.SetComputeRootConstantBufferView(root_sig.GetRuntimeDataIndex(),
+                                                        m_zero_address);
+    }
+
+    const u32 gx = qmd.grid_dim_x.Value();
+    const u32 gy = qmd.grid_dim_y.Value();
+    const u32 gz = qmd.grid_dim_z.Value();
+    if (dispatch_index < 8) {
+        LOG_WARNING(Render_D3D12,
+                    "D3D12 compute bind #{}: cbv={} res={} ssbo={} null_slots={} grid=({},{},{})",
+                    dispatch_index, num_cbv, num_res, storage_records.size(),
+                    res_slots.size() - storage_records.size(), gx, gy, gz);
+    }
+    m_command_list.Dispatch(gx, gy, gz);
+
+    // Make the UAV writes visible before the resources return to COMMON.
+    for (size_t i = 0; i < res_slots.size(); ++i) {
+        const ResSlot& slot = res_slots[i];
+        if (slot.record == 0xFFFFFFFFu || !slot.is_written) {
+            continue;
+        }
+        const auto& record = bindings[slot.record];
+        if (!m_runtime.IsNullResource(record.resource)) {
+            m_command_list.UAVBarrier(record.resource);
+        }
+    }
+    transition_uav(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
 }
 void RasterizerD3D12::ResetCounter(VideoCommon::QueryType type) {
     if (type != VideoCommon::QueryType::ZPassPixelCount64) {
@@ -2521,13 +2815,25 @@ bool RasterizerD3D12::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surfa
 }
 void RasterizerD3D12::AccelerateInlineToMemory(GPUVAddr address, size_t copy_size,
                                                std::span<const u8> memory) {
-    std::scoped_lock lock{m_buffer_cache.mutex};
+    if (gpu_memory == nullptr || copy_size == 0 || memory.empty()) {
+        return;
+    }
+    // Mirror RasterizerVulkan: the uploaded bytes must land in guest memory; the
+    // buffer/texture cache hooks below only refresh host-side cached copies.
+    gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
     const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_addr) {
         return;
     }
-    if (!m_buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
-        m_buffer_cache.WriteMemory(*cpu_addr, copy_size);
+    {
+        std::scoped_lock lock{m_buffer_cache.mutex};
+        if (!m_buffer_cache.InlineMemory(*cpu_addr, copy_size, memory)) {
+            m_buffer_cache.WriteMemory(*cpu_addr, copy_size);
+        }
+    }
+    {
+        std::scoped_lock lock{m_texture_cache.mutex};
+        m_texture_cache.WriteMemory(*cpu_addr, copy_size);
     }
 }
 void RasterizerD3D12::LoadDiskResources(u64 title_id, std::stop_token stop_loading,

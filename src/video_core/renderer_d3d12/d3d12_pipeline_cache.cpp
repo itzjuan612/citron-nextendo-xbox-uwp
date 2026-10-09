@@ -261,6 +261,8 @@ D3D12::ShaderStage CompilerStage(Shader::Stage stage) {
         return D3D12::ShaderStage::DXIL_SPIRV_SHADER_GEOMETRY;
     case Shader::Stage::Fragment:
         return D3D12::ShaderStage::DXIL_SPIRV_SHADER_FRAGMENT;
+    case Shader::Stage::Compute:
+        return D3D12::ShaderStage::DXIL_SPIRV_SHADER_COMPUTE;
     default:
         return D3D12::ShaderStage::DXIL_SPIRV_SHADER_NONE;
     }
@@ -384,6 +386,99 @@ PipelineCache::StoredPipeline* PipelineCache::CurrentStoredPipeline() {
     current_key = key;
     current_pipeline = CurrentPipelineSlowPath();
     return current_pipeline;
+}
+
+StoredComputePipeline* PipelineCache::CurrentComputePipeline() {
+    const ShaderInfo* const shader = ComputeShader();
+    if (!shader) {
+        return nullptr;
+    }
+    const auto& qmd = kepler_compute->launch_description;
+    const ComputePipelineCacheKey key{
+        .unique_hash = shader->unique_hash,
+        .shared_memory_size = qmd.shared_alloc,
+        .workgroup_size{qmd.block_dim_x, qmd.block_dim_y, qmd.block_dim_z},
+    };
+    const auto it = compute_cache.find(key);
+    if (it != compute_cache.end()) {
+        return it->second.get();
+    }
+    auto pipeline = CreateComputePipeline(key, shader);
+    StoredComputePipeline* const result = pipeline.get();
+    compute_cache.emplace(key, std::move(pipeline));
+    return result;
+}
+
+std::unique_ptr<StoredComputePipeline> PipelineCache::CreateComputePipeline(
+    const ComputePipelineCacheKey& key, const ShaderInfo* shader) try {
+    if (!HasPipelineCompileHeadroom()) {
+        static std::atomic<u32> compute_skip_count{0};
+        const u32 count = compute_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 8 || count % 64 == 0) {
+            LOG_WARNING(Render_D3D12,
+                        "Pipeline compile skipped: commit headroom below {} MB (count {})",
+                        PipelineCompileReserveBytes / (1024 * 1024), count);
+        }
+        return nullptr;
+    }
+    const GPUVAddr program_base = kepler_compute->regs.code_loc.Address();
+    const auto& qmd = kepler_compute->launch_description;
+    VideoCommon::ComputeEnvironment env{*kepler_compute, *gpu_memory, program_base,
+                                        qmd.program_start};
+    env.SetCachedSize(shader->size_bytes);
+
+    pools.ReleaseContents();
+    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
+    auto program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    std::vector<u32> code = EmitSPIRV(profile, program);
+
+    ShaderMetadata metadata{};
+    std::vector<u8> dxil =
+        compiler.Compile({code.data(), code.size()}, D3D12::ShaderStage::DXIL_SPIRV_SHADER_COMPUTE,
+                         metadata);
+    if (dxil.empty()) {
+        LOG_ERROR(Render_D3D12, "Compute pipeline compilation failed: {}", compiler.GetLastError());
+        return nullptr;
+    }
+
+    RootSignatureParams params{};
+    params.num_cbv = Shader::NumDescriptors(program.info.constant_buffer_descriptors);
+    params.num_resources = Shader::NumDescriptors(program.info.storage_buffers_descriptors) +
+                           Shader::NumDescriptors(program.info.texture_buffer_descriptors) +
+                           Shader::NumDescriptors(program.info.image_buffer_descriptors) +
+                           Shader::NumDescriptors(program.info.texture_descriptors) +
+                           Shader::NumDescriptors(program.info.image_descriptors);
+    params.needs_push_constants =
+        program.info.uses_render_area || program.info.uses_rescaling_uniform;
+    params.needs_runtime_data = metadata.requires_runtime_data;
+
+    auto stored = std::make_unique<StoredComputePipeline>();
+    stored->root_signature = RootSignature(device.GetDevice(), params);
+    if (!stored->root_signature.IsValid()) {
+        LOG_ERROR(Render_D3D12, "Compute pipeline root signature creation failed");
+        return nullptr;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
+    desc.pRootSignature = stored->root_signature.Get();
+    desc.CS.pShaderBytecode = dxil.data();
+    desc.CS.BytecodeLength = dxil.size();
+    const HRESULT hr =
+        device.GetDevice()->CreateComputePipelineState(&desc, IID_PPV_ARGS(&stored->pipeline));
+    if (FAILED(hr)) {
+        LOG_ERROR(Render_D3D12, "CreateComputePipelineState failed hr={:#x}", static_cast<u32>(hr));
+        return nullptr;
+    }
+
+    stored->info = program.info;
+    LOG_WARNING(Render_D3D12,
+                "Compute pipeline created: hash={:#x} cbv={} res={} smem={} wg=({},{},{})",
+                key.unique_hash, params.num_cbv, params.num_resources, key.shared_memory_size,
+                key.workgroup_size[0], key.workgroup_size[1], key.workgroup_size[2]);
+    return stored;
+} catch (const Shader::Exception& exception) {
+    LOG_ERROR(Render_D3D12, "Compute shader translation failed: {}", exception.what());
+    return nullptr;
 }
 
 PipelineCache::StoredPipeline* PipelineCache::CurrentPipelineSlowPath() {

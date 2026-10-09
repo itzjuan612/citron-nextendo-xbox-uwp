@@ -129,6 +129,10 @@ Buffer::Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_)
     desc.MipLevels = 1;
     desc.SampleDesc.Count = 1;
     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Buffers can become storage buffers (raw UAV) at any time; creating a UAV view on a
+    // resource without ALLOW_UNORDERED_ACCESS removes the device on Xbox (session 11
+    // lesson). Raw/structured UAVs are always supported on buffers, so the flag is safe.
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     if (FAILED(device->GetDevice()->CreateCommittedResource(
             &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
             IID_PPV_ARGS(&buffer)))) {
