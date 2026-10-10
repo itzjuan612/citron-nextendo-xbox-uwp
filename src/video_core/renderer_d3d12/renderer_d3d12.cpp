@@ -979,6 +979,7 @@ void DecodeTextureToBgra(u32 dxgi_format, u32 width, u32 height, u32 row_pitch, 
             return b | (g << 8) | (r << 16) | 0xFF000000u;
         });
         return;
+    case DXGI_FORMAT_R16G16_TYPELESS:
     case DXGI_FORMAT_R16G16_FLOAT:
         decode_unpacked_rows(4, [&](const u8* pixel) -> u32 {
             const u32 r = to_byte(decode_half(read_u16(pixel)));
@@ -1039,7 +1040,8 @@ void WriteTextureContentDumps() {
         const u32 row_pitch = entry.footprint.Footprint.RowPitch;
         const u32 row_count =
             TextureFormatIsBlockCompressed(entry.dxgi_format) ? (height + 3) / 4 : height;
-        const size_t total_bytes = static_cast<size_t>(row_pitch) * row_count;
+        const size_t total_bytes = std::min(static_cast<size_t>(row_pitch) * row_count,
+                                            static_cast<size_t>(entry.readback->GetDesc().Width));
         void* mapped = nullptr;
         const D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
         const HRESULT s15_map_hr = entry.readback->Map(0, &read_range, &mapped);
@@ -1135,7 +1137,7 @@ void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
 bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src,
                               u32 guest_format, u64 guest_addr, u32 image_index, bool force) {
     static std::vector<std::pair<u64, u32>> seen;
-    if (!src || g_texture_dumps.size() >= 24) {
+    if (!src || g_texture_dumps.size() >= 32) {
         return false;
     }
     if (!force &&

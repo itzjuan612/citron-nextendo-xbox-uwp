@@ -1557,7 +1557,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             if (s15_relevant &&
                 std::find(s15_chain_seen.begin(), s15_chain_seen.end(), s15_sig) ==
                     s15_chain_seen.end()) {
-                if (s15_chain_seen.size() < 64) {
+                if (s15_chain_seen.size() < 256) {
                     s15_chain_seen.push_back(s15_sig);
                     LOG_WARNING(Render_D3D12, "S15 chain #{}: verts={} depth={} {}",
                                 s15_chain_seen.size(), params.num_vertices,
@@ -1578,12 +1578,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
                 ImageView& sv = m_texture_cache.GetImageView(slot.view);
                 const u64 gpu = static_cast<u64>(sv.GpuAddr());
-                if (!((sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                       (sv.size.width == 960 || sv.size.width >= 1920)))) {
+                if (sv.size.width < 960 || sv.size.height < 540) {
                     continue;
                 }
                 ++s15_rt_logs;
-                if (s15_rt_logs <= 64 || (s15_rt_logs % 8192) == 0) {
+                if (s15_rt_logs <= 128 || (s15_rt_logs % 4096) == 0) {
                     const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
                                            ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
                                            : 0;
@@ -1600,7 +1599,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     std::chrono::steady_clock::now() - s15_rt_start > std::chrono::minutes(20);
                 if (s15_src_late && !s15_src_dumped &&
                     sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                    sv.size.width >= 1920 && sv.Resource() != nullptr) {
+                    sv.size.width >= 960 && sv.Resource() != nullptr) {
                     s15_src_dumped = true;
                     (void)D3D12::RecordTextureContentDump(
                         m_device.GetDevice(), m_command_list, sv.Resource(),
@@ -1760,6 +1759,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 std::chrono::steady_clock::now();
             static bool s15_early_tex_dump_done = false;
             static bool s15_late_dump_done = false;
+            static bool s15_big_dump_done = false;
             // The slot counts must be computed before the dump decision: the late dump has to
             // latch onto a draw that actually samples several textures (the visible scene), not
             // onto the first depth-tested draw that happens after the 20-minute mark.
@@ -1789,9 +1789,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
             const bool s15_late_phase =
                 std::chrono::steady_clock::now() - s15_start > std::chrono::minutes(20);
+            const bool s15_big_dump_now = s15_late_phase && !s15_big_dump_done &&
+                                          params.num_vertices >= 4000 && s15_sampled >= 5;
             const bool s15_dump_now =
                 scene3d_index == 0 || (s15_sampled >= 5 && !s15_early_tex_dump_done) ||
-                (s15_late_phase && !s15_late_dump_done && s15_sampled >= 5);
+                (s15_late_phase && !s15_late_dump_done && s15_sampled >= 5) || s15_big_dump_now;
             if (s15_dump_now) {
                 if (scene3d_index != 0 && s15_sampled >= 5) {
                     s15_early_tex_dump_done = true;
@@ -1799,11 +1801,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 if (scene3d_index != 0 && s15_late_phase) {
                     s15_late_dump_done = true;
                 }
+                if (s15_big_dump_now) {
+                    s15_big_dump_done = true;
+                }
                 LOG_WARNING(Render_D3D12,
                             "S15 scene slots: total={} sampled={} texbuf={} imgbuf={} storage={} "
-                            "image={} late={}",
+                            "image={} verts={} late={}",
                             res_slots.size(), s15_sampled, s15_texel, s15_image_buffer,
-                            s15_storage, s15_image, s15_late_phase ? 1 : 0);
+                            s15_storage, s15_image, params.num_vertices, s15_late_phase ? 1 : 0);
                 for (u32 s15_rt = 0; s15_rt < num_rtvs && s15_rt < 4; ++s15_rt) {
                     const auto& s15_att = stored.pipeline->State().attachments[s15_rt];
                     LOG_WARNING(Render_D3D12,
@@ -1893,7 +1898,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         (void)D3D12::RecordTextureContentDump(
                             m_device.GetDevice(), m_command_list, sv.Resource(),
                             static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
-                            sv.image_id.index);
+                            sv.image_id.index, true);
                     }
                     const auto dev = gpu_memory->GpuToCpuAddress(static_cast<GPUVAddr>(sv.GpuAddr()));
                     std::array<u8, 64> bytes{};
