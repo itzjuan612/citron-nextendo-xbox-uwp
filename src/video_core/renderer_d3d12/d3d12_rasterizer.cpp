@@ -423,6 +423,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
             const u64 addr = view ? static_cast<u64>(view->GpuAddr()) : 0;
             ID3D12Resource* const res = view ? view->Resource() : nullptr;
+            // TEMP DIAGNOSTIC (session 15): the 256x256 B10G11R11 lighting LUT is all-zero
+            // while the scene samples it; dump the RT resource the first few times a small
+            // R11G11B10 target is rendered into, to see whether the render lands in it.
+            if (res != nullptr && depth_view == nullptr) {
+                const D3D12_RESOURCE_DESC s15_lut_desc = res->GetDesc();
+                if (s15_lut_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+                    s15_lut_desc.Width <= 512 && s15_lut_desc.Height <= 512) {
+                    static u32 s15_lut_rtv_dumps = 0;
+                    if (s15_lut_rtv_dumps < 4) {
+                        ++s15_lut_rtv_dumps;
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 LUT RT: gpu={:#x} res=0x{:x} {}x{} fmt={:#x} verts={} "
+                                    "vp=({},{},{},{})",
+                                    static_cast<u64>(view->GpuAddr()),
+                                    reinterpret_cast<u64>(res), s15_lut_desc.Width,
+                                    s15_lut_desc.Height, static_cast<u32>(s15_lut_desc.Format),
+                                    params.num_vertices, MakeViewport(maxwell3d->regs).TopLeftX,
+                                    MakeViewport(maxwell3d->regs).TopLeftY,
+                                    MakeViewport(maxwell3d->regs).Width,
+                                    MakeViewport(maxwell3d->regs).Height);
+                        (void)D3D12::RecordTextureContentDump(m_device.GetDevice(),
+                                                              m_command_list, res,
+                                                              static_cast<u32>(
+                                                                  VideoCore::Surface::PixelFormat::
+                                                                      B10G11R11_FLOAT),
+                                                              static_cast<u64>(view->GpuAddr()),
+                                                              900000u + s15_lut_rtv_dumps, true);
+                    }
+                }
+            }
             bool is_display = false;
             for (ID3D12Resource* const display_res : g_display_resources) {
                 if (display_res != nullptr && display_res == res) {

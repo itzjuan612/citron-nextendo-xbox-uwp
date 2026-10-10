@@ -1360,7 +1360,34 @@ bool TextureCacheRuntime::CanImageBeCopied(Image& dst, Image& src) {
 
 void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const ImageCopy> copies) {
-    if (!command_list.IsValid() || !CanImageBeCopied(dst, src)) {
+    if (!command_list.IsValid()) {
+        return;
+    }
+    if (!CanImageBeCopied(dst, src)) {
+        static std::atomic<u32> g_copy_image_skip{0};
+        if (g_copy_image_skip.fetch_add(1, std::memory_order_relaxed) < 16) {
+            const D3D12_RESOURCE_DESC s15_dst_desc =
+                dst.Handle() ? dst.Handle()->GetDesc() : D3D12_RESOURCE_DESC{};
+            const D3D12_RESOURCE_DESC s15_src_desc =
+                src.Handle() ? src.Handle()->GetDesc() : D3D12_RESOURCE_DESC{};
+            LOG_ERROR(Render_D3D12,
+                      "CopyImage skipped: dst_fmt={:#x} {}x{} samples={} dim={} src_fmt={:#x} "
+                      "{}x{} samples={} dim={} copies={}",
+                      static_cast<u32>(s15_dst_desc.Format), s15_dst_desc.Width,
+                      s15_dst_desc.Height, s15_dst_desc.SampleDesc.Count,
+                      static_cast<u32>(s15_dst_desc.Dimension),
+                      static_cast<u32>(s15_src_desc.Format), s15_src_desc.Width,
+                      s15_src_desc.Height, s15_src_desc.SampleDesc.Count,
+                      static_cast<u32>(s15_src_desc.Dimension), copies.size());
+        }
+        // Byte-equal reinterpretations (same guest memory viewed with a different format /
+        // texel size) cannot use CopyTextureRegion directly, so roundtrip the raw bytes
+        // through a temporary DEFAULT-heap buffer (one subresource at a time). The
+        // per-subresource footprint sizes are validated inside the roundtrip.
+        if (!dst.Handle() || !src.Handle()) {
+            return;
+        }
+        CopyImageRawRoundtrip(dst, src, copies);
         return;
     }
     Transition(dst.Handle(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -1400,6 +1427,144 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
     }
     Transition(dst.Handle(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     Transition(src.Handle(), D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
+
+void TextureCacheRuntime::CopyImageRawRoundtrip(Image& dst, Image& src,
+                                                std::span<const ImageCopy> copies) {
+    ID3D12Resource* const src_resource = src.Handle();
+    ID3D12Resource* const dst_resource = dst.Handle();
+    if (!command_list.IsValid() || !src_resource || !dst_resource) {
+        return;
+    }
+    const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
+    const D3D12_RESOURCE_DESC dst_desc = dst_resource->GetDesc();
+    const u32 src_array_size =
+        src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(src_desc.DepthOrArraySize);
+    const u32 dst_array_size =
+        dst_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+            ? 1
+            : static_cast<u32>(dst_desc.DepthOrArraySize);
+
+    static std::atomic<bool> g_copy_roundtrip_logged{false};
+    if (!g_copy_roundtrip_logged.exchange(true, std::memory_order_relaxed)) {
+        LOG_WARNING(Render_D3D12,
+                    "CopyImage raw roundtrip: dst_fmt={:#x} {}x{} src_fmt={:#x} {}x{} copies={} "
+                    "bytes={}",
+                    static_cast<u32>(dst_desc.Format), dst_desc.Width, dst_desc.Height,
+                    static_cast<u32>(src_desc.Format), src_desc.Width, src_desc.Height,
+                    copies.size(), dst.guest_size_bytes);
+    }
+
+    // Pass 1: find the largest source subresource footprint; one buffer serves every copy.
+    u64 max_total = 0;
+    for (const ImageCopy& copy : copies) {
+        const u32 src_sub = CalcSubresource(
+            static_cast<u32>(copy.src_subresource.base_level),
+            static_cast<u32>(copy.src_subresource.base_layer), 0, src_desc.MipLevels,
+            src_array_size);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_fp{};
+        u64 src_total = 0;
+        device.GetDevice()->GetCopyableFootprints(&src_desc, src_sub, 1, 0, &src_fp, nullptr,
+                                                  nullptr, &src_total);
+        max_total = std::max(max_total, src_total);
+    }
+    if (max_total == 0) {
+        return;
+    }
+
+    D3D12_HEAP_PROPERTIES heap{};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap.CreationNodeMask = 1;
+    heap.VisibleNodeMask = 1;
+
+    D3D12_RESOURCE_DESC buffer_desc{};
+    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer_desc.Width = max_total;
+    buffer_desc.Height = 1;
+    buffer_desc.DepthOrArraySize = 1;
+    buffer_desc.MipLevels = 1;
+    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+    buffer_desc.SampleDesc.Count = 1;
+    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ComPtr<ID3D12Resource> buffer;
+    const HRESULT create_hr = device.GetDevice()->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &buffer_desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&buffer));
+    if (FAILED(create_hr)) {
+        static std::atomic<bool> g_copy_buffer_fail_logged{false};
+        if (!g_copy_buffer_fail_logged.exchange(true, std::memory_order_relaxed)) {
+            LOG_WARNING(Render_D3D12,
+                        "CopyImage raw roundtrip buffer creation failed (bytes={} hr={:#x})",
+                        max_total, static_cast<u32>(create_hr));
+        }
+        return;
+    }
+
+    Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+
+    D3D12_RESOURCE_STATES buffer_state = D3D12_RESOURCE_STATE_COMMON;
+    for (const ImageCopy& copy : copies) {
+        const u32 src_sub = CalcSubresource(
+            static_cast<u32>(copy.src_subresource.base_level),
+            static_cast<u32>(copy.src_subresource.base_layer), 0, src_desc.MipLevels,
+            src_array_size);
+        const u32 dst_sub = CalcSubresource(
+            static_cast<u32>(copy.dst_subresource.base_level),
+            static_cast<u32>(copy.dst_subresource.base_layer), 0, dst_desc.MipLevels,
+            dst_array_size);
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT src_fp{};
+        u64 src_total = 0;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_fp{};
+        u64 dst_total = 0;
+        device.GetDevice()->GetCopyableFootprints(&src_desc, src_sub, 1, 0, &src_fp, nullptr,
+                                                  nullptr, &src_total);
+        device.GetDevice()->GetCopyableFootprints(&dst_desc, dst_sub, 1, 0, &dst_fp, nullptr,
+                                                  nullptr, &dst_total);
+        if (src_total == 0 || dst_total == 0 || src_total != dst_total) {
+            static std::atomic<bool> g_copy_footprint_mismatch_logged{false};
+            if (!g_copy_footprint_mismatch_logged.exchange(true, std::memory_order_relaxed)) {
+                LOG_WARNING(Render_D3D12,
+                            "CopyImage raw roundtrip footprint mismatch: src_sub={} dst_sub={} "
+                            "src_total={} dst_total={}",
+                            src_sub, dst_sub, src_total, dst_total);
+            }
+            continue;
+        }
+
+        // Texture -> buffer.
+        Transition(buffer.Get(), buffer_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        buffer_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = src_resource;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = src_sub;
+        D3D12_TEXTURE_COPY_LOCATION buffer_dst{};
+        buffer_dst.pResource = buffer.Get();
+        buffer_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        buffer_dst.PlacedFootprint = src_fp;
+        command_list.Get()->CopyTextureRegion(&buffer_dst, 0, 0, 0, &src_loc, nullptr);
+
+        // Buffer -> texture.
+        Transition(buffer.Get(), buffer_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        buffer_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        D3D12_TEXTURE_COPY_LOCATION buffer_src{};
+        buffer_src.pResource = buffer.Get();
+        buffer_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        buffer_src.PlacedFootprint = dst_fp;
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = dst_resource;
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst_loc.SubresourceIndex = dst_sub;
+        command_list.Get()->CopyTextureRegion(&dst_loc, 0, 0, 0, &buffer_src, nullptr);
+    }
+
+    Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+    Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
 }
 
 void TextureCacheRuntime::EmulateCopyImage(Image&, Image&,

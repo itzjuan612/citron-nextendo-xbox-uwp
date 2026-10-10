@@ -330,6 +330,8 @@ public:
 private:
     DXGI_FORMAT ResourceFormat(VideoCore::Surface::PixelFormat format) const;
     ComPtr<ID3D12Resource> CreateImageResource(const VideoCommon::ImageInfo& info);
+    void CopyImageRawRoundtrip(Image& dst, Image& src,
+                               std::span<const VideoCommon::ImageCopy> copies);
     void Transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before,
                     D3D12_RESOURCE_STATES after);
 
