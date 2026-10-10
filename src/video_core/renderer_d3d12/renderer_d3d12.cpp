@@ -1044,8 +1044,13 @@ void WriteTextureContentDumps() {
         const D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
         const HRESULT s15_map_hr = entry.readback->Map(0, &read_range, &mapped);
         if (FAILED(s15_map_hr) || mapped == nullptr) {
-            LOG_WARNING(Render_D3D12, "Texture dump #{}: Map failed hr={:#x} (img={})", i,
-                        static_cast<u32>(s15_map_hr), entry.image_index);
+            LOG_WARNING(Render_D3D12,
+                        "Texture dump #{}: Map failed hr={:#x} (img={}) res={} x{} x{} "
+                        "dxgi={:#x} pitch={} range_end={}",
+                        i, static_cast<u32>(s15_map_hr), entry.image_index,
+                        entry.readback->GetDesc().Width, entry.width, entry.height,
+                        entry.dxgi_format, entry.footprint.Footprint.RowPitch,
+                        static_cast<u64>(read_range.End));
             continue;
         }
         const u8* const base = static_cast<const u8*>(mapped);

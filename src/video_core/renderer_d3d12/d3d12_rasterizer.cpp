@@ -1514,6 +1514,57 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
             }
         }
+        // TEMP DIAGNOSTIC (session 15): log each distinct (render target, sampled B10G11R11 RT)
+        // signature once, so the whole style-phase scene->composite chain is visible regardless
+        // of log caps or timing.
+        {
+            static std::vector<u64> s15_chain_seen;
+            u64 s15_sig = 1469598103934665603ull;
+            bool s15_relevant = false;
+            std::string s15_chain;
+            for (u32 s15_i = 0; s15_i < num_rtvs; ++s15_i) {
+                ImageView* const s15_rt_view =
+                    framebuffer != nullptr ? framebuffer->ColorBuffers()[s15_i] : nullptr;
+                if (s15_rt_view == nullptr || s15_rt_view->Resource() == nullptr) {
+                    continue;
+                }
+                const D3D12_RESOURCE_DESC s15_rt_desc = s15_rt_view->Resource()->GetDesc();
+                s15_chain += fmt::format("[rt {:#x} {:#x} {}x{}]",
+                                         static_cast<u64>(s15_rt_view->GpuAddr()),
+                                         static_cast<u32>(s15_rt_desc.Format), s15_rt_desc.Width,
+                                         s15_rt_desc.Height);
+                s15_sig = s15_sig * 1099511628211ull ^ static_cast<u64>(s15_rt_view->GpuAddr());
+                if (s15_rt_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+                    s15_rt_desc.Width >= 960) {
+                    s15_relevant = true;
+                }
+            }
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind != SlotKind::Sampled) {
+                    continue;
+                }
+                ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                if (sv.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+                    continue;
+                }
+                s15_chain += fmt::format("[tex {:#x} {}x{}]", static_cast<u64>(sv.GpuAddr()),
+                                         sv.size.width, sv.size.height);
+                s15_sig = s15_sig * 1099511628211ull ^ static_cast<u64>(sv.GpuAddr());
+                if (sv.size.width >= 960) {
+                    s15_relevant = true;
+                }
+            }
+            if (s15_relevant &&
+                std::find(s15_chain_seen.begin(), s15_chain_seen.end(), s15_sig) ==
+                    s15_chain_seen.end()) {
+                if (s15_chain_seen.size() < 64) {
+                    s15_chain_seen.push_back(s15_sig);
+                    LOG_WARNING(Render_D3D12, "S15 chain #{}: verts={} depth={} {}",
+                                s15_chain_seen.size(), params.num_vertices,
+                                depth_view != nullptr ? 1 : 0, s15_chain);
+                }
+            }
+        }
         // TEMP DIAGNOSTIC (session 15): who samples the 960x540 scene RT and the 1080p
         // scene source, to locate where the visible 3D scene is lost.
         {
@@ -1531,8 +1582,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                        (sv.size.width == 960 || sv.size.width >= 1920)))) {
                     continue;
                 }
-                if (s15_rt_logs < 64) {
-                    ++s15_rt_logs;
+                ++s15_rt_logs;
+                if (s15_rt_logs <= 64 || (s15_rt_logs % 8192) == 0) {
                     const u64 rt_gpu = (framebuffer && framebuffer->ColorBuffers()[0])
                                            ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
                                            : 0;
@@ -2327,6 +2378,29 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         const HRESULT diag_reason = m_device.GetDevice()->GetDeviceRemovedReason();
         LOG_ERROR(Render_D3D12, "DIAG draw {}: post-flush device reason {:#x}", diag_index,
                   static_cast<u32>(diag_reason));
+    }
+
+    // TEMP DIAGNOSTIC (session 15): capture the final composite target (1920x1080
+    // R10G10B10A2) once after 20 minutes, to localize whether the presented loss happens
+    // before or after this surface.
+    {
+        static std::chrono::steady_clock::time_point s15_final_start =
+            std::chrono::steady_clock::now();
+        static bool s15_final_captured = false;
+        if (!s15_final_captured &&
+            std::chrono::steady_clock::now() - s15_final_start > std::chrono::minutes(20) &&
+            framebuffer != nullptr && num_rtvs > 0 &&
+            framebuffer->ColorBuffers()[0] != nullptr &&
+            framebuffer->ColorBuffers()[0]->Resource() != nullptr) {
+            ID3D12Resource* const s15_final_res = framebuffer->ColorBuffers()[0]->Resource();
+            const D3D12_RESOURCE_DESC s15_final_desc = s15_final_res->GetDesc();
+            if (s15_final_desc.Width >= 1920 &&
+                s15_final_desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS) {
+                s15_final_captured = true;
+                D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list,
+                                                    s15_final_res);
+            }
+        }
     }
 
     {
