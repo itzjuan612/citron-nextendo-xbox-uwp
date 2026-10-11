@@ -244,7 +244,7 @@ struct FrameCapture {
 FrameCapture g_frame_capture;
 // TEMP DIAGNOSTIC (session 13): same machinery, but for the visible 3D scene render target
 // (g_probe_scene3d): a 16x16 content probe cannot show whether the scene holds geometry, so
-// dump the whole target as a BMP. Up to eight files are written, then the probe stops.
+// dump the whole target as a BMP. Up to sixteen files are written, then the probe stops.
 FrameCapture g_scene3d_capture;
 std::string g_capture_directory;
 
@@ -1539,9 +1539,13 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     }
     // TEMP DIAGNOSTIC (session 13): the scene3d copy was recorded on the same list that just
     // executed, so its readback is complete once the list (and the idle wait above) is done.
-    if (g_scene3d_capture.index < 8 && g_scene3d_capture.armed) {
-        device.WaitForIdle();
-        WriteScene3dCapture();
+    if (g_scene3d_capture.armed) {
+        if (g_scene3d_capture.index < 16) {
+            device.WaitForIdle();
+            WriteScene3dCapture();
+        } else {
+            g_scene3d_capture.armed = false;
+        }
     }
     // TEMP DIAGNOSTIC (session 15): sampled-texture dumps are recorded mid-frame, so their
     // readbacks are complete once the list that carried the copy has executed.

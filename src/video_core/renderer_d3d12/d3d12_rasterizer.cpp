@@ -1603,7 +1603,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             static u32 s15_rt_logs = 0;
             static std::chrono::steady_clock::time_point s15_rt_start =
                 std::chrono::steady_clock::now();
-            static bool s15_src_dumped = false;
+            static std::chrono::steady_clock::time_point s15_src_next = s15_rt_start;
+            static u32 s15_src_dumps = 0;
             for (const DrawSlot& slot : res_slots) {
                 if (slot.kind != SlotKind::Sampled) {
                     continue;
@@ -1626,13 +1627,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
                 // TEMP DIAGNOSTIC (session 15): the 1080p scene source is finally sampled only
                 // once the game is fully loaded; force a dump and a mid-frame capture of it
-                // after 20 minutes, when the under-lit frame is actually on screen.
+                // repeatedly after 20 minutes (every ~4 min, cap 6), when the under-lit frame
+                // is actually on screen, to pair it with the post-draw probe of the same frame.
                 const bool s15_src_late =
                     std::chrono::steady_clock::now() - s15_rt_start > std::chrono::minutes(20);
-                if (s15_src_late && !s15_src_dumped &&
+                if (s15_src_late && std::chrono::steady_clock::now() >= s15_src_next &&
+                    s15_src_dumps < 6 &&
                     sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
                     sv.size.width >= 960 && sv.Resource() != nullptr) {
-                    s15_src_dumped = true;
+                    s15_src_next = std::chrono::steady_clock::now() + std::chrono::minutes(4);
+                    ++s15_src_dumps;
                     (void)D3D12::RecordTextureContentDump(
                         m_device.GetDevice(), m_command_list, sv.Resource(),
                         static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
@@ -2443,9 +2447,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                             s15_post_desc.Width >= 960 && s15_post_desc.Width <= 1400;
                 const bool s15_post_lut = depth_view == nullptr && s15_post_desc.Width <= 512 &&
                                           s15_post_desc.Height <= 512;
-                static u32 s15_post_dumps = 0;
-                if ((s15_post_scene || s15_post_lut) && s15_post_dumps < 8) {
-                    ++s15_post_dumps;
+                static u32 s15_post_scene_dumps = 0;
+                static u32 s15_post_lut_dumps = 0;
+                static std::chrono::steady_clock::time_point s15_post_start =
+                    std::chrono::steady_clock::now();
+                const bool s15_post_late =
+                    std::chrono::steady_clock::now() - s15_post_start > std::chrono::minutes(20);
+                const bool s15_post_scene_budget =
+                    s15_post_scene && s15_post_late && s15_post_scene_dumps < 4;
+                const bool s15_post_lut_budget = s15_post_lut && s15_post_lut_dumps < 8;
+                if (s15_post_scene_budget || s15_post_lut_budget) {
+                    const u32 s15_post_index =
+                        s15_post_scene_budget ? (930000u + ++s15_post_scene_dumps)
+                                              : (920000u + ++s15_post_lut_dumps);
                     LOG_WARNING(Render_D3D12,
                                 "S15 post-draw RT: gpu={:#x} res=0x{:x} {}x{} depth={} verts={} "
                                 "lut={}",
@@ -2457,7 +2471,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         m_device.GetDevice(), m_command_list, s15_post_res,
                         static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
                         static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
-                        920000u + s15_post_dumps, true);
+                        s15_post_index, true);
+                    if (s15_post_scene_budget) {
+                        D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list,
+                                                            s15_post_res);
+                    }
                 }
             }
         }
