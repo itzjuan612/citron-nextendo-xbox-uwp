@@ -1859,7 +1859,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 static u32 s15_comp_src_dumps = 0;
                 const bool s15_comp_src_due =
                     std::chrono::steady_clock::now() >= s15_comp_src_next &&
-                    s15_comp_src_dumps < 12;
+                    s15_comp_src_dumps < 24;
                 for (const DrawSlot& slot : res_slots) {
                     if (slot.kind != SlotKind::Sampled || s15_comp_dumps >= 2) {
                         continue;
@@ -2806,12 +2806,80 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             }
                             ++s15_small_sampled;
                         }
+                        const D3D12_VIEWPORT s15_small_vp = MakeViewport(regs);
+                        const D3D12_RECT s15_small_sc = MakeScissor(regs);
                         LOG_WARNING(Render_D3D12,
                                     "S15 small scene writer #{}: verts={} att={:#x} sampled={} "
-                                    "{}",
+                                    "vp=({},{},{},{}) sc=({},{},{},{}) blend={} {}",
                                     s15_small_writer_logs, params.num_vertices,
                                     stored.pipeline->State().attachments[0].raw,
-                                    s15_small_sampled, fmt::to_string(s15_small_chain));
+                                    s15_small_sampled, s15_small_vp.TopLeftX,
+                                    s15_small_vp.TopLeftY, s15_small_vp.Width,
+                                    s15_small_vp.Height, s15_small_sc.left, s15_small_sc.top,
+                                    s15_small_sc.right, s15_small_sc.bottom,
+                                    stored.pipeline->State().attachments[0].enable.Value(),
+                                    fmt::to_string(s15_small_chain));
+                        // Post-draw content dump of the scene RT for every small writer
+                        // event that logs (970xxx), so the wiper's effect on the RT is
+                        // visible even if the 960xxx per-writer budget is exhausted:
+                        // before-content in the 960xxx series, after-content in 970xxx.
+                        static u32 s15_small_writer_dumps = 0;
+                        if (s15_small_writer_dumps < 16) {
+                            ++s15_small_writer_dumps;
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, s15_post_res,
+                                static_cast<u32>(
+                                    VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                                static_cast<u64>(
+                                    framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                970000u + s15_small_writer_dumps, /*force=*/true);
+                        }
+                        // TEMP DIAGNOSTIC (session 15): the zeroing ("wiper") draw
+                        // signature: <=4 verts, write-mask low nibble 0x7 (RGB only, no
+                        // alpha) and <=2 sampled slots. The same-rt self-sampler (mask
+                        // 0xf) is already covered by the feedback-loop dumps above and is
+                        // excluded by the 0x7 check. Dump the wiper's INPUT textures
+                        // (their own image ids, forced so the per-image dedupe cannot
+                        // skip them) so a zeroed RT can be attributed to a zero input;
+                        // bounded to the first 4 such events, up to 3 inputs each.
+                        if (params.num_vertices <= 4 &&
+                            (stored.pipeline->State().attachments[0].raw & 0xFu) == 0x7u &&
+                            s15_small_sampled <= 2) {
+                            static u32 s15_wiper_input_events = 0;
+                            if (s15_wiper_input_events < 4) {
+                                ++s15_wiper_input_events;
+                                fmt::memory_buffer s15_wiper_chain;
+                                u32 s15_wiper_dumped = 0;
+                                for (const DrawSlot& slot : res_slots) {
+                                    if (slot.kind != SlotKind::Sampled) {
+                                        continue;
+                                    }
+                                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                                    fmt::format_to(
+                                        std::back_inserter(s15_wiper_chain),
+                                        "[img={} gpu={:#x} fmt={:#x} res=0x{:x} same_rt={}]",
+                                        sv.image_id.index, static_cast<u64>(sv.GpuAddr()),
+                                        static_cast<u32>(sv.format),
+                                        reinterpret_cast<u64>(sv.Resource()),
+                                        sv.Resource() == s15_post_res ? 1 : 0);
+                                    if (sv.Resource() != nullptr && s15_wiper_dumped < 3) {
+                                        ++s15_wiper_dumped;
+                                        (void)D3D12::RecordTextureContentDump(
+                                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                                            static_cast<u32>(sv.format),
+                                            static_cast<u64>(sv.GpuAddr()), sv.image_id.index,
+                                            /*force=*/true);
+                                    }
+                                }
+                                LOG_WARNING(
+                                    Render_D3D12,
+                                    "S15 wiper inputs: verts={} att={:#x} inputs={} dumped={} {}",
+                                    params.num_vertices,
+                                    stored.pipeline->State().attachments[0].raw,
+                                    s15_small_sampled, s15_wiper_dumped,
+                                    fmt::to_string(s15_wiper_chain));
+                            }
+                        }
                     }
                 }
                 static u32 s15_post_scene_dumps = 0;
