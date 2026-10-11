@@ -1702,6 +1702,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // unconditionally. The duplicate call inside the logging loop is harmless
                 // because RecordTextureContentDump dedupes per image.
                 u32 s15_comp_dumps = 0;
+                // TEMP DIAGNOSTIC (session 15): also dump the style-phase scene source the
+                // composite samples (B10G11R11, any width >= 960), bounded to ~once per 45 s:
+                // this is the exact image the composite reads, so its content at composite
+                // time decides whether the loss is the scene RT or the composite path.
+                static std::chrono::steady_clock::time_point s15_comp_src_next =
+                    std::chrono::steady_clock::now();
+                static u32 s15_comp_src_dumps = 0;
+                const bool s15_comp_src_due =
+                    std::chrono::steady_clock::now() >= s15_comp_src_next &&
+                    s15_comp_src_dumps < 12;
                 for (const DrawSlot& slot : res_slots) {
                     if (slot.kind != SlotKind::Sampled || s15_comp_dumps >= 2) {
                         continue;
@@ -1709,7 +1719,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     ImageView& sv = m_texture_cache.GetImageView(slot.view);
                     if (sv.Resource() != nullptr &&
                         sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                        sv.size.width >= 1920 && !s15_is_current_rt(sv.Resource())) {
+                        ((sv.size.width >= 1920 && !s15_is_current_rt(sv.Resource())) ||
+                         (s15_comp_src_due && sv.size.width >= 960 &&
+                          !s15_is_current_rt(sv.Resource())))) {
                         const bool s15_comp_force =
                             !s15_comp_late_dumped &&
                             std::chrono::steady_clock::now() - s15_comp_start >
@@ -1717,10 +1729,21 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         if (s15_comp_force) {
                             s15_comp_late_dumped = true;
                         }
+                        if (s15_comp_src_due && sv.size.width >= 960 && sv.size.width < 1920) {
+                            s15_comp_src_next =
+                                std::chrono::steady_clock::now() + std::chrono::seconds(45);
+                            ++s15_comp_src_dumps;
+                            LOG_WARNING(Render_D3D12,
+                                        "S15 composite scene source: img={} gpu={:#x} {}x{} "
+                                        "fmt={:#x} res={}",
+                                        sv.image_id.index, static_cast<u64>(sv.GpuAddr()),
+                                        sv.size.width, sv.size.height,
+                                        static_cast<u32>(sv.format), sv.Resource() ? 1 : 0);
+                        }
                         (void)D3D12::RecordTextureContentDump(
                             m_device.GetDevice(), m_command_list, sv.Resource(),
                             static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
-                            sv.image_id.index, s15_comp_force);
+                            sv.image_id.index, s15_comp_force || s15_comp_src_due);
                     }
                 }
                 // TEMP DIAGNOSTIC (session 15): capture the 1080p scene source the compositor
@@ -2477,7 +2500,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             ID3D12Resource* const s15_post_res = framebuffer->ColorBuffers()[0]->Resource();
             const D3D12_RESOURCE_DESC s15_post_desc = s15_post_res->GetDesc();
             if (s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
-                const bool s15_post_scene = depth_view != nullptr &&
+                // The scene-class probe must latch the COLOR pass, not the depth-only prepass
+                // (att mask 0 writes no color, so its post-draw RT readback is legitimately
+                // unchanged). Require at least one color channel to be written.
+                const auto s15_post_mask = stored.pipeline->State().attachments[0].Mask();
+                const bool s15_post_color =
+                    s15_post_mask[0] || s15_post_mask[1] || s15_post_mask[2];
+                const bool s15_post_scene = depth_view != nullptr && s15_post_color &&
                                             params.num_vertices >= 4000 &&
                                             s15_post_desc.Width >= 960 && s15_post_desc.Width <= 1400;
                 const bool s15_post_lut = depth_view == nullptr && s15_post_desc.Width <= 512 &&
