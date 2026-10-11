@@ -2528,20 +2528,71 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         break;
                     }
                 }
+                // Separate budgets so the boot LUT self-sampling draws (128 wide) cannot
+                // starve the scene-RT ones (the earlier single cap was consumed at t=221).
                 static u32 s15_post_feedback_dumps = 0;
-                if (s15_post_feedback && s15_post_feedback_dumps < 16) {
-                    ++s15_post_feedback_dumps;
+                static u32 s15_post_feedback_scene_dumps = 0;
+                u32& s15_fb_counter =
+                    s15_post_desc.Width >= 512 ? s15_post_feedback_scene_dumps
+                                               : s15_post_feedback_dumps;
+                if (s15_post_feedback && s15_fb_counter < 24) {
+                    ++s15_fb_counter;
                     LOG_WARNING(Render_D3D12,
                                 "S15 feedback loop draw: gpu={:#x} res=0x{:x} {}x{} verts={} "
-                                "color={}",
+                                "color={} n={}",
                                 static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
                                 reinterpret_cast<u64>(s15_post_res), s15_post_desc.Width,
-                                s15_post_desc.Height, params.num_vertices, s15_post_color ? 1 : 0);
+                                s15_post_desc.Height, params.num_vertices, s15_post_color ? 1 : 0,
+                                s15_fb_counter);
                     (void)D3D12::RecordTextureContentDump(
                         m_device.GetDevice(), m_command_list, s15_post_res,
                         static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
                         static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
-                        940000u + s15_post_feedback_dumps, true);
+                        940000u + s15_fb_counter +
+                            (s15_post_desc.Width >= 512 ? 100u : 0u),
+                        true);
+                }
+                // TEMP DIAGNOSTIC (session 15): sequence trace of EVERY writer to the 960x540
+                // scene RT for the first draws after 20 minutes, so the pass that zeroes the
+                // RT (or the last writer before the composite) is directly visible. Post-draw
+                // state per writer, ids 960xxx, bounded.
+                {
+                    static u32 s15_scene_writer_dumps = 0;
+                    static std::chrono::steady_clock::time_point s15_scene_writer_start =
+                        std::chrono::steady_clock::now();
+                    const bool s15_scene_writer_late =
+                        std::chrono::steady_clock::now() - s15_scene_writer_start >
+                        std::chrono::minutes(20);
+                    if (s15_scene_writer_late && s15_scene_writer_dumps < 64 &&
+                        s15_post_desc.Width >= 900 && s15_post_desc.Width <= 1000 &&
+                        s15_post_desc.Height >= 500 && s15_post_desc.Height <= 600) {
+                        ++s15_scene_writer_dumps;
+                        u32 s15_writer_sampled = 0;
+                        u32 s15_writer_feedback = 0;
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ++s15_writer_sampled;
+                            ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                            if (sv.Resource() == s15_post_res) {
+                                ++s15_writer_feedback;
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 scene writer #{}: gpu={:#x} res=0x{:x} verts={} att={:#x} "
+                                    "sampled={} self_sample={} depth={}",
+                                    s15_scene_writer_dumps,
+                                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                    reinterpret_cast<u64>(s15_post_res), params.num_vertices,
+                                    stored.pipeline->State().attachments[0].raw, s15_writer_sampled,
+                                    s15_writer_feedback, depth_view != nullptr ? 1 : 0);
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, s15_post_res,
+                            static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                            static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                            960000u + s15_scene_writer_dumps, true);
+                    }
                 }
                 static u32 s15_post_scene_dumps = 0;
                 static u32 s15_post_lut_dumps = 0;
