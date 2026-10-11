@@ -1559,10 +1559,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     continue;
                 }
                 const D3D12_RESOURCE_DESC s15_rt_desc = s15_rt_view->Resource()->GetDesc();
-                s15_chain += fmt::format("[rt {:#x} {:#x} {}x{}]",
+                s15_chain += fmt::format("[rt {:#x} {:#x} {}x{} res=0x{:x}]",
                                          static_cast<u64>(s15_rt_view->GpuAddr()),
                                          static_cast<u32>(s15_rt_desc.Format), s15_rt_desc.Width,
-                                         s15_rt_desc.Height);
+                                         s15_rt_desc.Height,
+                                         reinterpret_cast<u64>(s15_rt_view->Resource()));
                 s15_sig = s15_sig * 1099511628211ull ^ static_cast<u64>(s15_rt_view->GpuAddr());
                 if (s15_rt_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
                     s15_rt_desc.Width >= 960) {
@@ -1577,8 +1578,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 if (sv.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
                     continue;
                 }
-                s15_chain += fmt::format("[tex {:#x} {}x{}]", static_cast<u64>(sv.GpuAddr()),
-                                         sv.size.width, sv.size.height);
+                s15_chain += fmt::format("[tex {:#x} {}x{} res=0x{:x}]",
+                                         static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                         sv.size.height, reinterpret_cast<u64>(sv.Resource()));
                 s15_sig = s15_sig * 1099511628211ull ^ static_cast<u64>(sv.GpuAddr());
                 if (sv.size.width >= 960) {
                     s15_relevant = true;
@@ -2009,9 +2011,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // guest memory, independent of the larger draw-latched dump above.
             {
                 static bool s15_lut_dumped = false;
+                static bool s15_lut_late_done = false;
+                static std::chrono::steady_clock::time_point s15_lut_start =
+                    std::chrono::steady_clock::now();
+                const bool s15_lut_late =
+                    std::chrono::steady_clock::now() - s15_lut_start > std::chrono::minutes(20);
+                const bool s15_lut_run = !s15_lut_dumped || (s15_lut_late && !s15_lut_late_done);
                 u32 s15_lut_slots = 0;
                 for (const DrawSlot& slot : res_slots) {
-                    if (s15_lut_dumped || slot.kind != SlotKind::Sampled || s15_lut_slots >= 4) {
+                    if (!s15_lut_run || slot.kind != SlotKind::Sampled || s15_lut_slots >= 4) {
                         continue;
                     }
                     ImageView& sv = m_texture_cache.GetImageView(slot.view);
@@ -2051,13 +2059,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                     LOG_WARNING(Render_D3D12,
                                 "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} dev={:#x} "
-                                "nz={}/{} hex={}",
+                                "nz={}/{} hex={} verts={}",
                                 sv.image_id.index, static_cast<u64>(sv.GpuAddr()), sv.size.width,
                                 sv.size.height, static_cast<u32>(sv.format),
-                                dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex);
+                                dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex,
+                                params.num_vertices);
                 }
-                if (!s15_lut_dumped && s15_lut_slots > 0) {
-                    s15_lut_dumped = true;
+                if (s15_lut_run && s15_lut_slots > 0) {
+                    if (!s15_lut_dumped) {
+                        s15_lut_dumped = true;
+                    }
+                    if (s15_lut_late) {
+                        s15_lut_late_done = true;
+                    }
                 }
             }
             if (scene3d_index < 8 ||
@@ -2413,6 +2427,40 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         const HRESULT diag_reason = m_device.GetDevice()->GetDeviceRemovedReason();
         LOG_ERROR(Render_D3D12, "DIAG draw {}: post-flush device reason {:#x}", diag_index,
                   static_cast<u32>(diag_reason));
+    }
+
+    // TEMP DIAGNOSTIC (session 15): post-draw content probe of the R11G11B10 RTs (runs after
+    // the draw command, unlike the early per-RT probe), to see whether the big scene draw's
+    // own output and the small LUT renders actually land.
+    {
+        if (framebuffer != nullptr && num_rtvs > 0 && framebuffer->ColorBuffers()[0] != nullptr &&
+            framebuffer->ColorBuffers()[0]->Resource() != nullptr) {
+            ID3D12Resource* const s15_post_res = framebuffer->ColorBuffers()[0]->Resource();
+            const D3D12_RESOURCE_DESC s15_post_desc = s15_post_res->GetDesc();
+            if (s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+                const bool s15_post_scene = depth_view != nullptr &&
+                                            params.num_vertices >= 4000 &&
+                                            s15_post_desc.Width >= 960 && s15_post_desc.Width <= 1400;
+                const bool s15_post_lut = depth_view == nullptr && s15_post_desc.Width <= 512 &&
+                                          s15_post_desc.Height <= 512;
+                static u32 s15_post_dumps = 0;
+                if ((s15_post_scene || s15_post_lut) && s15_post_dumps < 8) {
+                    ++s15_post_dumps;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 post-draw RT: gpu={:#x} res=0x{:x} {}x{} depth={} verts={} "
+                                "lut={}",
+                                static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                reinterpret_cast<u64>(s15_post_res), s15_post_desc.Width,
+                                s15_post_desc.Height, depth_view != nullptr ? 1 : 0,
+                                params.num_vertices, s15_post_lut ? 1 : 0);
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, s15_post_res,
+                        static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                        920000u + s15_post_dumps, true);
+                }
+            }
+        }
     }
 
     // TEMP DIAGNOSTIC (session 15): capture the final composite target (1920x1080
