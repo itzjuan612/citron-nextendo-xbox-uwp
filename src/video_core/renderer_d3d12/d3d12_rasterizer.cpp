@@ -1724,7 +1724,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         }
                     }
                 }
-                if (s15_comp_n < 8 || (s15_comp_n % 4096 == 0 && s15_comp_n < 32768)) {
+                // TEMP DIAGNOSTIC (session 15): the early rate limit below suppressed the
+                // style-phase compositor lines, so also log the compositor's full sampled
+                // texture list a bounded number of times after 20 minutes, to see WHICH image
+                // the final composite actually samples at style phase (the 960x540 scene RT
+                // with content, or the dynamic-res ~1300x731 source).
+                static std::chrono::steady_clock::time_point s15_comp_late_start =
+                    std::chrono::steady_clock::now();
+                static u32 s15_comp_late_logs = 0;
+                const bool s15_comp_late_log =
+                    std::chrono::steady_clock::now() - s15_comp_late_start >
+                        std::chrono::minutes(20) &&
+                    s15_comp_late_logs < 12;
+                if (s15_comp_late_log) {
+                    ++s15_comp_late_logs;
+                }
+                if (s15_comp_n < 8 || (s15_comp_n % 4096 == 0 && s15_comp_n < 32768) ||
+                    s15_comp_late_log) {
                     std::string s15_texs;
                     for (const DrawSlot& slot : res_slots) {
                         if (slot.kind != SlotKind::Sampled) {
