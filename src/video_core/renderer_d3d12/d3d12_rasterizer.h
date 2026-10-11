@@ -126,6 +126,19 @@ private:
     /// Resolves TIC handles for one draw and fills the shader-visible descriptor tables.
     void ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeline& stored, u32 instance_count);
 
+    /// Snapshot copies of render-target resources that a draw samples while rendering into
+    /// them. Sampling a live RTV is undefined on D3D12 (Xbox returns zeros, which the draw
+    /// then writes over the whole target - the scene RT was being wiped this way). The
+    /// snapshot is refreshed from the target for every feedback draw, before its RT
+    /// transition, and bound in place of the live SRV.
+    struct FeedbackSnapshot {
+        ID3D12Resource* source{};
+        D3D12_RESOURCE_DESC desc{};
+        ComPtr<ID3D12Resource> snapshot;
+    };
+    std::vector<FeedbackSnapshot> m_feedback_snapshots;
+    ID3D12Resource* GetFeedbackSnapshot(ID3D12Resource* src);
+
     /// DEFAULT-heap ring used to realign unaligned uniform ranges for root/table CBVs
     /// (a CBV address must be 256-byte aligned; UPLOAD staging cannot be a copy target).
     static constexpr u64 CBV_SCRATCH_SIZE = 1024 * 1024;

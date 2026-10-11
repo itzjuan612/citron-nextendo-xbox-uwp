@@ -128,6 +128,69 @@ RasterizerD3D12::RasterizerD3D12(Tegra::GPU& gpu,
 }
 RasterizerD3D12::~RasterizerD3D12() = default;
 
+ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
+    if (src == nullptr) {
+        return nullptr;
+    }
+    const D3D12_RESOURCE_DESC desc = src->GetDesc();
+    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width == 0 ||
+        desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
+        return nullptr;
+    }
+    // Keyed by descriptor, not source pointer: one scratch per distinct target shape.
+    // Entries are never destroyed or evicted once created (a command list in flight may
+    // still reference them); the cap just stops substituting for very exotic targets and
+    // falls back to the live SRV.
+    FeedbackSnapshot* entry = nullptr;
+    for (FeedbackSnapshot& candidate : m_feedback_snapshots) {
+        const D3D12_RESOURCE_DESC& cached = candidate.desc;
+        if (cached.Width == desc.Width && cached.Height == desc.Height &&
+            cached.Format == desc.Format && cached.DepthOrArraySize == desc.DepthOrArraySize &&
+            cached.MipLevels == desc.MipLevels &&
+            cached.SampleDesc.Count == desc.SampleDesc.Count) {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (entry == nullptr) {
+        if (m_feedback_snapshots.size() >= 16) {
+            return nullptr;
+        }
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap.CreationNodeMask = 1;
+        heap.VisibleNodeMask = 1;
+        ComPtr<ID3D12Resource> snapshot;
+        if (FAILED(m_device.GetDevice()->CreateCommittedResource(
+                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+                IID_PPV_ARGS(&snapshot)))) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                LOG_ERROR(Render_D3D12, "Feedback snapshot creation failed ({}x{})", desc.Width,
+                          desc.Height);
+            }
+            return nullptr;
+        }
+        m_feedback_snapshots.push_back(FeedbackSnapshot{nullptr, desc, std::move(snapshot)});
+        entry = &m_feedback_snapshots.back();
+    }
+    // Refresh the snapshot with the target's current contents. The target is in COMMON
+    // here: the RT transition to RENDER_TARGET is recorded after this descriptor fill.
+    // (In-order execution on one queue makes reusing one scratch per shape safe: the
+    // previous draw that sampled it has already executed by the time the next copy runs.)
+    m_command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE);
+    m_command_list.Transition(entry->snapshot.Get(), D3D12_RESOURCE_STATE_COMMON,
+                              D3D12_RESOURCE_STATE_COPY_DEST);
+    m_command_list.Get()->CopyResource(entry->snapshot.Get(), src);
+    m_command_list.Transition(entry->snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                              D3D12_RESOURCE_STATE_COMMON);
+    m_command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_COMMON);
+    return entry->snapshot.Get();
+}
+
 void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     if (kSkipDraws) {
         return;
@@ -1195,6 +1258,22 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     const u32 uav_slot_base = heap_base + num_cbv + num_res;
     ID3D12Device* const d3d = m_device.GetDevice();
 
+    // Feedback-loop detection (session 15): a draw that samples a resource it also renders
+    // into must not sample the live target - D3D12 leaves that read undefined (Xbox returns
+    // zeros) and the draw then writes the zeros back over the whole target.
+    const auto is_feedback_source = [&](ID3D12Resource* resource) {
+        if (resource == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < num_rtvs; ++i) {
+            ImageView* const rt = framebuffer != nullptr ? framebuffer->ColorBuffers()[i] : nullptr;
+            if (rt != nullptr && rt->Resource() == resource) {
+                return true;
+            }
+        }
+        return depth_view != nullptr && depth_view->Resource() == resource;
+    };
+
     for (u32 slot = 0; slot < num_cbv; ++slot) {
         const auto& record = bindings[cbv_records[slot]];
         D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
@@ -1245,6 +1324,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         D3D12_CPU_DESCRIPTOR_HANDLE prebuilt{};
         bool have_prebuilt = false;
         bool want_uav = false;
+        bool feedback_view_written = false;
         switch (slot.kind) {
         case SlotKind::Storage: {
             const auto& record = bindings[slot.record];
@@ -1270,14 +1350,28 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // No host path yet: null descriptors below.
             want_uav = slot.is_written;
             break;
-        case SlotKind::Sampled:
+        case SlotKind::Sampled: {
             if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
-                prebuilt = m_texture_cache.GetImageView(slot.view).Sampled();
+                ImageView& image_view = m_texture_cache.GetImageView(slot.view);
+                prebuilt = image_view.Sampled();
                 have_prebuilt = prebuilt.ptr != 0;
+                // Feedback loop: sample a snapshot copy of the target instead of the live
+                // resource (undefined read on D3D12; written back as zeros on Xbox).
+                if (have_prebuilt && is_feedback_source(image_view.Resource())) {
+                    if (ID3D12Resource* const snapshot = GetFeedbackSnapshot(image_view.Resource())) {
+                        image_view.CreateSampledViewFor(
+                            snapshot, m_res_heap.CpuHandle(srv_slot_base + k));
+                        have_prebuilt = false;
+                        feedback_view_written = true;
+                    }
+                }
             }
             break;
         }
-        if (have_prebuilt) {
+        }
+        if (feedback_view_written) {
+            // SRV already created directly into the table (feedback snapshot substitute).
+        } else if (have_prebuilt) {
             d3d->CopyDescriptorsSimple(1, m_res_heap.CpuHandle(srv_slot_base + k), prebuilt,
                                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
         } else if (resource) {

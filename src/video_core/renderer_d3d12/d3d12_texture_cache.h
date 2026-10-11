@@ -157,6 +157,12 @@ public:
         return storage_view;
     }
 
+    /// Creates an SRV with this view's description over `target`. Used to bind a snapshot
+    /// copy of an image that is also the current draw's render target: sampling the live
+    /// resource is undefined on D3D12 (the SRV read returns zeros on Xbox and the draw
+    /// then writes those zeros back), so the draw must sample a copy instead.
+    void CreateSampledViewFor(ID3D12Resource* target, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
+
     [[nodiscard]] bool IsRescaled() const noexcept {
         return false;
     }
@@ -180,6 +186,9 @@ private:
     D3D12_CPU_DESCRIPTOR_HANDLE sampled_view{};
     D3D12_CPU_DESCRIPTOR_HANDLE storage_view{};
     D3D12_CPU_DESCRIPTOR_HANDLE rt_view{};
+    Device* device{};
+    D3D12_SHADER_RESOURCE_VIEW_DESC sampled_desc{};
+    bool has_sampled_desc{};
 };
 
 /// TEMP DIAGNOSTIC: dumps the last texture uploads (called when a DIAG flush detects a

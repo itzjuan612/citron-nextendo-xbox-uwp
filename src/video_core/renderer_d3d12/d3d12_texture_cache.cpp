@@ -1062,6 +1062,13 @@ ImageView::ImageView(TextureCacheRuntime&, const VideoCommon::NullImageViewParam
 
 ImageView::~ImageView() = default;
 
+void ImageView::CreateSampledViewFor(ID3D12Resource* target,
+                                     D3D12_CPU_DESCRIPTOR_HANDLE handle) const {
+    if (target != nullptr && device != nullptr && has_sampled_desc) {
+        device->GetDevice()->CreateShaderResourceView(target, &sampled_desc, handle);
+    }
+}
+
 void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view_info) {
     ID3D12Resource* resource_ = image.Handle();
     if (!resource_) {
@@ -1116,6 +1123,9 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
             srv.Texture2D.MipLevels = num_mips;
         }
         image.device->GetDevice()->CreateShaderResourceView(resource, &srv, sampled_view);
+        device = image.device;
+        sampled_desc = srv;
+        has_sampled_desc = true;
     }
 
     if (image.IsDepthStencil()) {
