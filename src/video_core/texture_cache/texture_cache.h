@@ -1175,6 +1175,38 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+    // TEMP DIAGNOSTIC (S15): log uploads that could clobber the 960x540 scene RT
+    // (gpu 0x5103e0000, ~2073600 bytes). If a stray CPU write marks this image CpuModified,
+    // RefreshContents re-uploads guest memory over the freshly GPU-rendered content; log a
+    // small guest-memory prefix to tell whether the uploaded bytes are zero. Log-only.
+    {
+        static u32 refresh_diag_logs = 0;
+        const u64 diag_size = image.guest_size_bytes;
+        const bool diag_addr = (static_cast<u64>(image.gpu_addr) == 0x5103e0000ULL);
+        const bool diag_size_match = (diag_size >= 2000000ULL && diag_size <= 2100000ULL);
+        if (refresh_diag_logs < 24 && (diag_addr || diag_size_match)) {
+            ++refresh_diag_logs;
+            std::array<u8, 16> diag_prefix{};
+            u32 diag_nz = 0;
+            const std::size_t diag_read =
+                std::min<std::size_t>(diag_prefix.size(), staging.mapped_span.size());
+            gpu_memory->ReadBlock(static_cast<GPUVAddr>(image.gpu_addr), diag_prefix.data(),
+                                  diag_read, VideoCommon::CacheType::NoTextureCache);
+            for (std::size_t i = 0; i < diag_read; ++i) {
+                if (diag_prefix[i] != 0) {
+                    ++diag_nz;
+                }
+            }
+            LOG_WARNING(Render_D3D12,
+                        "S15 RefreshContents upload: gpu={:#x} size={} {}x{} fmt={:#x} "
+                        "prefix_nz={}/{} prefix={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        static_cast<u64>(image.gpu_addr), diag_size, image.info.size.width,
+                        image.info.size.height, static_cast<u32>(image.info.format), diag_nz,
+                        static_cast<u32>(diag_read), diag_prefix[0], diag_prefix[1], diag_prefix[2],
+                        diag_prefix[3], diag_prefix[4], diag_prefix[5], diag_prefix[6],
+                        diag_prefix[7]);
+        }
+    }
     UploadImageContents(image, staging);
     runtime.InsertUploadMemoryBarrier();
 }
