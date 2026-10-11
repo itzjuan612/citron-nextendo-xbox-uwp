@@ -604,12 +604,18 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     // Release the whole write-tracked page; GPU-written images keep exact bounds.
     const DAddr page_start = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(cpu_addr + size, Core::DEVICE_PAGESIZE);
-    ForEachImageInRegion(page_start, page_end - page_start, [this, cpu_addr, size](ImageId image_id,
-                                                                                   Image& image) {
+    ForEachImageInRegion(page_start, page_end - page_start, [this](ImageId image_id, Image& image) {
         if (True(image.flags & ImageFlagBits::CpuModified)) {
             return;
         }
-        if (True(image.flags & ImageFlagBits::GpuModified) && !image.Overlaps(cpu_addr, size)) {
+        // FIX (S15/S16): never let a guest CPU write mark a GPU-authored image as CPU-modified.
+        // Such an image's content is owned by the GPU (the scene render target was being
+        // re-uploaded from zero guest memory and wiped between the scene draw and the
+        // composite). The previous guard kept the CPU mark whenever the write overlapped the
+        // image, which page-aligned writes routinely do. Leaving GpuModified images untouched
+        // keeps the GPU content authoritative (a real CPU overwrite of such an image must go
+        // through an explicit download/invalidate, as everywhere else).
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
             return;
         }
         image.flags |= ImageFlagBits::CpuModified;
