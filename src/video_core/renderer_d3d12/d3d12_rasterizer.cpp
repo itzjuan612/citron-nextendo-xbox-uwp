@@ -137,31 +137,39 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
         desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
         return nullptr;
     }
-    // Keyed by source pointer, not descriptor: the descriptor match reused one scratch for
-    // a different aliased resource with the same shape, so a draw could sample a stale
-    // snapshot (or one refreshed for another resource) instead of this target's contents.
-    // Entries are never destroyed or evicted once created (a command list in flight may
-    // still reference them); the cap just stops substituting for very exotic targets and
-    // falls back to the live SRV.
+    // Keyed by source pointer AND desc shape: the texture cache can destroy an image and
+    // reuse its address for a differently-shaped resource, so a pointer-only match hit a
+    // stale entry, skipped creation, and refreshed/sampled a wrongly-shaped snapshot
+    // (mismatched-desc CopyResource/SRV => device removal). When full, the oldest entry is
+    // evicted (see below) so a fresh snapshot is always created.
     FeedbackSnapshot* entry = nullptr;
     for (FeedbackSnapshot& candidate : m_feedback_snapshots) {
-        if (candidate.source == src) {
+        const D3D12_RESOURCE_DESC& cached = candidate.desc;
+        if (candidate.source == src && cached.Width == desc.Width &&
+            cached.Height == desc.Height && cached.Format == desc.Format &&
+            cached.DepthOrArraySize == desc.DepthOrArraySize &&
+            cached.MipLevels == desc.MipLevels &&
+            cached.SampleDesc.Count == desc.SampleDesc.Count) {
             entry = &candidate;
             break;
         }
     }
     if (entry == nullptr) {
         if (m_feedback_snapshots.size() >= 24) {
-            static bool logged_cap = false;
-            if (!logged_cap) {
-                logged_cap = true;
+            static bool logged_evict = false;
+            if (!logged_evict) {
+                logged_evict = true;
                 LOG_WARNING(Render_D3D12,
-                            "Feedback snapshot cap reached ({} entries); live SRV fallback for "
-                            "res=0x{:x} {}x{} fmt={:#x}",
-                            m_feedback_snapshots.size(), reinterpret_cast<u64>(src), desc.Width,
-                            desc.Height, static_cast<u32>(desc.Format));
+                            "Feedback snapshot cache full ({} entries); evicting oldest "
+                            "(res=0x{:x})",
+                            m_feedback_snapshots.size(),
+                            reinterpret_cast<u64>(m_feedback_snapshots.front().source));
             }
-            return nullptr;
+            // Eviction is safe: the backend executes and waits for GPU idle at command-list
+            // boundaries (TickFrame/FlushCommands), so the current command list's snapshots
+            // are the newest entries and the oldest belongs to an already-completed
+            // command list.
+            m_feedback_snapshots.erase(m_feedback_snapshots.begin());
         }
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_DEFAULT;
