@@ -137,23 +137,30 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
         desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
         return nullptr;
     }
-    // Keyed by descriptor, not source pointer: one scratch per distinct target shape.
+    // Keyed by source pointer, not descriptor: the descriptor match reused one scratch for
+    // a different aliased resource with the same shape, so a draw could sample a stale
+    // snapshot (or one refreshed for another resource) instead of this target's contents.
     // Entries are never destroyed or evicted once created (a command list in flight may
     // still reference them); the cap just stops substituting for very exotic targets and
     // falls back to the live SRV.
     FeedbackSnapshot* entry = nullptr;
     for (FeedbackSnapshot& candidate : m_feedback_snapshots) {
-        const D3D12_RESOURCE_DESC& cached = candidate.desc;
-        if (cached.Width == desc.Width && cached.Height == desc.Height &&
-            cached.Format == desc.Format && cached.DepthOrArraySize == desc.DepthOrArraySize &&
-            cached.MipLevels == desc.MipLevels &&
-            cached.SampleDesc.Count == desc.SampleDesc.Count) {
+        if (candidate.source == src) {
             entry = &candidate;
             break;
         }
     }
     if (entry == nullptr) {
-        if (m_feedback_snapshots.size() >= 16) {
+        if (m_feedback_snapshots.size() >= 24) {
+            static bool logged_cap = false;
+            if (!logged_cap) {
+                logged_cap = true;
+                LOG_WARNING(Render_D3D12,
+                            "Feedback snapshot cap reached ({} entries); live SRV fallback for "
+                            "res=0x{:x} {}x{} fmt={:#x}",
+                            m_feedback_snapshots.size(), reinterpret_cast<u64>(src), desc.Width,
+                            desc.Height, static_cast<u32>(desc.Format));
+            }
             return nullptr;
         }
         D3D12_HEAP_PROPERTIES heap{};
@@ -161,18 +168,19 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
         heap.CreationNodeMask = 1;
         heap.VisibleNodeMask = 1;
         ComPtr<ID3D12Resource> snapshot;
-        if (FAILED(m_device.GetDevice()->CreateCommittedResource(
-                &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                IID_PPV_ARGS(&snapshot)))) {
+        const HRESULT hr = m_device.GetDevice()->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr,
+            IID_PPV_ARGS(&snapshot));
+        if (FAILED(hr)) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                LOG_ERROR(Render_D3D12, "Feedback snapshot creation failed ({}x{})", desc.Width,
-                          desc.Height);
+                LOG_ERROR(Render_D3D12, "Feedback snapshot creation failed ({}x{}) hr={:#x}",
+                          desc.Width, desc.Height, static_cast<u32>(hr));
             }
             return nullptr;
         }
-        m_feedback_snapshots.push_back(FeedbackSnapshot{nullptr, desc, std::move(snapshot)});
+        m_feedback_snapshots.push_back(FeedbackSnapshot{src, desc, std::move(snapshot)});
         entry = &m_feedback_snapshots.back();
     }
     // Refresh the snapshot with the target's current contents. The target is in COMMON
@@ -188,6 +196,15 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
                               D3D12_RESOURCE_STATE_COMMON);
     m_command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE,
                               D3D12_RESOURCE_STATE_COMMON);
+    static u32 s15_fb_refresh_logs = 0;
+    if (s15_fb_refresh_logs < 24) {
+        ++s15_fb_refresh_logs;
+        LOG_WARNING(Render_D3D12,
+                    "S15 feedback snapshot refresh #{}: src=0x{:x} snap=0x{:x} {}x{} fmt={:#x}",
+                    s15_fb_refresh_logs, reinterpret_cast<u64>(src),
+                    reinterpret_cast<u64>(entry->snapshot.Get()), desc.Width, desc.Height,
+                    static_cast<u32>(desc.Format));
+    }
     return entry->snapshot.Get();
 }
 
@@ -1261,17 +1278,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // Feedback-loop detection (session 15): a draw that samples a resource it also renders
     // into must not sample the live target - D3D12 leaves that read undefined (Xbox returns
     // zeros) and the draw then writes the zeros back over the whole target.
-    const auto is_feedback_source = [&](ID3D12Resource* resource) {
-        if (resource == nullptr) {
+    const auto is_feedback_source = [&](const ImageView& view) {
+        if (view.Resource() == nullptr) {
             return false;
         }
         for (size_t i = 0; i < num_rtvs; ++i) {
             ImageView* const rt = framebuffer != nullptr ? framebuffer->ColorBuffers()[i] : nullptr;
-            if (rt != nullptr && rt->Resource() == resource) {
+            if (rt != nullptr && (rt->Resource() == view.Resource() ||
+                                  rt->GpuAddr() == view.GpuAddr())) {
                 return true;
             }
         }
-        return depth_view != nullptr && depth_view->Resource() == resource;
+        return depth_view != nullptr && (depth_view->Resource() == view.Resource() ||
+                                         depth_view->GpuAddr() == view.GpuAddr());
     };
 
     for (u32 slot = 0; slot < num_cbv; ++slot) {
@@ -1357,12 +1376,39 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 have_prebuilt = prebuilt.ptr != 0;
                 // Feedback loop: sample a snapshot copy of the target instead of the live
                 // resource (undefined read on D3D12; written back as zeros on Xbox).
-                if (have_prebuilt && is_feedback_source(image_view.Resource())) {
-                    if (ID3D12Resource* const snapshot = GetFeedbackSnapshot(image_view.Resource())) {
+                if (is_feedback_source(image_view)) {
+                    ID3D12Resource* const snapshot = GetFeedbackSnapshot(image_view.Resource());
+                    static u32 s15_fb_slot_logs = 0;
+                    if (s15_fb_slot_logs < 64) {
+                        ++s15_fb_slot_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 feedback slot #{}: k={} prebuilt=0x{:x} res=0x{:x} "
+                                    "gpu=0x{:x} snap=0x{:x} srv_cpu=0x{:x} table=0x{:x} "
+                                    "num_rtvs={}",
+                                    s15_fb_slot_logs, k, static_cast<u64>(prebuilt.ptr),
+                                    reinterpret_cast<u64>(image_view.Resource()),
+                                    static_cast<u64>(image_view.GpuAddr()),
+                                    reinterpret_cast<u64>(snapshot),
+                                    static_cast<u64>(m_res_heap.CpuHandle(srv_slot_base + k).ptr),
+                                    static_cast<u64>(m_res_heap.GpuHandle(srv_slot_base).ptr),
+                                    num_rtvs);
+                    }
+                    if (have_prebuilt && snapshot != nullptr) {
                         image_view.CreateSampledViewFor(
                             snapshot, m_res_heap.CpuHandle(srv_slot_base + k));
                         have_prebuilt = false;
                         feedback_view_written = true;
+                        // Verify what the snapshot actually contains (bounded).
+                        static u32 s15_fb_dump_logs = 0;
+                        if (s15_fb_dump_logs < 24) {
+                            ++s15_fb_dump_logs;
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, snapshot,
+                                static_cast<u32>(image_view.format),
+                                static_cast<u64>(image_view.GpuAddr()),
+                                941000u + s15_fb_dump_logs,
+                                /*force=*/true);
+                        }
                     }
                 }
             }
@@ -2221,6 +2267,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 sv.size.height, static_cast<u32>(sv.format),
                                 dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex,
                                 params.num_vertices);
+                    // ONE-SHOT: enumerate every cached image registered over the 27 MB LUT
+                    // bank (cpu 0x29426000) once the 256x256 LUT sub-view itself is the
+                    // probed image, so aliasing/sibling coverage of that region is visible
+                    // in one run.
+                    static bool s15_lut_siblings_done = false;
+                    if (!s15_lut_siblings_done &&
+                        static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull) {
+                        s15_lut_siblings_done = true;
+                        LOG_WARNING(
+                            Render_D3D12,
+                            "S15 LUT region: cpu=0x29426000 size=0x1a40000 gpu_modified={}",
+                            m_texture_cache.IsRegionGpuModified(0x29426000u, 0x1a40000u) ? 1
+                                                                                          : 0);
+                        u32 s15_sib_count = 0;
+                        m_texture_cache.ForEachImageInRegion(
+                            0x29426000u, 0x1a40000u,
+                            [&](VideoCommon::ImageId image_id, auto& image) {
+                                if (s15_sib_count >= 8) {
+                                    return;
+                                }
+                                ++s15_sib_count;
+                                LOG_WARNING(
+                                    Render_D3D12,
+                                    "S15 LUT sibling: id={} gpu={:#x} flags={:#x} size={} "
+                                    "fmt={:#x} tick={}",
+                                    image_id.index, static_cast<u64>(image.gpu_addr),
+                                    static_cast<u32>(image.flags), image.guest_size_bytes,
+                                    static_cast<u32>(image.info.format), image.modification_tick);
+                            });
+                    }
                 }
                 if (s15_lut_run && s15_lut_slots > 0) {
                     if (!s15_lut_dumped) {
@@ -2686,6 +2762,48 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
                             static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
                             960000u + s15_scene_writer_dumps, true);
+                    }
+                }
+                // TEMP DIAGNOSTIC (session 15): the small writers (fullscreen/copy passes)
+                // into the scene RT, logged with its own budget so they cannot be starved
+                // by (or starve) the writer dump above. Late window + same RT size window,
+                // small vertex counts only.
+                {
+                    static u32 s15_small_writer_logs = 0;
+                    static std::chrono::steady_clock::time_point s15_small_writer_start =
+                        std::chrono::steady_clock::now();
+                    const bool s15_small_writer_late =
+                        std::chrono::steady_clock::now() - s15_small_writer_start >
+                        std::chrono::minutes(20);
+                    if (s15_small_writer_late && s15_small_writer_logs < 16 &&
+                        params.num_vertices <= 8 && s15_post_desc.Width >= 900 &&
+                        s15_post_desc.Width <= 1000 && s15_post_desc.Height >= 500 &&
+                        s15_post_desc.Height <= 600) {
+                        ++s15_small_writer_logs;
+                        fmt::memory_buffer s15_small_chain;
+                        u32 s15_small_sampled = 0;
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                            if (s15_small_sampled < 8) {
+                                fmt::format_to(
+                                    std::back_inserter(s15_small_chain),
+                                    "[img={} gpu={:#x} fmt={:#x} res=0x{:x} same_rt={}]",
+                                    sv.image_id.index, static_cast<u64>(sv.GpuAddr()),
+                                    static_cast<u32>(sv.format),
+                                    reinterpret_cast<u64>(sv.Resource()),
+                                    sv.Resource() == s15_post_res ? 1 : 0);
+                            }
+                            ++s15_small_sampled;
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 small scene writer #{}: verts={} att={:#x} sampled={} "
+                                    "{}",
+                                    s15_small_writer_logs, params.num_vertices,
+                                    stored.pipeline->State().attachments[0].raw,
+                                    s15_small_sampled, fmt::to_string(s15_small_chain));
                     }
                 }
                 static u32 s15_post_scene_dumps = 0;

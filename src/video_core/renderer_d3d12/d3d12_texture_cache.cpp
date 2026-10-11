@@ -1077,6 +1077,15 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
     resource = resource_;
     const DXGI_FORMAT sampled_format = SampledFormat(format);
     if (sampled_format == DXGI_FORMAT_UNKNOWN) {
+        // No SRV is ever created for this view (silently skips sampling for the image);
+        // log it once so a black-texture cause is visible in one console run.
+        static bool logged_no_sampled_format = false;
+        if (!logged_no_sampled_format) {
+            logged_no_sampled_format = true;
+            LOG_WARNING(Render_D3D12, "ImageView: no sampled format for fmt={:#x} ({}x{})",
+                        static_cast<u32>(format), image.info.size.width,
+                        image.info.size.height);
+        }
         return;
     }
     const D3D12_RESOURCE_DESC desc = resource->GetDesc();
@@ -1126,6 +1135,17 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
         device = image.device;
         sampled_desc = srv;
         has_sampled_desc = true;
+    } else {
+        // view_heap exhausted: DescriptorHeap::Allocate returns INVALID_INDEX (it does not
+        // assert); the sampled view is silently left null and the draw binds a null SRV.
+        static bool logged_srv_heap_exhausted = false;
+        if (!logged_srv_heap_exhausted) {
+            logged_srv_heap_exhausted = true;
+            LOG_ERROR(Render_D3D12,
+                      "ImageView: view_heap exhausted; sampled view left null (fmt={:#x} "
+                      "{}x{})",
+                      static_cast<u32>(format), image.info.size.width, image.info.size.height);
+        }
     }
 
     if (image.IsDepthStencil()) {
