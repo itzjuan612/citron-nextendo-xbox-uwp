@@ -1735,10 +1735,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             ++s15_comp_src_dumps;
                             LOG_WARNING(Render_D3D12,
                                         "S15 composite scene source: img={} gpu={:#x} {}x{} "
-                                        "fmt={:#x} res={}",
+                                        "fmt={:#x} res=0x{:x}",
                                         sv.image_id.index, static_cast<u64>(sv.GpuAddr()),
                                         sv.size.width, sv.size.height,
-                                        static_cast<u32>(sv.format), sv.Resource() ? 1 : 0);
+                                        static_cast<u32>(sv.format),
+                                        reinterpret_cast<u64>(sv.Resource()));
                         }
                         (void)D3D12::RecordTextureContentDump(
                             m_device.GetDevice(), m_command_list, sv.Resource(),
@@ -2511,6 +2512,37 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                             s15_post_desc.Width >= 960 && s15_post_desc.Width <= 1400;
                 const bool s15_post_lut = depth_view == nullptr && s15_post_desc.Width <= 512 &&
                                           s15_post_desc.Height <= 512;
+                // TEMP DIAGNOSTIC (session 15): feedback-loop detector. A draw that both
+                // samples and renders the SAME resource (rt == tex) is invalid on D3D12
+                // (sampling a live RTV returns undefined data, often zeros) and a prime
+                // suspect for the scene RT being wiped in place. Detect it and dump the RT
+                // right after such a draw (940xxx) so the wipe is directly observable.
+                bool s15_post_feedback = false;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled) {
+                        continue;
+                    }
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    if (sv.Resource() != nullptr && sv.Resource() == s15_post_res) {
+                        s15_post_feedback = true;
+                        break;
+                    }
+                }
+                static u32 s15_post_feedback_dumps = 0;
+                if (s15_post_feedback && s15_post_feedback_dumps < 16) {
+                    ++s15_post_feedback_dumps;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 feedback loop draw: gpu={:#x} res=0x{:x} {}x{} verts={} "
+                                "color={}",
+                                static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                reinterpret_cast<u64>(s15_post_res), s15_post_desc.Width,
+                                s15_post_desc.Height, params.num_vertices, s15_post_color ? 1 : 0);
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, s15_post_res,
+                        static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                        940000u + s15_post_feedback_dumps, true);
+                }
                 static u32 s15_post_scene_dumps = 0;
                 static u32 s15_post_lut_dumps = 0;
                 static std::chrono::steady_clock::time_point s15_post_start =
@@ -2992,6 +3024,24 @@ void RasterizerD3D12::Clear(u32 layer_count) {
     if (use_color && color_attachment < VideoCommon::NUM_RT) {
         const ImageView* const view = framebuffer->ColorBuffers()[color_attachment];
         ID3D12Resource* const resource = view ? view->Resource() : nullptr;
+        // TEMP DIAGNOSTIC (session 15): log color clears that target the 960x540 scene RT,
+        // to see whether (and when) the guest wipes the scene render target between the
+        // scene draws and the composite.
+        {
+            static u32 s15_scene_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr &&
+                static_cast<u64>(view->GpuAddr()) == 0x5103e0000ULL &&
+                s15_scene_clear_logs < 32) {
+                ++s15_scene_clear_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S15 scene RT clear: gpu={:#x} color0=({},{},{},{}) scissor={} "
+                            "rect=({},{},{},{})",
+                            static_cast<u64>(view->GpuAddr()), regs.clear_color[0],
+                            regs.clear_color[1], regs.clear_color[2], regs.clear_color[3],
+                            regs.clear_control.use_scissor ? 1 : 0, clear_rect.left,
+                            clear_rect.top, clear_rect.right, clear_rect.bottom);
+            }
+        }
         if (view != nullptr && resource != nullptr && view->RenderTarget().ptr != 0) {
             // Clear-value conversion mirrors RasterizerVulkan::Clear: regs.clear_color is
             // a std::array<f32, 4>, so a non-integer render target takes its components
