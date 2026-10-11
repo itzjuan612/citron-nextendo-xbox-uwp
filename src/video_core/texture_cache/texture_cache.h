@@ -1171,6 +1171,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     image.flags &= ~ImageFlagBits::CpuModified;
     TrackImage(image, image_id);
 
+    // FIX (S15/S16): never upload guest bytes over a GPU-authored image. The scene's lighting
+    // LUT bank, mask and dynamic-res render targets are written by the GPU while the guest
+    // memory beneath them stays zero; any stale CpuModified mark (UnmapGPUMemory, the
+    // full-clear invalidate window, or an alias sibling) would otherwise let the upload path
+    // wipe the rendered content with zeros. This is the single choke point every mark path
+    // shares. A legitimate CPU overwrite must go through an explicit download/invalidate.
+    if (True(image.flags & ImageFlagBits::GpuModified)) {
+        static u32 refresh_gpu_wins_logs = 0;
+        if (refresh_gpu_wins_logs < 24) {
+            ++refresh_gpu_wins_logs;
+            LOG_WARNING(Render_D3D12,
+                        "RefreshContents: skipping upload over GpuModified image gpu={:#x} "
+                        "{}x{} fmt={:#x}",
+                        static_cast<u64>(image.gpu_addr), image.info.size.width,
+                        image.info.size.height, static_cast<u32>(image.info.format));
+        }
+        return;
+    }
+
     if (image.info.num_samples > 1 && !runtime.CanUploadMSAA()) {
         LOG_WARNING(HW_GPU, "MSAA image uploads are not implemented");
         runtime.TransitionImageLayout(image);
@@ -1188,7 +1207,10 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     {
         static u32 refresh_diag_logs = 0;
         const u64 diag_size = image.guest_size_bytes;
-        const bool diag_addr = (static_cast<u64>(image.gpu_addr) == 0x5103e0000ULL);
+        const u64 diag_gpu = static_cast<u64>(image.gpu_addr);
+        // Scene RT, the 256x256 lighting-LUT bank (JoinImages layer stack) and the mask.
+        const bool diag_addr =
+            diag_gpu == 0x5103e0000ULL || diag_gpu == 0x5eb340000ULL || diag_gpu == 0x510f30000ULL;
         const bool diag_size_match = (diag_size >= 2000000ULL && diag_size <= 2100000ULL);
         if (refresh_diag_logs < 24 && (diag_addr || diag_size_match)) {
             ++refresh_diag_logs;
@@ -1752,7 +1774,14 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
         if (copy_object.is_alias) {
-            if (!overlap.IsSafeDownload()) {
+            // FIX (S15/S16): preserve GPU-authored alias content. IsSafeDownload() is a
+            // guest-download safety predicate; using it here skipped the device-local
+            // GPU->GPU preservation copy for exactly the images that need it (GpuModified),
+            // leaving the new joined image zero (the lighting-LUT bank was lost this way).
+            // Copy iff the overlap holds GPU-authored content; CPU-authored content is
+            // re-uploaded by RefreshContents below. MSAA stays on the old skip path
+            // (CopyImage does not support it here).
+            if (False(overlap.flags & ImageFlagBits::GpuModified) || overlap.info.num_samples > 1) {
                 continue;
             }
             const auto alias_pointer = join_alias_indices.find(copy_object.id);

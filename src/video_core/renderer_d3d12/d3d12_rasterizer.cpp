@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -1403,6 +1404,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         ++rt_resource_count;
         m_command_list.Transition(resource, D3D12_RESOURCE_STATE_COMMON, state);
     };
+    // TEMP DIAGNOSTIC (session 15): in-draw probe dumps must never read back a resource that is
+    // currently bound as this draw's render target. RecordTextureContentDump records
+    // COMMON -> COPY_SOURCE, but the RT stays in RENDER_TARGET in the command stream until the
+    // restore loop at the end of ConfigureDraw; recording the dump mid-window produces an
+    // invalid transition pair on Xbox and can fail Close (dropping the whole batch). Skip any
+    // dump of a currently-bound RT/depth resource.
+    const auto s15_is_current_rt = [&](ID3D12Resource* resource) {
+        if (resource == nullptr) {
+            return false;
+        }
+        for (u32 i = 0; i < rt_resource_count; ++i) {
+            if (rt_resources[i] == resource) {
+                return true;
+            }
+        }
+        return false;
+    };
     for (size_t i = 0; i < num_rtvs; ++i) {
         ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
         rtvs[i] = view ? view->RenderTarget() : D3D12_CPU_DESCRIPTOR_HANDLE{0};
@@ -1634,7 +1652,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 if (s15_src_late && std::chrono::steady_clock::now() >= s15_src_next &&
                     s15_src_dumps < 6 &&
                     sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                    sv.size.width >= 960 && sv.Resource() != nullptr) {
+                    sv.size.width >= 960 && sv.Resource() != nullptr &&
+                    !s15_is_current_rt(sv.Resource())) {
                     s15_src_next = std::chrono::steady_clock::now() + std::chrono::minutes(4);
                     ++s15_src_dumps;
                     (void)D3D12::RecordTextureContentDump(
@@ -1690,7 +1709,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     ImageView& sv = m_texture_cache.GetImageView(slot.view);
                     if (sv.Resource() != nullptr &&
                         sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                        sv.size.width >= 1920) {
+                        sv.size.width >= 1920 && !s15_is_current_rt(sv.Resource())) {
                         const bool s15_comp_force =
                             !s15_comp_late_dumped &&
                             std::chrono::steady_clock::now() - s15_comp_start >
@@ -1754,7 +1773,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                 sv.Resource() ? 1 : 0);
                         if (sv.Resource() != nullptr &&
                             sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
-                            sv.size.width >= 1920) {
+                            sv.size.width >= 1920 && !s15_is_current_rt(sv.Resource())) {
                             (void)D3D12::RecordTextureContentDump(
                                 m_device.GetDevice(), m_command_list, sv.Resource(),
                                 static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
@@ -1946,7 +1965,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                     ++s15_sampled_seen;
                     ImageView& sv = m_texture_cache.GetImageView(slot.view);
-                    if (sv.Resource() != nullptr) {
+                    if (sv.Resource() != nullptr && !s15_is_current_rt(sv.Resource())) {
                         (void)D3D12::RecordTextureContentDump(
                             m_device.GetDevice(), m_command_list, sv.Resource(),
                             static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
@@ -2051,7 +2070,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         continue;
                     }
                     ++s15_lut_slots;
-                    if (sv.Resource() != nullptr) {
+                    if (sv.Resource() != nullptr && !s15_is_current_rt(sv.Resource())) {
                         (void)D3D12::RecordTextureContentDump(
                             m_device.GetDevice(), m_command_list, sv.Resource(),
                             static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
@@ -2491,6 +2510,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     if (s15_post_scene_budget) {
                         D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list,
                                                             s15_post_res);
+                        // TEMP DIAGNOSTIC (session 15): dump the sampled inputs of the EXACT
+                        // same scene draw as the 930xxx RT probe, so a black scene RT can be
+                        // correlated with its (possibly zero) sampled textures. Bounded to a
+                        // few probe events, up to 8 inputs each; force=true bypasses per-image
+                        // dedupe so every probe event really lands.
+                        static u32 s15_post_input_dumps = 0;
+                        if (s15_post_input_dumps < 4) {
+                            ++s15_post_input_dumps;
+                            fmt::memory_buffer s15_input_chain;
+                            u32 s15_input_count = 0;
+                            u32 s15_input_dumped = 0;
+                            for (const DrawSlot& slot : res_slots) {
+                                if (slot.kind != SlotKind::Sampled) {
+                                    continue;
+                                }
+                                ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                                if (sv.Resource() == nullptr) {
+                                    continue;
+                                }
+                                ++s15_input_count;
+                                fmt::format_to(std::back_inserter(s15_input_chain),
+                                               "[img={} gpu={:#x} {}x{} fmt={:#x} res={}]",
+                                               sv.image_id.index,
+                                               static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                               sv.size.height, static_cast<u32>(sv.format),
+                                               sv.Resource() ? 1 : 0);
+                                if (s15_input_dumped < 8) {
+                                    ++s15_input_dumped;
+                                    (void)D3D12::RecordTextureContentDump(
+                                        m_device.GetDevice(), m_command_list, sv.Resource(),
+                                        static_cast<u32>(sv.format),
+                                        static_cast<u64>(sv.GpuAddr()), sv.image_id.index,
+                                        /*force=*/true);
+                                }
+                            }
+                            LOG_WARNING(Render_D3D12,
+                                        "S15 scene-probe inputs: gpu={:#x} verts={} inputs={} "
+                                        "dumped={} {}",
+                                        static_cast<u64>(
+                                            framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                        params.num_vertices, s15_input_count, s15_input_dumped,
+                                        fmt::to_string(s15_input_chain));
+                        }
                     }
                 }
             }
