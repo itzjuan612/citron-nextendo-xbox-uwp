@@ -483,6 +483,63 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
     }
 
+    // TEMP DIAGNOSTIC (S15, producer tracer): the wiper-input window
+    // [0x517000000, 0x517200000) never appears in the decimated "Draw RTs" log; trace any
+    // draw that binds an RT or depth view inside it (unfiltered, two integer compares per
+    // RT, bounded to 16 logs). Likewise the dynamic-res family window
+    // [0x5103e0000, 0x510640000) minus the 960x540 member itself (bounded to 32): settles
+    // whether the scene ever renders into the members the composite samples.
+    {
+        static u32 s15_wiper_rt_logs = 0;
+        if (s15_wiper_rt_logs < 16) {
+            const ImageView* s15_wiper_rt = nullptr;
+            for (size_t i = 0; i < num_rtvs; ++i) {
+                const ImageView* const s15_view = framebuffer->ColorBuffers()[i];
+                const u64 s15_gpu = static_cast<u64>(s15_view->GpuAddr());
+                if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
+                    s15_wiper_rt = s15_view;
+                    break;
+                }
+            }
+            if (s15_wiper_rt == nullptr && depth_view != nullptr &&
+                depth_view->RenderTarget().ptr != 0) {
+                const u64 s15_gpu = static_cast<u64>(depth_view->GpuAddr());
+                if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
+                    s15_wiper_rt = depth_view;
+                }
+            }
+            if (s15_wiper_rt != nullptr) {
+                ++s15_wiper_rt_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S15 wiper-range RT: gpu={:#x} res={:#x} {}x{} att={:#x} verts={} "
+                            "depth={}",
+                            static_cast<u64>(s15_wiper_rt->GpuAddr()),
+                            reinterpret_cast<u64>(s15_wiper_rt->Resource()),
+                            s15_wiper_rt->size.width, s15_wiper_rt->size.height,
+                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                            depth_view != nullptr ? 1 : 0);
+            }
+        }
+    }
+    {
+        static u32 s15_family_writer_logs = 0;
+        if (s15_family_writer_logs < 32 && num_rtvs > 0) {
+            const ImageView* const s15_view = framebuffer->ColorBuffers()[0];
+            const u64 s15_gpu = static_cast<u64>(s15_view->GpuAddr());
+            if (s15_gpu >= 0x5103e0000ull && s15_gpu < 0x510640000ull &&
+                s15_gpu != 0x5103e0000ull) {
+                ++s15_family_writer_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S15 family writer: gpu={:#x} res={:#x} {}x{} att={:#x} verts={} "
+                            "blend={}",
+                            s15_gpu, reinterpret_cast<u64>(s15_view->Resource()),
+                            s15_view->size.width, s15_view->size.height,
+                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                            stored.pipeline->State().attachments[0].enable.Value());
+            }
+        }
+    }
+
     bool flinger_draw = false;
     {
         static bool marker_logged = false;
@@ -2879,6 +2936,90 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     s15_small_sampled, s15_wiper_dumped,
                                     fmt::to_string(s15_wiper_chain));
                             }
+                            // TEMP DIAGNOSTIC (S15): the wiper's blend factors from the
+                            // packed BlendingAttachment (own budget so the input dumps
+                            // above cannot starve it).
+                            {
+                                static u32 s15_wiper_blend_logs = 0;
+                                if (s15_wiper_blend_logs < 8) {
+                                    ++s15_wiper_blend_logs;
+                                    const auto& s15_att =
+                                        stored.pipeline->State().attachments[0];
+                                    LOG_WARNING(
+                                        Render_D3D12,
+                                        "S15 wiper blend: att={:#x} enable={} src={:#x} "
+                                        "dst={:#x} op={:#x} asrc={:#x} adst={:#x} aop={:#x}",
+                                        s15_att.raw, s15_att.enable.Value(),
+                                        s15_att.factor_source_rgb.Value(),
+                                        s15_att.factor_dest_rgb.Value(),
+                                        s15_att.equation_rgb.Value(),
+                                        s15_att.factor_source_a.Value(),
+                                        s15_att.factor_dest_a.Value(),
+                                        s15_att.equation_a.Value());
+                                }
+                            }
+                            // ONE-SHOT (S15): enumerate every cached image registered over
+                            // the wiper input's CPU memory (4 MB window) - a sibling image
+                            // over the same guest memory is how the LUT bank received its
+                            // content (JoinImages alias copy).
+                            {
+                                static bool s15_wiper_siblings_done = false;
+                                if (!s15_wiper_siblings_done) {
+                                    s15_wiper_siblings_done = true;
+                                    ImageView* s15_wiper_in_view = nullptr;
+                                    for (const DrawSlot& slot : res_slots) {
+                                        if (slot.kind != SlotKind::Sampled) {
+                                            continue;
+                                        }
+                                        s15_wiper_in_view =
+                                            &m_texture_cache.GetImageView(slot.view);
+                                        break;
+                                    }
+                                    if (s15_wiper_in_view != nullptr) {
+                                        const std::optional<DAddr> s15_wiper_cpu =
+                                            gpu_memory->GpuToCpuAddress(
+                                                static_cast<GPUVAddr>(
+                                                    s15_wiper_in_view->GpuAddr()));
+                                        if (s15_wiper_cpu) {
+                                            u32 s15_wiper_sib_total = 0;
+                                            m_texture_cache.ForEachImageInRegion(
+                                                *s15_wiper_cpu, 0x400000u,
+                                                [&](VideoCommon::ImageId s15_id,
+                                                    auto& s15_img) {
+                                                    ++s15_wiper_sib_total;
+                                                    if (s15_wiper_sib_total <= 8) {
+                                                        LOG_WARNING(
+                                                            Render_D3D12,
+                                                            "S15 wiper-input siblings: "
+                                                            "cpu=0x{:x} id={} gpu={:#x} "
+                                                            "flags={:#x} size={} fmt={:#x} "
+                                                            "tick={}",
+                                                            static_cast<u64>(*s15_wiper_cpu),
+                                                            s15_id.index,
+                                                            static_cast<u64>(s15_img.gpu_addr),
+                                                            static_cast<u32>(s15_img.flags),
+                                                            s15_img.guest_size_bytes,
+                                                            static_cast<u32>(
+                                                                s15_img.info.format),
+                                                            s15_img.modification_tick);
+                                                    }
+                                                });
+                                            LOG_WARNING(
+                                                Render_D3D12,
+                                                "S15 wiper-input siblings total: cpu=0x{:x} "
+                                                "count={}",
+                                                static_cast<u64>(*s15_wiper_cpu),
+                                                s15_wiper_sib_total);
+                                        } else {
+                                            LOG_WARNING(
+                                                Render_D3D12,
+                                                "S15 wiper-input siblings: gpu={:#x} unmapped",
+                                                static_cast<u64>(
+                                                    s15_wiper_in_view->GpuAddr()));
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3381,6 +3522,25 @@ void RasterizerD3D12::Clear(u32 layer_count) {
                             clear_rect.top, clear_rect.right, clear_rect.bottom);
             }
         }
+        {
+            // TEMP DIAGNOSTIC (S15, producer tracer): bounded trace of a clear landing
+            // inside the wiper-input window [0x517000000, 0x517200000) - a clear is a
+            // candidate zero-producer for the 480x270 R16G16 input no draw renders into.
+            static u32 s15_wiper_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr &&
+                s15_wiper_clear_logs < 8) {
+                const u64 s15_wiper_clear_gpu = static_cast<u64>(view->GpuAddr());
+                if (s15_wiper_clear_gpu >= 0x517000000ull &&
+                    s15_wiper_clear_gpu < 0x517200000ull) {
+                    ++s15_wiper_clear_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 wiper-range clear: gpu={:#x} color=({},{},{},{}) scissor={}",
+                                s15_wiper_clear_gpu, regs.clear_color[0], regs.clear_color[1],
+                                regs.clear_color[2], regs.clear_color[3],
+                                regs.clear_control.use_scissor ? 1 : 0);
+                }
+            }
+        }
         if (view != nullptr && resource != nullptr && view->RenderTarget().ptr != 0) {
             // Clear-value conversion mirrors RasterizerVulkan::Clear: regs.clear_color is
             // a std::array<f32, 4>, so a non-integer render target takes its components
@@ -3610,6 +3770,83 @@ void RasterizerD3D12::DispatchCompute() {
         imgbuf_resolved = count_resolved(texbuf_total, texbuf_total + imgbuf_total);
         tex_resolved = count_resolved(sampled_views_begin, sampled_views_end);
         img_resolved = count_resolved(sampled_views_end, views.size());
+    }
+
+    // TEMP DIAGNOSTIC (S15, producer tracer): the wiper-input window [0x517000000,
+    // 0x517200000) has no logged producer and compute dispatches log no addresses, so a
+    // compute writer would be invisible. Bounded trace (cap 16) of compute bindings that
+    // touch the window: SSBO guest addresses (read from the launch-description const
+    // buffers, same convention as BufferCache::StorageBufferBinding) and image /
+    // image-buffer views by guest GPU VA or CPU-translation overlap (JoinImages aliases).
+    {
+        static u32 s15_compute_wiper_logs = 0;
+        if (s15_compute_wiper_logs < 16) {
+            const std::optional<DAddr> s15_window_cpu = gpu_memory->GpuToCpuAddress(0x517000000ull);
+            const auto s15_compute_hits = [&](GPUVAddr gpu, u64 size) {
+                if (gpu >= 0x517000000ull && gpu < 0x517200000ull) {
+                    return true;
+                }
+                const std::optional<DAddr> cpu = gpu_memory->GpuToCpuAddress(gpu);
+                return cpu && s15_window_cpu &&
+                       *cpu < *s15_window_cpu + 0x200000ull &&
+                       *s15_window_cpu < *cpu + (size != 0 ? size : 0x400000ull);
+            };
+            const auto s15_compute_log = [&](const char* kind, u64 gpu, u64 size) {
+                if (s15_compute_wiper_logs >= 16) {
+                    return;
+                }
+                ++s15_compute_wiper_logs;
+                LOG_WARNING(
+                    Render_D3D12,
+                    "S15 wiper-range compute: program={:#x} grid=({},{},{}) kind={} gpu={:#x} "
+                    "size={}",
+                    static_cast<u64>(qmd.program_start), qmd.grid_dim_x.Value(),
+                    qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind,
+                    static_cast<u64>(gpu), size);
+            };
+            for (const auto& desc : info.storage_buffers_descriptors) {
+                if (s15_compute_wiper_logs >= 16) {
+                    break;
+                }
+                if (desc.cbuf_index >= cbufs.size()) [[unlikely]] {
+                    continue;
+                }
+                const GPUVAddr s15_ssbo_cbuf = cbufs[desc.cbuf_index].Address() + desc.cbuf_offset;
+                const GPUVAddr s15_ssbo_gpu = gpu_memory->Read<u64>(s15_ssbo_cbuf);
+                const u64 s15_ssbo_size =
+                    desc.cbuf_index == 0 ? gpu_memory->Read<u32>(s15_ssbo_cbuf + 8) : 0;
+                if (s15_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
+                    s15_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
+                }
+            }
+            for (size_t i = texbuf_total; i < texbuf_total + imgbuf_total && i < views.size();
+                 ++i) {
+                if (s15_compute_wiper_logs >= 16) {
+                    break;
+                }
+                if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                    continue;
+                }
+                ImageView& s15_iv = m_texture_cache.GetImageView(views[i].id);
+                const GPUVAddr s15_gpu = s15_iv.GpuAddr();
+                if (s15_compute_hits(s15_gpu, s15_iv.BufferSize())) {
+                    s15_compute_log("imgbuf", s15_gpu, s15_iv.BufferSize());
+                }
+            }
+            for (size_t i = sampled_views_end; i < views.size(); ++i) {
+                if (s15_compute_wiper_logs >= 16) {
+                    break;
+                }
+                if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                    continue;
+                }
+                ImageView& s15_iv = m_texture_cache.GetImageView(views[i].id);
+                const GPUVAddr s15_gpu = s15_iv.GpuAddr();
+                if (s15_compute_hits(s15_gpu, 0)) {
+                    s15_compute_log("img", s15_gpu, 0);
+                }
+            }
+        }
     }
 
     m_buffer_cache.UnbindComputeTextureBuffers();

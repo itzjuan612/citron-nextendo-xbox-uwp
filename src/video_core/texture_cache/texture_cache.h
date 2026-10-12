@@ -1208,9 +1208,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         static u32 refresh_diag_logs = 0;
         const u64 diag_size = image.guest_size_bytes;
         const u64 diag_gpu = static_cast<u64>(image.gpu_addr);
-        // Scene RT, the 256x256 lighting-LUT bank (JoinImages layer stack) and the mask.
-        const bool diag_addr =
-            diag_gpu == 0x5103e0000ULL || diag_gpu == 0x5eb340000ULL || diag_gpu == 0x510f30000ULL;
+        // Scene RT, the 256x256 lighting-LUT bank (JoinImages layer stack), the mask, and
+        // the wiper-input images (480x270 R16G16 window at 0x517000000/0x517180000).
+        const bool diag_addr = diag_gpu == 0x5103e0000ULL || diag_gpu == 0x5eb340000ULL ||
+                               diag_gpu == 0x510f30000ULL || diag_gpu == 0x517000000ULL ||
+                               diag_gpu == 0x517180000ULL;
         const bool diag_size_match = (diag_size >= 2000000ULL && diag_size <= 2100000ULL);
         if (refresh_diag_logs < 24 && (diag_addr || diag_size_match)) {
             ++refresh_diag_logs;
