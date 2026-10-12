@@ -31,6 +31,30 @@ constexpr bool kSkipDraws = false;
 // first few draws and checking GetDeviceRemovedReason, dumping full bindings for each.
 std::atomic<u32> g_diag_draws{0};
 
+// TEMP DIAGNOSTIC (session 15, per-draw flush attribution): armed by the first render target
+// bound into the wiper window [0x517000000, 0x517200000) that ConfigureDraw's window tracer
+// sees. While armed, RasterizerD3D12::Draw submits and waits out the command list after every
+// recorded draw (exactly what FlushCommands does), so the draw that hangs the GPU is the one
+// between the last clean "S15 per-draw flush" line and the next one. Cleared as soon as the
+// device reports a removal reason. Single-process flag: only ever touched from the GPU thread
+// (ConfigureDraw/Draw), so no synchronisation is needed for correctness of the gate itself.
+bool g_s15_flush_every_draw = false;
+
+// Bounded log budget for the attribution lines; 2048 entries in total, shared by the
+// pre-draw line in ConfigureDraw and the post-flush line in Draw (a draw consumes at most
+// two lines), so logging can never dominate the log.
+constexpr u32 kS15FlushLogCap = 2048;
+std::atomic<u32> g_s15_flush_logs{0};
+
+// Draw identity captured in ConfigureDraw next to the recorded draw. Draw() cannot reach the
+// framebuffer, the pipeline state, or the guest draw parameters, so they are parked here for
+// the post-flush line.
+std::atomic<u64> g_s15_flush_rt0{0};
+std::atomic<u32> g_s15_flush_rts{0};
+std::atomic<u32> g_s15_flush_att{0};
+std::atomic<u32> g_s15_flush_verts{0};
+std::atomic<u32> g_s15_flush_draws{0};
+
 // TEMP DIAGNOSTIC (session 12): resources of the images the frontend presents; ConfigureDraw
 // tags draws that render into them so the composition path is unmissable in the log.
 std::array<ID3D12Resource*, 6> g_display_resources{};
@@ -227,6 +251,37 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
     ConfigureDraw(is_indexed, *stored, instance_count);
+    // TEMP DIAGNOSTIC (session 15): per-draw flush attribution. Armed by the first draw into
+    // the wiper window [0x517000000, 0x517200000) (ConfigureDraw), so every draw after the
+    // first "S15 window bind" is submitted on its own and waited out. The last clean line
+    // before a removal reason names the draw that hung the GPU; its inputs are on the
+    // matching "S15 pre-draw" line ConfigureDraw logged just before recording it.
+    if (g_s15_flush_every_draw) {
+        // Same sequence FlushCommands()/TickFrame() use mid-frame (Execute -> WaitForIdle ->
+        // Reset, which re-opens the command list, plus the per-draw descriptor-heap and CBV
+        // scratch resets), reused verbatim instead of hand-rolling it: both cache mutexes are
+        // recursive and Draw already holds them, so calling the existing helper here is safe.
+        FlushCommands();
+        const HRESULT removed_reason = m_device.GetDevice()->GetDeviceRemovedReason();
+        const u32 draws = g_s15_flush_draws.load(std::memory_order_relaxed);
+        const u32 flush_index = g_s15_flush_logs.fetch_add(1, std::memory_order_relaxed);
+        if (flush_index < kS15FlushLogCap) {
+            LOG_WARNING(Render_D3D12,
+                        "S15 per-draw flush #{}: draw={} rt0=0x{:x} rts={} att={:#x} verts={} "
+                        "hr={:#x}",
+                        flush_index, draws,
+                        g_s15_flush_rt0.load(std::memory_order_relaxed),
+                        g_s15_flush_rts.load(std::memory_order_relaxed),
+                        g_s15_flush_att.load(std::memory_order_relaxed),
+                        g_s15_flush_verts.load(std::memory_order_relaxed),
+                        static_cast<u32>(removed_reason));
+        }
+        if (FAILED(removed_reason)) {
+            g_s15_flush_every_draw = false;
+            LOG_ERROR(Render_D3D12, "S15 hang attributed to draw #{} (hr={:#x})", draws,
+                      static_cast<u32>(removed_reason));
+        }
+    }
     // NOTE: no m_gpu.TickWork() here. The GPU worker ticks independently, and TickWork
     // from inside Draw hung the boot on console right after the first draw (TBD why).
 }
@@ -486,6 +541,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             const u64 s15_gpu = static_cast<u64>(view->GpuAddr());
             if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
                 ++s15_window_bind_logs;
+                // TEMP DIAGNOSTIC (session 15): the wiper window is first drawn into here.
+                // Arm the per-draw flush attribution: from this point on every recorded draw
+                // is flushed and waited out so the GPU hang can be pinned on one draw. Never
+                // re-arms itself once a removal reason disarmed it above in Draw().
+                g_s15_flush_every_draw = true;
                 LOG_WARNING(Render_D3D12,
                             "S15 window bind: gpu={:#x} res={:#x} {}x{} slot={} raw_fmt={:#x} "
                             "unrepresentable={} unbound={} att={:#x} verts={}",
@@ -1717,6 +1777,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         "DBG-B: fd={} indexed={} verts={} first_idx={} base_vtx={} ib_valid={}",
                         flinger_draw ? 1 : 0, params.is_indexed ? 1 : 0, params.num_vertices,
                         params.first_index, params.base_vertex, index_binding.valid ? 1 : 0);
+        }
+    }
+    // TEMP DIAGNOSTIC (session 15): per-draw flush attribution. Emitted for every draw while
+    // g_s15_flush_every_draw is armed, so the hanging draw's inputs are on the line right
+    // before its flush in RasterizerD3D12::Draw. Shares the 2048-entry cap with that line.
+    if (g_s15_flush_every_draw) {
+        const u32 s15_pre_index = g_s15_flush_logs.fetch_add(1, std::memory_order_relaxed);
+        if (s15_pre_index < kS15FlushLogCap) {
+            u32 s15_pre_sampled_total = 0;
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind == SlotKind::Sampled) {
+                    ++s15_pre_sampled_total;
+                }
+            }
+            fmt::memory_buffer s15_pre_textures;
+            u32 s15_pre_shown = 0;
+            for (const DrawSlot& slot : res_slots) {
+                if (slot.kind != SlotKind::Sampled || s15_pre_shown >= 3) {
+                    continue;
+                }
+                if (s15_pre_shown != 0) {
+                    fmt::format_to(std::back_inserter(s15_pre_textures), ",");
+                }
+                fmt::format_to(std::back_inserter(s15_pre_textures), "0x{:x}",
+                               static_cast<u64>(m_texture_cache.GetImageView(slot.view).GpuAddr()));
+                ++s15_pre_shown;
+            }
+            const u64 s15_pre_rt0 =
+                (framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr)
+                    ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                    : 0;
+            LOG_WARNING(Render_D3D12,
+                        "S15 pre-draw: rt0=0x{:x} rts={} att={:#x} verts={} textures={} [{}]",
+                        s15_pre_rt0, num_rtvs, stored.pipeline->State().attachments[0].raw,
+                        params.num_vertices, s15_pre_sampled_total,
+                        fmt::to_string(s15_pre_textures));
+            // Park this draw's identity so Draw() can log it next to its removal reason.
+            g_s15_flush_draws.fetch_add(1, std::memory_order_relaxed);
+            g_s15_flush_rt0.store(s15_pre_rt0, std::memory_order_relaxed);
+            g_s15_flush_rts.store(num_rtvs, std::memory_order_relaxed);
+            g_s15_flush_att.store(static_cast<u32>(stored.pipeline->State().attachments[0].raw),
+                                  std::memory_order_relaxed);
+            g_s15_flush_verts.store(params.num_vertices, std::memory_order_relaxed);
         }
     }
     if (params.is_indexed && index_binding.valid) {

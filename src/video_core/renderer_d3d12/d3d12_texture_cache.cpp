@@ -1176,7 +1176,12 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
     }
 
     const DXGI_FORMAT rtv_format = RenderTargetFormat(image.info.format);
-    if (rtv_format != DXGI_FORMAT_UNKNOWN && desc.SampleDesc.Count <= 1) {
+    // A render-target view may only be created on a resource created with
+    // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET. Compressed and depth-stencil resources never
+    // get that flag (see CreateImageResource), so creating an RTV over them is an invalid
+    // call (device removal/hang). This mirrors the UAV guard in Image::StorageImageView.
+    if (rtv_format != DXGI_FORMAT_UNKNOWN && desc.SampleDesc.Count <= 1 &&
+        (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0) {
         if (image.runtime->rtv_heap.Size() + 1 > image.runtime->rtv_heap.Capacity()) {
             static bool logged_rtv_exhausted = false;
             if (!logged_rtv_exhausted) {
