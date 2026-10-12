@@ -122,6 +122,9 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d) {
     }
     alpha_test_ref = Common::BitCast<u32>(regs.alpha_test_ref);
     point_size = Common::BitCast<u32>(regs.point_size);
+    depth_bias = Common::BitCast<u32>(regs.depth_bias);
+    depth_bias_clamp = Common::BitCast<u32>(regs.depth_bias_clamp);
+    slope_scale_depth_bias = Common::BitCast<u32>(regs.slope_scale_depth_bias);
 
     for (size_t index = 0; index < Tegra::Engines::Maxwell3D::Regs::NumVertexArrays; ++index) {
         const bool is_enabled = regs.vertex_stream_instances.IsInstancingEnabled(index);

@@ -7,6 +7,7 @@
 #include <cstring>
 #include <type_traits>
 
+#include "common/bit_cast.h"
 #include "common/bit_field.h"
 #include "common/common_types.h"
 
@@ -194,6 +195,11 @@ struct FixedPipelineState {
 
     u32 alpha_test_ref{};
     u32 point_size{};
+    /// Raw bits of the depth-bias registers (see the accessor below), so the struct keeps
+    /// unique object representations while still carrying float values in the PSO key.
+    u32 depth_bias{};
+    u32 depth_bias_clamp{};
+    u32 slope_scale_depth_bias{};
 
     /// Captures the current Maxwell fixed-function state.
     void Refresh(Tegra::Engines::Maxwell3D& maxwell3d);
@@ -222,6 +228,18 @@ struct FixedPipelineState {
 
     [[nodiscard]] Tegra::Engines::Maxwell3D::Regs::PolygonMode PolygonModeMode() const noexcept {
         return UnpackPolygonMode(polygon_mode.Value());
+    }
+
+    [[nodiscard]] float DepthBias() const noexcept {
+        return Common::BitCast<float>(depth_bias);
+    }
+
+    [[nodiscard]] float DepthBiasClamp() const noexcept {
+        return Common::BitCast<float>(depth_bias_clamp);
+    }
+
+    [[nodiscard]] float SlopeScaleDepthBias() const noexcept {
+        return Common::BitCast<float>(slope_scale_depth_bias);
     }
 };
 

@@ -649,9 +649,19 @@ GraphicsPipeline::GraphicsPipeline(
     // direct mapping every triangle is culled; inverting it draws.
     rasterizer_desc.FrontCounterClockwise =
         state.FrontFaceMode() != Maxwell3D::Regs::FrontFace::CounterClockWise;
-    rasterizer_desc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
-    rasterizer_desc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
-    rasterizer_desc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    // Depth bias is baked into the PSO (D3D12 has no dynamic depth-bias state). The enable
+    // flag already reflects the polygon-offset registers for the draw topology; the values
+    // follow the Vulkan conversion (`regs.depth_bias / 2.0f`) with the register clamp used
+    // as-is. When the guest disables bias, keep the D3D12 defaults.
+    if (state.depth_bias_enable != 0) {
+        rasterizer_desc.DepthBias = static_cast<INT>(state.DepthBias() / 2.0f);
+        rasterizer_desc.DepthBiasClamp = state.DepthBiasClamp();
+        rasterizer_desc.SlopeScaledDepthBias = state.SlopeScaleDepthBias();
+    } else {
+        rasterizer_desc.DepthBias = D3D12_DEFAULT_DEPTH_BIAS;
+        rasterizer_desc.DepthBiasClamp = D3D12_DEFAULT_DEPTH_BIAS_CLAMP;
+        rasterizer_desc.SlopeScaledDepthBias = D3D12_DEFAULT_SLOPE_SCALED_DEPTH_BIAS;
+    }
     rasterizer_desc.DepthClipEnable = state.depth_clamp_disabled == 0;
     rasterizer_desc.MultisampleEnable = SampleCount(state.msaa_mode.Value()) > 1;
     rasterizer_desc.AntialiasedLineEnable = state.smooth_lines != 0;
@@ -661,15 +671,23 @@ GraphicsPipeline::GraphicsPipeline(
                                              : D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF;
 
     D3D12_DEPTH_STENCIL_DESC depth_stencil_desc{};
-    depth_stencil_desc.DepthEnable = state.depth_test_enable != 0;
+    const bool depth_test_enable = state.depth_test_enable != 0;
+    // D3D12 performs no depth write at all when DepthEnable is FALSE, so a guest draw that
+    // writes depth without testing it (depth_test_enable=0, depth_write_enable=1) still
+    // needs the depth stage on with an always-passing comparison. Vulkan keeps
+    // depthTestEnable and depthWriteEnable independent; mirror that here. Guarded by
+    // zeta_enable: with no depth attachment the DSV format is UNKNOWN and a DepthEnable=true
+    // PSO is rejected (E_INVALIDARG).
+    depth_stencil_desc.DepthEnable =
+        (depth_test_enable || state.depth_write_enable != 0) && state.depth_enabled != 0;
     depth_stencil_desc.DepthWriteMask =
         state.depth_write_enable != 0 ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-    depth_stencil_desc.DepthFunc = ComparisonOp(state.depth_test_func.Value());
-    // TEMP EXPERIMENT (session 16 cont.5): the session-14 test ("no effect") ran while the
-    // scene RT was still being wiped by the modulate pass, so it proved nothing. Re-testing
-    // now that the chain works: if the 3D color passes are depth-rejected, ALWAYS makes them
-    // draw (character should appear); if the content is unchanged, depth is not the cause.
-    static constexpr bool kForceDepthAlways = true;
+    depth_stencil_desc.DepthFunc = depth_test_enable
+                                       ? ComparisonOp(state.depth_test_func.Value())
+                                       : D3D12_COMPARISON_FUNC_ALWAYS;
+    // TEMP DIAGNOSTIC (session 14): tested true -> the 960x540 scene RT stayed black, so the
+    // depth path is not the cause. Left disabled.
+    static constexpr bool kForceDepthAlways = false;
     if (kForceDepthAlways && depth_stencil_desc.DepthEnable) {
         depth_stencil_desc.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     }
