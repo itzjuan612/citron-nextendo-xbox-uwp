@@ -447,6 +447,38 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
 
     m_runtime.ClearDrawBindings();
 
+    // ClearDrawBindings() above deliberately wipes the runtime's index/vertex views so
+    // stale host pointers can never leak into a draw, but the shared cache re-binds a
+    // vertex slot only while its per-slot dirty flag is set (BindHostVertexBuffers). A
+    // draw whose guest vertex-stream registers were not rewritten since the previous
+    // draw (e.g. the 3D color pass reusing the depth prepass's streams) would leave the
+    // wiped views all-zero (BufferLocation == 0) and be skipped by the vertex-range
+    // guard below, so force the flags of the streams this pipeline actually reads. Read
+    // slots mirror the guard's derivation (distinct State().attributes[i].buffer over
+    // enabled attributes); unread slots are never fetched by the input layout. The
+    // master Dirty::VertexBuffers flag is deliberately not forced: the update phase
+    // re-resolves a slot's persistent channel binding whenever the guest or the
+    // deleted-buffer path re-dirty it, so the persistent bindings are valid to re-bind
+    // from as-is. BindHostIndexBuffer rebuilds the index view unconditionally, but
+    // UpdateIndexBuffer sizes the persistent index binding from the CURRENT draw's
+    // first/count only while its flag is set, so force it for indexed draws too.
+    {
+        auto& flags = maxwell3d->dirty.flags;
+        const auto& pipe_state = stored.pipeline->State();
+        for (u32 i = 0; i < pipe_state.attributes.size(); ++i) {
+            if (pipe_state.attributes[i].enabled == 0) {
+                continue;
+            }
+            const u32 read_slot = pipe_state.attributes[i].buffer.Value();
+            if (read_slot < VideoCommon::NUM_VERTEX_BUFFERS) {
+                flags[VideoCommon::Dirty::VertexBuffer0 + read_slot] = true;
+            }
+        }
+        if (is_indexed) {
+            flags[VideoCommon::Dirty::IndexBuffer] = true;
+        }
+    }
+
     // Validate BEFORE recording any uploads: draws the backend cannot represent must
     // return here, before the buffer-binding section below records staging COPY commands
     // for garbage draw state (those copies execute at flush and fault the GPU on console,
