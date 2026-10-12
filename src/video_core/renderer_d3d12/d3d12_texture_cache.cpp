@@ -1151,6 +1151,16 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
     if (image.IsDepthStencil()) {
         const DXGI_FORMAT dsv_format = DepthStencilFormat(image.info.format);
         if (dsv_format != DXGI_FORMAT_UNKNOWN) {
+            if (image.runtime->dsv_heap.Size() + 1 > image.runtime->dsv_heap.Capacity()) {
+                static bool logged_dsv_exhausted = false;
+                if (!logged_dsv_exhausted) {
+                    logged_dsv_exhausted = true;
+                    LOG_ERROR(Render_D3D12,
+                              "ImageView: dsv_heap exhausted; no DSV for {}x{} fmt={:#x}",
+                              image.info.size.width, image.info.size.height,
+                              static_cast<u32>(image.info.format));
+                }
+            }
             const u32 dsv_index = image.runtime->dsv_heap.Allocate();
             if (dsv_index != DescriptorHeap::INVALID_INDEX) {
                 rt_view = image.runtime->dsv_heap.CpuHandle(dsv_index);
@@ -1167,6 +1177,16 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
 
     const DXGI_FORMAT rtv_format = RenderTargetFormat(image.info.format);
     if (rtv_format != DXGI_FORMAT_UNKNOWN && desc.SampleDesc.Count <= 1) {
+        if (image.runtime->rtv_heap.Size() + 1 > image.runtime->rtv_heap.Capacity()) {
+            static bool logged_rtv_exhausted = false;
+            if (!logged_rtv_exhausted) {
+                logged_rtv_exhausted = true;
+                LOG_ERROR(Render_D3D12,
+                          "ImageView: rtv_heap exhausted; no RTV for {}x{} fmt={:#x}",
+                          image.info.size.width, image.info.size.height,
+                          static_cast<u32>(image.info.format));
+            }
+        }
         const u32 rtv_index = image.runtime->rtv_heap.Allocate();
         if (rtv_index != DescriptorHeap::INVALID_INDEX) {
             rt_view = image.runtime->rtv_heap.CpuHandle(rtv_index);
@@ -1278,9 +1298,15 @@ Framebuffer::Framebuffer(TextureCacheRuntime&,
 TextureCacheRuntime::TextureCacheRuntime(Device& device_, CommandList& command_list_,
                                          StagingBufferPool& staging_pool_)
     : device{device_}, command_list{command_list_}, staging_pool{staging_pool_},
-      view_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 8192, false},
-      rtv_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 2048, false},
-      dsv_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 512, false} {}
+      // Session 16 cont.2: these staging heaps are process-lifetime bump allocators (no
+      // free list, Reset() is unsafe while cached views hold handles). The old capacities
+      // (8192/2048/512) exhausted mid-run on console - the RTV heap first, so every RT
+      // view created afterwards had no RTV and its draws were silently skipped as
+      // "unbound" (the 480x270 bloom source was never written and the per-frame
+      // modulate/wiper pass zeroed the scene). Raised for run-length headroom.
+      view_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 65536, false},
+      rtv_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 32768, false},
+      dsv_heap{device_.GetDevice(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4096, false} {}
 
 void TextureCacheRuntime::Finish() {
     device.WaitForIdle();
