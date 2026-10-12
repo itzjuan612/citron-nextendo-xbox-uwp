@@ -973,14 +973,48 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                       static_cast<u64>(view.StrideInBytes);
                 }
             }
-            if (view.BufferLocation == 0 || view.SizeInBytes == 0 || view.StrideInBytes == 0 ||
-                (enforce_range && vertex_required > static_cast<u64>(view.SizeInBytes))) {
+            // Values as bound, captured before any in-place repair below.
+            const u32 bound_stride = view.StrideInBytes;
+            const u32 bound_size = view.SizeInBytes;
+            // D3D12 legally accepts StrideInBytes == 0 (constant vertex) and any nonzero
+            // SizeInBytes, while NVN often leaves the guest stream stride/size registers
+            // stale-zero. So a zero stride alone no longer skips a draw, and a zero size is
+            // repaired below whenever the vertex range is known; only a genuinely unbound
+            // view (BufferLocation == 0) or an unbounded size keeps the old skip. The guest
+            // meshes (Splatoon 3 style screen) hit this path with slot=0 stride=0 size=0.
+            u64 effective_size = static_cast<u64>(bound_size);
+            if (view.BufferLocation != 0 && bound_size == 0 && range_known) {
+                effective_size = std::max<u64>(
+                    vertex_required + static_cast<u64>(bound_stride),
+                    bound_stride != 0 ? static_cast<u64>(bound_stride) : u64{16});
+                effective_size = std::min<u64>(effective_size, 512u * 1024u * 1024u);
+                // Stay inside the committed resource: an out-of-range vertex fetch removes the
+                // device, which Close cannot catch. BindHostVertexBuffers passes the (possibly
+                // stale) guest size straight through, so the host buffer is the authority here.
+                if (ID3D12Resource* resource = m_runtime.GetVertexBindingResource(slot)) {
+                    const u64 resource_size = resource->GetDesc().Width;
+                    const u64 resource_base = resource->GetGPUVirtualAddress();
+                    if (view.BufferLocation >= resource_base) {
+                        const u64 offset = static_cast<u64>(view.BufferLocation) - resource_base;
+                        effective_size = std::min<u64>(
+                            effective_size,
+                            resource_size > offset ? resource_size - offset : u64{0});
+                    }
+                }
+                if (effective_size > 0) {
+                    // Transient: BindVertexBuffers rewrites the whole array whenever the
+                    // vertex bindings change, so the patch applies to this draw only.
+                    m_runtime.SetVertexBindingSize(slot, static_cast<u32>(effective_size));
+                }
+            }
+            if (view.BufferLocation == 0 || effective_size == 0 ||
+                (enforce_range && vertex_required > effective_size)) {
                 static u32 vertex_range_skips{};
                 if ((vertex_range_skips++ % 256) == 0) {
                     LOG_ERROR(Render_D3D12,
                               "Draw with degenerate vertex view on read slot={} stride={} "
                               "vertex_size={} skipped (count {})",
-                              slot, view.StrideInBytes, view.SizeInBytes, vertex_range_skips);
+                              slot, bound_stride, bound_size, vertex_range_skips);
                 }
                 if (flinger_draw) {
                     static u32 fd_vb_logs = 0;
@@ -990,12 +1024,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     "FLINGER skip: degenerate vb slot={} loc={:#x} stride={} "
                                     "size={} base_vtx={} verts={} range_known={} dev={:#x} req={}",
                                     slot, static_cast<u64>(view.BufferLocation),
-                                    view.StrideInBytes, view.SizeInBytes, params.base_vertex,
+                                    bound_stride, bound_size, params.base_vertex,
                                     params.num_vertices, range_known ? 1 : 0,
                                     static_cast<u64>(index_binding.device_addr), vertex_required);
                     }
                 }
                 return;
+            }
+            if (bound_size == 0 || bound_stride == 0) {
+                // The draw now proceeds where this guard used to skip it (zero bound
+                // size/stride). TEMP DIAGNOSTIC (session 15), static cap.
+                static u32 s15_vertex_guard_repair_logs = 0;
+                if (s15_vertex_guard_repair_logs < 24) {
+                    ++s15_vertex_guard_repair_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S15 vertex guard repair: slot={} stride={} size={} "
+                                "repaired={} verts={} indexed={} base={} first={} att={:#x}",
+                                slot, bound_stride, bound_size, effective_size, params.num_vertices,
+                                params.is_indexed ? 1 : 0, params.base_vertex, params.first_index,
+                                static_cast<u32>(pipe_state.attachments[0].raw));
+                }
             }
         }
     }

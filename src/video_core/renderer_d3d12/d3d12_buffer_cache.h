@@ -207,6 +207,16 @@ public:
         return vertex_bindings;
     }
 
+    /// S15: repair one bound vertex view's size for the current draw (ConfigureDraw's
+    /// vertex-range guard fixes up a guest size of 0 when the vertex range is known).
+    /// BindVertexBuffers rewrites the whole array whenever vertex bindings change, so
+    /// the patch is transient and applies to this draw only.
+    void SetVertexBindingSize(u32 index, u32 size) noexcept {
+        if (index < MAX_VERTEX_BUFFERS) {
+            vertex_bindings[index].SizeInBytes = size;
+        }
+    }
+
     /// TEMP DIAGNOSTIC (session 13): host resource backing a bound vertex slot, so the
     /// uploaded bytes can be read back and compared with the guest's vertex data.
     [[nodiscard]] ID3D12Resource* GetVertexBindingResource(u32 slot) const noexcept {
