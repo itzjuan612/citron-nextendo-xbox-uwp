@@ -55,6 +55,13 @@ std::atomic<u32> g_s15_flush_att{0};
 std::atomic<u32> g_s15_flush_verts{0};
 std::atomic<u32> g_s15_flush_draws{0};
 
+// TEMP DIAGNOSTIC (session 15, style-screen chain): set by the S15 compositor block in
+// ConfigureDraw once the scene-composite draw's sampled textures have been dumped
+// (980021..980023), and consumed by the post-draw section of the same function, which dumps
+// that draw's composite target once (980024) and clears the flag again. Only ever touched
+// from the GPU thread (ConfigureDraw), like the flush flags above.
+bool g_s15_composite_target_dump = false;
+
 // TEMP DIAGNOSTIC (session 12): resources of the images the frontend presents; ConfigureDraw
 // tags draws that render into them so the composition path is unmissable in the log.
 std::array<ID3D12Resource*, 6> g_display_resources{};
@@ -541,11 +548,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             const u64 s15_gpu = static_cast<u64>(view->GpuAddr());
             if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
                 ++s15_window_bind_logs;
-                // TEMP DIAGNOSTIC (session 15): the wiper window is first drawn into here.
-                // Arm the per-draw flush attribution: from this point on every recorded draw
-                // is flushed and waited out so the GPU hang can be pinned on one draw. Never
-                // re-arms itself once a removal reason disarmed it above in Draw().
-                g_s15_flush_every_draw = true;
+                // TEMP DIAGNOSTIC (session 15): per-draw flush attribution was armed here; the
+                // 1.0.243 hang is fixed (1.0.244 ran clean) and the mode costs a full GPU sync
+                // per draw, so it stays disarmed and only the log lines above remain.
+                // g_s15_flush_every_draw = true;
                 LOG_WARNING(Render_D3D12,
                             "S15 window bind: gpu={:#x} res={:#x} {}x{} slot={} raw_fmt={:#x} "
                             "unrepresentable={} unbound={} att={:#x} verts={}",
@@ -1991,6 +1997,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             ID3D12Resource* const s15_comp_res =
                 s15_comp_rt != nullptr ? s15_comp_rt->Resource() : nullptr;
             bool s15_has_scene_source = false;
+            bool s15_stage_samples_scene_rt = false;
             for (const DrawSlot& slot : res_slots) {
                 if (slot.kind != SlotKind::Sampled) {
                     continue;
@@ -2000,10 +2007,22 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     sv.size.width >= 1920) {
                     s15_has_scene_source = true;
                 }
+                if (static_cast<u64>(sv.GpuAddr()) == 0x5103e0000ull) {
+                    s15_stage_samples_scene_rt = true;
+                }
             }
             const bool s15_final_rt =
                 s15_comp_res != nullptr && s15_comp_res->GetDesc().Width >= 1920 &&
                 s15_comp_res->GetDesc().Format == DXGI_FORMAT_R10G10B10A2_TYPELESS;
+            // TEMP DIAGNOSTIC (session 15, style-screen chain): the scene composite is the
+            // blend-off 3-vertex draw into the 1920x1080 target that samples the 960x540
+            // B10G11R11 scene RT at gpu 0x5103e0000; every other draw into that target is a
+            // UI quad, which must not consume the composite's stage-dump budget.
+            const bool s15_stage_scene_composite =
+                s15_comp_res != nullptr && s15_comp_res->GetDesc().Width == 1920 &&
+                s15_comp_res->GetDesc().Height == 1080 && params.num_vertices == 3 &&
+                !stored.pipeline->State().attachments[0].enable.Value() &&
+                s15_stage_samples_scene_rt;
             if (s15_comp_res != nullptr && (s15_final_rt || s15_has_scene_source)) {
                 static u32 s15_comp_logs = 0;
                 // TEMP DIAGNOSTIC (session 15): the early dumps below run in the first
@@ -2083,6 +2102,80 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                                 m_command_list, sv.Resource());
                             break;
                         }
+                    }
+                }
+                // TEMP DIAGNOSTIC (session 15, style-screen chain): one-shot, late-gated stage
+                // dumps for the scene composite. Its sampled textures are dumped in slot order
+                // under unique ids (the 1x1 parameter texture, the 960x540 scene RT, the
+                // 240x136 bloom) so a dark RT can be attributed to a stage instead of guessed,
+                // and the flag for the post-draw dump of the composite target itself is armed
+                // here. force=true so the per-image dedupe in RecordTextureContentDump cannot
+                // skip a stage.
+                static bool s15_stage_composite_done = false;
+                static std::chrono::steady_clock::time_point s15_stage_start =
+                    std::chrono::steady_clock::now();
+                if (!s15_stage_composite_done && s15_stage_scene_composite &&
+                    std::chrono::steady_clock::now() - s15_stage_start >
+                        std::chrono::minutes(20)) {
+                    s15_stage_composite_done = true;
+                    u32 s15_stage_inputs = 0;
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled || s15_stage_inputs >= 3) {
+                            continue;
+                        }
+                        ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                        if (sv.Resource() == nullptr) {
+                            continue;
+                        }
+                        ++s15_stage_inputs;
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                            static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                            980020u + s15_stage_inputs, /*force=*/true);
+                    }
+                    g_s15_composite_target_dump = true;
+                    LOG_WARNING(Render_D3D12, "S15 composite stage dumps: ids=980021..980024");
+                }
+                // TEMP DIAGNOSTIC (session 15, style-screen chain): the UI panel/icon textures
+                // the compositor samples (small textures, and not the scene composite itself).
+                // One unique id per resource so the missing dark panel's source can be
+                // inspected; the loading-phase draws are excluded by the late gate and the
+                // per-resource memory so repeated icons cannot consume the budget.
+                static ID3D12Resource* s15_stage_ui_res[4] = {};
+                static u32 s15_stage_ui_dumps = 0;
+                if (!s15_stage_scene_composite && s15_stage_ui_dumps < 4 &&
+                    std::chrono::steady_clock::now() - s15_stage_start >
+                        std::chrono::minutes(20)) {
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled || s15_stage_ui_dumps >= 4) {
+                            continue;
+                        }
+                        ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                        if (sv.Resource() == nullptr || sv.size.width > 256) {
+                            continue;
+                        }
+                        bool s15_stage_ui_seen = false;
+                        for (u32 s15_stage_ui_i = 0; s15_stage_ui_i < 4; ++s15_stage_ui_i) {
+                            if (s15_stage_ui_res[s15_stage_ui_i] == sv.Resource()) {
+                                s15_stage_ui_seen = true;
+                                break;
+                            }
+                        }
+                        if (s15_stage_ui_seen) {
+                            continue;
+                        }
+                        s15_stage_ui_res[s15_stage_ui_dumps] = sv.Resource();
+                        const u32 s15_stage_ui_id = 980031u + s15_stage_ui_dumps;
+                        ++s15_stage_ui_dumps;
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, sv.Resource(),
+                            static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                            s15_stage_ui_id, /*force=*/true);
+                        LOG_WARNING(Render_D3D12,
+                                    "S15 ui texture dump: id={} img={} gpu={:#x} {}x{} fmt={:#x}",
+                                    s15_stage_ui_id, sv.image_id.index,
+                                    static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                    sv.size.height, static_cast<u32>(sv.format));
                     }
                 }
                 // TEMP DIAGNOSTIC (session 15): the early rate limit below suppressed the
@@ -3004,6 +3097,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     framebuffer->ColorBuffers()[0]->GpuAddr()),
                                 970000u + s15_small_writer_dumps, /*force=*/true);
                         }
+                        // TEMP DIAGNOSTIC (session 15, style-screen chain): the self-sampler
+                        // signature (<=4 verts, write mask 0xf, 4 sampled textures) is the
+                        // draw that REPLACES the scene RT instead of blending into it. Dump
+                        // every sampled slot in order on the first 2 such events, with unique
+                        // ids, so the four inputs of the replacing pass are inspectable
+                        // individually; force=true bypasses the per-image dedupe.
+                        if (params.num_vertices <= 4 &&
+                            (stored.pipeline->State().attachments[0].raw & 0xFu) == 0xFu &&
+                            s15_small_sampled == 4) {
+                            static bool s15_selfsampler_pending = true;
+                            static u32 s15_selfsampler_events = 0;
+                            if (s15_selfsampler_pending) {
+                                ++s15_selfsampler_events;
+                                const u32 s15_selfsampler_base =
+                                    s15_selfsampler_events == 1 ? 980001u : 980011u;
+                                u32 s15_selfsampler_dumped = 0;
+                                for (const DrawSlot& slot : res_slots) {
+                                    if (slot.kind != SlotKind::Sampled) {
+                                        continue;
+                                    }
+                                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                                    if (sv.Resource() == nullptr) {
+                                        continue;
+                                    }
+                                    ++s15_selfsampler_dumped;
+                                    (void)D3D12::RecordTextureContentDump(
+                                        m_device.GetDevice(), m_command_list, sv.Resource(),
+                                        static_cast<u32>(sv.format),
+                                        static_cast<u64>(sv.GpuAddr()),
+                                        s15_selfsampler_base + s15_selfsampler_dumped,
+                                        /*force=*/true);
+                                }
+                                LOG_WARNING(Render_D3D12,
+                                            "S15 selfsampler dumps: verts={} rts={} inputs={}",
+                                            params.num_vertices, num_rtvs,
+                                            s15_selfsampler_dumped);
+                                if (s15_selfsampler_events >= 2) {
+                                    s15_selfsampler_pending = false;
+                                }
+                            }
+                        }
                         // TEMP DIAGNOSTIC (session 15): the zeroing ("wiper") draw
                         // signature: <=4 verts, write-mask low nibble 0x7 (RGB only, no
                         // alpha) and <=2 sampled slots. The same-rt self-sampler (mask
@@ -3039,6 +3173,20 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                             static_cast<u32>(sv.format),
                                             static_cast<u64>(sv.GpuAddr()), sv.image_id.index,
                                             /*force=*/true);
+                                        // TEMP DIAGNOSTIC (session 15, style-screen chain): the
+                                        // input above is dumped under its own image id, whose
+                                        // filename collides with older runs; re-record the first
+                                        // event's input under the unique 980005 id so it lands
+                                        // in its own file.
+                                        static bool s15_wiper_stable_dumped = false;
+                                        if (!s15_wiper_stable_dumped) {
+                                            s15_wiper_stable_dumped = true;
+                                            (void)D3D12::RecordTextureContentDump(
+                                                m_device.GetDevice(), m_command_list,
+                                                sv.Resource(), static_cast<u32>(sv.format),
+                                                static_cast<u64>(sv.GpuAddr()), 980005u,
+                                                /*force=*/true);
+                                        }
                                     }
                                 }
                                 LOG_WARNING(
@@ -3209,6 +3357,18 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         }
                     }
                 }
+            }
+            // TEMP DIAGNOSTIC (session 15, style-screen chain): the composite target of the very
+            // scene-composite draw whose sampled textures were dumped above, recorded once under
+            // a unique id now that the draw has executed and the render targets are back in
+            // COMMON. The flag is cleared here so exactly one such dump can be armed.
+            if (g_s15_composite_target_dump) {
+                g_s15_composite_target_dump = false;
+                (void)D3D12::RecordTextureContentDump(
+                    m_device.GetDevice(), m_command_list, s15_post_res,
+                    static_cast<u32>(VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM),
+                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()), 980024u,
+                    /*force=*/true);
             }
         }
     }
