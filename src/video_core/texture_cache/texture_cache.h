@@ -604,7 +604,8 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     // Release the whole write-tracked page; GPU-written images keep exact bounds.
     const DAddr page_start = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(cpu_addr + size, Core::DEVICE_PAGESIZE);
-    ForEachImageInRegion(page_start, page_end - page_start, [this](ImageId image_id, Image& image) {
+    ForEachImageInRegion(page_start, page_end - page_start,
+                          [this, cpu_addr, size](ImageId image_id, Image& image) {
         if (True(image.flags & ImageFlagBits::CpuModified)) {
             return;
         }
@@ -616,6 +617,19 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         // keeps the GPU content authoritative (a real CPU overwrite of such an image must go
         // through an explicit download/invalidate, as everywhere else).
         if (True(image.flags & ImageFlagBits::GpuModified)) {
+            // TEMP DIAGNOSTIC (S15): H-cpu probe - this early return swallows guest CPU
+            // writes whose page range overlaps a GPU-authored image (candidate writer of
+            // the wiper input at cpu 0x9501a000 and of the atlas images); bounded log of
+            // exactly what is being skipped.
+            static u32 s15_write_swallow_logs = 0;
+            if (s15_write_swallow_logs < 16) {
+                ++s15_write_swallow_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S15 WriteMemory swallowed: img_gpu={:#x} img_flags={:#x} "
+                            "write_cpu={:#x} size={} gpu_modified=1",
+                            static_cast<u64>(image.gpu_addr),
+                            static_cast<u32>(image.flags), static_cast<u64>(cpu_addr), size);
+            }
             return;
         }
         image.flags |= ImageFlagBits::CpuModified;

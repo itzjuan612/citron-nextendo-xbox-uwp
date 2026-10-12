@@ -152,6 +152,21 @@ void Fermi2D::Blit() {
                  config.dst_x1, config.dst_y1, config.src_x0, config.src_y0, config.src_x1,
                  config.src_y1, static_cast<u32>(config.filter));
     }
+    // TEMP DIAGNOSTIC (S15): the wiper-input window [0x517000000, 0x517200000) has no
+    // logged draw/compute producer; catch a Fermi2D blit whose destination lands in it.
+    static u32 s15_window_blit_logs = 0;
+    if (s15_window_blit_logs < 8) {
+        const GPUVAddr s15_dst_gpu = regs.dst.Address();
+        if (s15_dst_gpu >= 0x517000000ull && s15_dst_gpu < 0x517200000ull) {
+            ++s15_window_blit_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S15 window blit: src={:#x} dst={:#x} src_box=({},{})-({},{}) "
+                        "dst_box=({},{})-({},{})",
+                        src.Address(), s15_dst_gpu, config.src_x0, config.src_y0,
+                        config.src_x1, config.src_y1, config.dst_x0, config.dst_y0,
+                        config.dst_x1, config.dst_y1);
+        }
+    }
 }
 
 } // namespace Tegra::Engines

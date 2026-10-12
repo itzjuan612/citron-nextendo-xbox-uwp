@@ -431,6 +431,25 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (params.num_vertices == 0 || params.num_instances == 0) {
         return;
     }
+    // TEMP DIAGNOSTIC (S15): depth-side half of the wiper-window RT tracer; a depth view
+    // can land in [0x517000000, 0x517200000) too, and this runs before the skip guards so
+    // draws rejected below still log. One shared static cap with the color-slot tracer in
+    // the validation loop.
+    static u32 s15_window_bind_logs = 0;
+    if (depth_view != nullptr && s15_window_bind_logs < 24) {
+        const u64 s15_depth_gpu = static_cast<u64>(depth_view->GpuAddr());
+        if (s15_depth_gpu >= 0x517000000ull && s15_depth_gpu < 0x517200000ull) {
+            ++s15_window_bind_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S15 window bind: gpu={:#x} res={:#x} {}x{} slot={} raw_fmt={:#x} "
+                        "unrepresentable={} unbound={} att={:#x} verts={}",
+                        s15_depth_gpu, reinterpret_cast<u64>(depth_view->Resource()),
+                        depth_view->size.width, depth_view->size.height, VideoCommon::NUM_RT,
+                        static_cast<u32>(depth_view->format), 0,
+                        depth_view->RenderTarget().ptr == 0 ? 1 : 0,
+                        stored.pipeline->State().attachments[0].raw, params.num_vertices);
+        }
+    }
     if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
         return;
     }
@@ -438,14 +457,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         const auto format =
             static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
         const bool is_none = (format == Tegra::RenderTargetFormat::NONE);
+        const u32 raw_format = static_cast<u32>(format);
+        const char* skip_reason = nullptr;
         if (!is_none) {
             // Garbage guest render-target state must never reach OMSetRenderTargets or PSO
             // creation: an out-of-range, depth/stencil, or otherwise unrepresentable format
             // builds a degenerate pipeline that removes the device at execute time.
-            const u32 raw_format = static_cast<u32>(format);
             const VideoCore::Surface::PixelFormat pixel_format =
                 VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
-            const char* skip_reason = nullptr;
             if (raw_format <
                     static_cast<u32>(Tegra::RenderTargetFormat::R32G32B32A32_FLOAT) ||
                 raw_format > static_cast<u32>(Tegra::RenderTargetFormat::X8B8G8R8_SRGB)) {
@@ -457,19 +476,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             } else if (!m_texture_runtime.IsRepresentableRenderTarget(pixel_format)) {
                 skip_reason = "unrepresentable";
             }
-            if (skip_reason != nullptr) {
-                if (!logged_rt_hole) {
-                    logged_rt_hole = true;
-                    LOG_ERROR(Render_D3D12,
-                              "Draw with unrepresentable render target slot {} (color_formats "
-                              "value {}, reason: {}) skipped",
-                              i, raw_format, skip_reason);
-                }
-                return;
-            }
         }
         const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
-        if (!view || !view->RenderTarget().ptr) {
+        const bool unbound = !view || !view->RenderTarget().ptr;
+        // TEMP DIAGNOSTIC (S15): wiper-window RT tracer, evaluated before the skip returns
+        // below so a producer draw this loop rejects (unrepresentable format or unbound
+        // slot) is still logged - the previous after-loop tracer never saw skipped draws.
+        if (s15_window_bind_logs < 24 && view != nullptr) {
+            const u64 s15_gpu = static_cast<u64>(view->GpuAddr());
+            if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
+                ++s15_window_bind_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S15 window bind: gpu={:#x} res={:#x} {}x{} slot={} raw_fmt={:#x} "
+                            "unrepresentable={} unbound={} att={:#x} verts={}",
+                            s15_gpu, reinterpret_cast<u64>(view->Resource()), view->size.width,
+                            view->size.height, i, raw_format, skip_reason != nullptr ? 1 : 0,
+                            unbound ? 1 : 0, stored.pipeline->State().attachments[0].raw,
+                            params.num_vertices);
+            }
+        }
+        if (skip_reason != nullptr) {
+            if (!logged_rt_hole) {
+                logged_rt_hole = true;
+                LOG_ERROR(Render_D3D12,
+                          "Draw with unrepresentable render target slot {} (color_formats "
+                          "value {}, reason: {}) skipped",
+                          i, raw_format, skip_reason);
+            }
+            return;
+        }
+        if (unbound) {
             // OMSetRenderTargets receives handles for all num_rtvs slots, and a null CPU
             // handle anywhere in the array is an execution-time device-removal on Xbox
             // that Close cannot catch.
@@ -484,46 +520,20 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     }
 
     // TEMP DIAGNOSTIC (S15, producer tracer): the wiper-input window
-    // [0x517000000, 0x517200000) never appears in the decimated "Draw RTs" log; trace any
-    // draw that binds an RT or depth view inside it (unfiltered, two integer compares per
-    // RT, bounded to 16 logs). Likewise the dynamic-res family window
-    // [0x5103e0000, 0x510640000) minus the 960x540 member itself (bounded to 32): settles
-    // whether the scene ever renders into the members the composite samples.
-    {
-        static u32 s15_wiper_rt_logs = 0;
-        if (s15_wiper_rt_logs < 16) {
-            const ImageView* s15_wiper_rt = nullptr;
-            for (size_t i = 0; i < num_rtvs; ++i) {
-                const ImageView* const s15_view = framebuffer->ColorBuffers()[i];
-                const u64 s15_gpu = static_cast<u64>(s15_view->GpuAddr());
-                if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
-                    s15_wiper_rt = s15_view;
-                    break;
-                }
-            }
-            if (s15_wiper_rt == nullptr && depth_view != nullptr &&
-                depth_view->RenderTarget().ptr != 0) {
-                const u64 s15_gpu = static_cast<u64>(depth_view->GpuAddr());
-                if (s15_gpu >= 0x517000000ull && s15_gpu < 0x517200000ull) {
-                    s15_wiper_rt = depth_view;
-                }
-            }
-            if (s15_wiper_rt != nullptr) {
-                ++s15_wiper_rt_logs;
-                LOG_WARNING(Render_D3D12,
-                            "S15 wiper-range RT: gpu={:#x} res={:#x} {}x{} att={:#x} verts={} "
-                            "depth={}",
-                            static_cast<u64>(s15_wiper_rt->GpuAddr()),
-                            reinterpret_cast<u64>(s15_wiper_rt->Resource()),
-                            s15_wiper_rt->size.width, s15_wiper_rt->size.height,
-                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
-                            depth_view != nullptr ? 1 : 0);
-            }
-        }
-    }
+    // [0x517000000, 0x517200000) never appears in the decimated "Draw RTs" log; it is now
+    // traced inside the validation loop above and at the depth view, so skipped draws log
+    // too. The block below covers the dynamic-res family window [0x5103e0000, 0x510640000)
+    // minus the 960x540 member itself: settles whether the scene ever renders into the
+    // members the composite samples. Late-gated like the small-writer tracer so the boot
+    // mip-chain writes into 0x510590000 cannot consume the cap before the style phase.
     {
         static u32 s15_family_writer_logs = 0;
-        if (s15_family_writer_logs < 32 && num_rtvs > 0) {
+        static std::chrono::steady_clock::time_point s15_family_writer_start =
+            std::chrono::steady_clock::now();
+        const bool s15_family_writer_late =
+            std::chrono::steady_clock::now() - s15_family_writer_start >
+            std::chrono::minutes(20);
+        if (s15_family_writer_late && s15_family_writer_logs < 64 && num_rtvs > 0) {
             const ImageView* const s15_view = framebuffer->ColorBuffers()[0];
             const u64 s15_gpu = static_cast<u64>(s15_view->GpuAddr());
             if (s15_gpu >= 0x5103e0000ull && s15_gpu < 0x510640000ull &&
