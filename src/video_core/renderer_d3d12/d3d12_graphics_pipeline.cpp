@@ -665,9 +665,11 @@ GraphicsPipeline::GraphicsPipeline(
     depth_stencil_desc.DepthWriteMask =
         state.depth_write_enable != 0 ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
     depth_stencil_desc.DepthFunc = ComparisonOp(state.depth_test_func.Value());
-    // TEMP DIAGNOSTIC (session 14): tested true -> the 960x540 scene RT stayed black, so the
-    // depth path is not the cause. Left disabled.
-    static constexpr bool kForceDepthAlways = false;
+    // TEMP EXPERIMENT (session 16 cont.5): the session-14 test ("no effect") ran while the
+    // scene RT was still being wiped by the modulate pass, so it proved nothing. Re-testing
+    // now that the chain works: if the 3D color passes are depth-rejected, ALWAYS makes them
+    // draw (character should appear); if the content is unchanged, depth is not the cause.
+    static constexpr bool kForceDepthAlways = true;
     if (kForceDepthAlways && depth_stencil_desc.DepthEnable) {
         depth_stencil_desc.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     }
