@@ -1018,6 +1018,37 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                               "vertex_size={} skipped (count {})",
                               slot, bound_stride, bound_size, vertex_range_skips);
                 }
+                // TEMP DIAGNOSTIC (session 15): full context for the first skips of the run
+                // (the big character meshes are believed to die here): draw params, the host
+                // resource behind the view, and the raw vertex-stream registers 0..3.
+                static u32 s15_vb_skip_details = 0;
+                if (s15_vb_skip_details < 24) {
+                    ++s15_vb_skip_details;
+                    ID3D12Resource* const s15_vb_res =
+                        m_runtime.GetVertexBindingResource(slot);
+                    fmt::memory_buffer s15_vb_streams;
+                    for (u32 s = 0; s < 4; ++s) {
+                        const auto& s15_vs = regs.vertex_streams[s];
+                        fmt::format_to(std::back_inserter(s15_vb_streams),
+                                       "[s{} str={} en={} addr={:#x}]", s,
+                                       s15_vs.stride.Value(), s15_vs.enable.Value(),
+                                       static_cast<u64>(s15_vs.Address()));
+                    }
+                    LOG_ERROR(Render_D3D12,
+                              "S15 vb skip detail #{}: slot={} loc={:#x} stride={} size={} "
+                              "verts={} indexed={} base={} first={} att={:#x} req={} "
+                              "range_known={} res={:#x} res_base={:#x} res_size={:#x} {}",
+                              s15_vb_skip_details, slot,
+                              static_cast<u64>(view.BufferLocation), bound_stride, bound_size,
+                              params.num_vertices, params.is_indexed ? 1 : 0, params.base_vertex,
+                              params.first_index,
+                              static_cast<u32>(pipe_state.attachments[0].raw), vertex_required,
+                              range_known ? 1 : 0,
+                              reinterpret_cast<u64>(s15_vb_res),
+                              s15_vb_res ? s15_vb_res->GetGPUVirtualAddress() : 0,
+                              s15_vb_res ? s15_vb_res->GetDesc().Width : 0,
+                              fmt::to_string(s15_vb_streams));
+                }
                 if (flinger_draw) {
                     static u32 fd_vb_logs = 0;
                     if (fd_vb_logs < 4) {
