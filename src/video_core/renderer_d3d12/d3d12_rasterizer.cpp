@@ -983,23 +983,25 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // view (BufferLocation == 0) or an unbounded size keeps the old skip. The guest
             // meshes (Splatoon 3 style screen) hit this path with slot=0 stride=0 size=0.
             u64 effective_size = static_cast<u64>(bound_size);
-            if (view.BufferLocation != 0 && bound_size == 0 && range_known) {
-                effective_size = std::max<u64>(
-                    vertex_required + static_cast<u64>(bound_stride),
-                    bound_stride != 0 ? static_cast<u64>(bound_stride) : u64{16});
-                effective_size = std::min<u64>(effective_size, 512u * 1024u * 1024u);
-                // Stay inside the committed resource: an out-of-range vertex fetch removes the
-                // device, which Close cannot catch. BindHostVertexBuffers passes the (possibly
-                // stale) guest size straight through, so the host buffer is the authority here.
+            if (view.BufferLocation != 0 && bound_size == 0) {
+                // The guest size is 0/stale (NVN leaves it at 0 for the big character meshes,
+                // which also have >kMaxGuardIndices vertices so range_known is false). The
+                // committed resource is the authority: bound the view by everything left in
+                // it after the view offset, which can never fault (an out-of-range vertex
+                // fetch removes the device and Close cannot catch it).
                 if (ID3D12Resource* resource = m_runtime.GetVertexBindingResource(slot)) {
                     const u64 resource_size = resource->GetDesc().Width;
                     const u64 resource_base = resource->GetGPUVirtualAddress();
                     if (view.BufferLocation >= resource_base) {
                         const u64 offset = static_cast<u64>(view.BufferLocation) - resource_base;
-                        effective_size = std::min<u64>(
-                            effective_size,
-                            resource_size > offset ? resource_size - offset : u64{0});
+                        effective_size = resource_size > offset ? resource_size - offset : u64{0};
                     }
+                }
+                if (effective_size == 0 && range_known) {
+                    effective_size = std::max<u64>(
+                        vertex_required + static_cast<u64>(bound_stride),
+                        bound_stride != 0 ? static_cast<u64>(bound_stride) : u64{16});
+                    effective_size = std::min<u64>(effective_size, 512u * 1024u * 1024u);
                 }
                 if (effective_size > 0) {
                     // Transient: BindVertexBuffers rewrites the whole array whenever the
