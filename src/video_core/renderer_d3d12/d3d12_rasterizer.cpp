@@ -680,20 +680,30 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // TEMP DIAGNOSTIC (session 15): the 256x256 B10G11R11 lighting LUT is all-zero
             // while the scene samples it; dump the RT resource the first few times a small
             // R11G11B10 target is rendered into, to see whether the render lands in it.
-            if (res != nullptr && depth_view == nullptr) {
+            // TEMP DIAGNOSTIC (session 17): also catch every draw whose render target lies in
+            // the 27 MB LUT bank (nvmap handle 0x370, mapped at 0x5e9900000 / 0x5eb340000 /
+            // 0x5ecd80000, dev 0x29426000). This loop runs before the RT/vertex guards, so a
+            // producer draw that is skipped later in ConfigureDraw still shows up here.
+            const bool s17_lut_bank = addr >= 0x5e9000000ull && addr < 0x5ed00000ull;
+            if (res != nullptr) {
                 const D3D12_RESOURCE_DESC s15_lut_desc = res->GetDesc();
-                if (s15_lut_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
-                    s15_lut_desc.Width <= 512 && s15_lut_desc.Height <= 512) {
+                const bool s17_small_lut =
+                    depth_view == nullptr &&
+                    s15_lut_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
+                    s15_lut_desc.Width <= 512 && s15_lut_desc.Height <= 512;
+                if (s17_lut_bank || s17_small_lut) {
                     static u32 s15_lut_rtv_dumps = 0;
-                    if (s15_lut_rtv_dumps < 4) {
+                    if (s15_lut_rtv_dumps < 24) {
                         ++s15_lut_rtv_dumps;
                         LOG_WARNING(Render_D3D12,
                                     "S15 LUT RT: gpu={:#x} res=0x{:x} {}x{} fmt={:#x} verts={} "
-                                    "vp=({},{},{},{})",
+                                    "bank={} att={:#x} vp=({},{},{},{})",
                                     static_cast<u64>(view->GpuAddr()),
                                     reinterpret_cast<u64>(res), s15_lut_desc.Width,
                                     s15_lut_desc.Height, static_cast<u32>(s15_lut_desc.Format),
-                                    params.num_vertices, MakeViewport(maxwell3d->regs).TopLeftX,
+                                    params.num_vertices, static_cast<u32>(s17_lut_bank),
+                                    static_cast<u32>(stored.pipeline->State().attachments[0].raw),
+                                    MakeViewport(maxwell3d->regs).TopLeftX,
                                     MakeViewport(maxwell3d->regs).TopLeftY,
                                     MakeViewport(maxwell3d->regs).Width,
                                     MakeViewport(maxwell3d->regs).Height);
@@ -1015,7 +1025,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // view (BufferLocation == 0) or an unbounded size keeps the old skip. The guest
             // meshes (Splatoon 3 style screen) hit this path with slot=0 stride=0 size=0.
             u64 effective_size = static_cast<u64>(bound_size);
-            if (view.BufferLocation != 0 && bound_size == 0) {
+            // The guest's stream size register is frequently stale or short: NVN leaves it at
+            // whatever the last explicit bind set while later draws reuse the same stream with
+            // a larger index range. Treat a too-short size exactly like a missing one - repair
+            // it from the committed resource - instead of skipping the draw. Skipping here was
+            // costing ~35k draws per run (S15 vb skip counters climbed every frame).
+            const bool size_short = enforce_range && vertex_required > effective_size;
+            if (view.BufferLocation != 0 && (bound_size == 0 || size_short)) {
                 // The guest size is 0/stale (NVN leaves it at 0 for the big character meshes,
                 // which also have >kMaxGuardIndices vertices so range_known is false). The
                 // committed resource is the authority: bound the view by everything left in
@@ -1029,7 +1045,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         effective_size = resource_size > offset ? resource_size - offset : u64{0};
                     }
                 }
-                if (effective_size == 0 && range_known) {
+                if (bound_size == 0 && effective_size == 0 && range_known) {
+                    // Only for the zero-size case: synthesise a size from the vertex range.
+                    // A merely-short size never reaches here with a zero clamp result - in
+                    // that path the committed resource stays the sole authority.
                     effective_size = std::max<u64>(
                         vertex_required + static_cast<u64>(bound_stride),
                         bound_stride != 0 ? static_cast<u64>(bound_stride) : u64{16});
@@ -1054,7 +1073,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // (the big character meshes are believed to die here): draw params, the host
                 // resource behind the view, and the raw vertex-stream registers 0..3.
                 static u32 s15_vb_skip_details = 0;
-                if (s15_vb_skip_details < 24) {
+                if (s15_vb_skip_details < 64) {
                     ++s15_vb_skip_details;
                     ID3D12Resource* const s15_vb_res =
                         m_runtime.GetVertexBindingResource(slot);
