@@ -692,9 +692,18 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     s15_lut_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT &&
                     s15_lut_desc.Width <= 512 && s15_lut_desc.Height <= 512;
                 if (s17_lut_bank || s17_small_lut) {
+                    // Separate budgets: in the 1.0.252 run the small-LUT branch consumed the
+                    // whole shared cap by t=220, so a later bank bind could never be observed.
                     static u32 s15_lut_rtv_dumps = 0;
-                    if (s15_lut_rtv_dumps < 24) {
-                        ++s15_lut_rtv_dumps;
+                    static u32 s17_bank_dumps = 0;
+                    const bool s17_allow_dump =
+                        s17_lut_bank ? (s17_bank_dumps < 24) : (s15_lut_rtv_dumps < 24);
+                    if (s17_allow_dump) {
+                        if (s17_lut_bank) {
+                            ++s17_bank_dumps;
+                        } else {
+                            ++s15_lut_rtv_dumps;
+                        }
                         LOG_WARNING(Render_D3D12,
                                     "S15 LUT RT: gpu={:#x} res=0x{:x} {}x{} fmt={:#x} verts={} "
                                     "bank={} att={:#x} vp=({},{},{},{})",
@@ -2625,10 +2634,20 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 const bool s15_lut_run = !s15_lut_dumped || (s15_lut_late && !s15_lut_late_done);
                 u32 s15_lut_slots = 0;
                 for (const DrawSlot& slot : res_slots) {
-                    if (!s15_lut_run || slot.kind != SlotKind::Sampled || s15_lut_slots >= 4) {
+                    if (slot.kind != SlotKind::Sampled) {
                         continue;
                     }
                     ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    // The 256x256 bank sub-view must reach the probe (and the white-clear
+                    // below) even after the one-shot LUT gate above has closed - in 1.0.253
+                    // the gate fired on a DIFFERENT 128x128 LUT at t=594 and the bank view
+                    // was therefore never probed, so the causal probe never ran. Everything
+                    // else keeps the gate's original semantics.
+                    const bool s17_bank_view =
+                        static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull;
+                    if ((!s15_lut_run && !s17_bank_view) || s15_lut_slots >= 4) {
+                        continue;
+                    }
                     const bool is_lut =
                         (sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
                          sv.size.width <= 512) ||
@@ -2670,6 +2689,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 sv.size.height, static_cast<u32>(sv.format),
                                 dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex,
                                 params.num_vertices);
+                    // TEMP DIAGNOSTIC (session 17) - CAUSAL PROBE: is the all-zero lighting LUT
+                    // what keeps the 3D scene dark? One-shot, in-stream, before the draw that
+                    // samples it: clear the bank sub-view to white so every lookup returns 1.0.
+                    // If the character lights up, the LUT is causally responsible and the next
+                    // step is finding its (currently unlogged) producer; if nothing changes, the
+                    // LUT is irrelevant and the darkness is elsewhere. Diagnostic only - remove
+                    // once the producer is found. Bounded: exactly one clear per process.
+                    static bool s17_lut_white_done = false;
+                    if (!s17_lut_white_done && static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull &&
+                        sv.Resource() != nullptr) {
+                        s17_lut_white_done = true;
+                        ID3D12Resource* const s17_lut_res = sv.Resource();
+                        // Own 1-descriptor RTV heap: TextureCacheRuntime::rtv_heap is private and
+                        // this probe must not consume the runtime's descriptor budget.
+                        static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s17_rtv_heap;
+                        if (!s17_rtv_heap) {
+                            D3D12_DESCRIPTOR_HEAP_DESC s17_heap_desc{};
+                            s17_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                            s17_heap_desc.NumDescriptors = 1;
+                            s17_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                            (void)m_device.GetDevice()->CreateDescriptorHeap(
+                                &s17_heap_desc, IID_PPV_ARGS(&s17_rtv_heap));
+                        }
+                        if (s17_rtv_heap) {
+                            const D3D12_CPU_DESCRIPTOR_HANDLE s17_rtv =
+                                s17_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+                            D3D12_RENDER_TARGET_VIEW_DESC s17_rtv_desc{};
+                            s17_rtv_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+                            s17_rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                            m_device.GetDevice()->CreateRenderTargetView(s17_lut_res, &s17_rtv_desc,
+                                                                         s17_rtv);
+                            m_command_list.Transition(s17_lut_res, D3D12_RESOURCE_STATE_COMMON,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            const f32 s17_white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                            m_command_list.ClearRenderTargetView(s17_rtv, s17_white);
+                            m_command_list.Transition(s17_lut_res,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+                            LOG_WARNING(Render_D3D12,
+                                        "S17 LUT white probe: cleared gpu=0x5eb340000 res=0x{:x}",
+                                        reinterpret_cast<u64>(s17_lut_res));
+                        }
+                    }
                     // ONE-SHOT: enumerate every cached image registered over the 27 MB LUT
                     // bank (cpu 0x29426000) once the 256x256 LUT sub-view itself is the
                     // probed image, so aliasing/sibling coverage of that region is visible
