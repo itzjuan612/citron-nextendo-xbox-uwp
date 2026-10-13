@@ -4100,6 +4100,14 @@ void RasterizerD3D12::Clear(u32 layer_count) {
     }
 }
 void RasterizerD3D12::DispatchCompute() {
+    // REVERTED (session 17, 1.0.256.0 -> 1.0.257.0): adding gpu_memory->FlushCaching() here
+    // BLACKED OUT the 3D scene on console (captures mean 5.4/255 with only a fragment of the
+    // character left, UI intact), where 1.0.255.0 was lit. Cause: D3D12 never marks
+    // compute-written STORAGE IMAGES as GpuModified (Vulkan does it in pipeline_helper.h:305 for
+    // desc.is_written), so flushing before a dispatch makes RasterizerD3D12::InvalidateRegion
+    // mark those images CpuModified and the next sample re-uploads them from stale guest memory,
+    // destroying GPU-authored content. Do NOT re-add this flush until compute storage-image
+    // writes are marked GpuModified the way Vulkan marks them.
     // TEMP DIAGNOSTIC (session 13): compute dispatches are currently dropped entirely (the
     // D3D12 backend has no compute pipeline path). The missing 3D scene on the style screen
     // is the prime suspect for guest compute usage, so log the dispatch rate and shape.
