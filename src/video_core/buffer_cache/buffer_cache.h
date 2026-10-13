@@ -1356,6 +1356,22 @@ void BufferCache<P>::UpdateComputeTextureBuffers() {
 
 template <class P>
 void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u32 size) {
+    // TEMP DIAGNOSTIC (S17): does anything write the 27 MB LUT bank (dev 0x29426000, 0x1a34000
+    // bytes, mapped at gpu 0x5e9900000 / 0x5eb340000 / 0x5ecd80000) through a *buffer* binding?
+    // The texture cache structurally cannot see buffer writes, so this line is the decisive
+    // split between a buffer-side producer and a draw-side one. Bounded to 32 lines.
+    {
+        static u32 s17_bank_write_logs = 0;
+        if (s17_bank_write_logs < 32 &&
+            device_addr < static_cast<DAddr>(0x29426000u + 0x1a34000u) &&
+            static_cast<u64>(device_addr) + size > 0x29426000u) {
+            ++s17_bank_write_logs;
+            LOG_WARNING(HW_GPU,
+                        "S17 bank buffer write #{}: dev={:#x} size={} buf={}",
+                        s17_bank_write_logs, static_cast<u64>(device_addr), size,
+                        buffer_id.index);
+        }
+    }
     memory_tracker.MarkRegionAsGpuModified(device_addr, size);
     gpu_modified_ranges.Add(device_addr, size);
     uncommitted_gpu_modified_ranges.Add(device_addr, size);

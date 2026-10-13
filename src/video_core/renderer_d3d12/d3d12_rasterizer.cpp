@@ -483,6 +483,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // return here, before the buffer-binding section below records staging COPY commands
     // for garbage draw state (those copies execute at flush and fault the GPU on console,
     // removing the device even for draws every later guard would skip).
+    // TEMP FIX CANDIDATE (S17): Vulkan calls gpu_memory->FlushCaching() before every draw and
+    // dispatch (vk_rasterizer.cpp:276 / :589) because KeplerMemory's block-linear inline-upload
+    // path writes guest memory with CacheType::None and relies on this flush to invalidate the
+    // caches (memory_manager.cpp:482-485). D3D12 only called it from Clear / Fermi2D / MaxwellDMA,
+    // so such an upload could leave the texture cache stale indefinitely - a candidate cause of
+    // the all-zero 27 MB LUT bank. No-op when nothing is pending.
+    gpu_memory->FlushCaching();
     m_texture_cache.UpdateRenderTargets(false);
     Framebuffer* framebuffer = m_texture_cache.GetFramebuffer();
 
@@ -2645,8 +2652,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     // else keeps the gate's original semantics.
                     const bool s17_bank_view =
                         static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull;
-                    if ((!s15_lut_run && !s17_bank_view) || s15_lut_slots >= 4) {
+                    static u32 s17_bank_views = 0;
+                    if ((!s15_lut_run && !(s17_bank_view && s17_bank_views < 8)) ||
+                        s15_lut_slots >= 4) {
                         continue;
+                    }
+                    if (s17_bank_view) {
+                        ++s17_bank_views;
                     }
                     const bool is_lut =
                         (sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
@@ -2697,7 +2709,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     // LUT is irrelevant and the darkness is elsewhere. Diagnostic only - remove
                     // once the producer is found. Bounded: exactly one clear per process.
                     static bool s17_lut_white_done = false;
-                    if (!s17_lut_white_done && static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull &&
+                    // The probe has served its purpose: with the FlushCaching() fix the LUT now
+                    // receives real guest data, so clearing it would destroy correct content.
+                    // Kept disabled (not deleted) until the whole S17 set is cleaned up.
+                    static constexpr bool s17_enable_white_probe = false;
+                    if (s17_enable_white_probe && !s17_lut_white_done &&
+                        static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull &&
                         sv.Resource() != nullptr) {
                         s17_lut_white_done = true;
                         ID3D12Resource* const s17_lut_res = sv.Resource();
