@@ -4852,7 +4852,16 @@ void RasterizerD3D12::UnmapMemory(DAddr addr, u64 size) {
     m_buffer_cache.WriteMemory(addr, size);
     m_texture_cache.WriteMemory(addr, size);
 }
-void RasterizerD3D12::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {}
+void RasterizerD3D12::ModifyGPUMemory(size_t as_id, GPUVAddr addr, u64 size) {
+    // Mirror RasterizerVulkan (vk_rasterizer.cpp:809): a GMMU remap means the backing memory
+    // changed, so mark every overlapping image CpuModified|Remapped. FindImage then stops serving
+    // them and JoinImages deletes them, while the replacement image's RefreshContents uploads the
+    // CURRENT guest bytes. Without this the 27 MB LUT bank - one dev range mapped at three GPU VAs
+    // via MapBufferEx, which fires this on every re-map - keeps the image it created before the
+    // guest filled the buffer, and is sampled with stale (zero) content for the whole run.
+    std::scoped_lock lock{m_texture_cache.mutex};
+    m_texture_cache.UnmapGPUMemory(as_id, addr, size);
+}
 void RasterizerD3D12::SignalFence(std::function<void()>&& func) {
     func();
 }

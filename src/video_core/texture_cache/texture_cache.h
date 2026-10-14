@@ -1257,8 +1257,11 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     // alternating frames, or something else clobbering its resource. This logs every upload of a
     // bank-overlapping image with its flags/tick so the two are distinguishable. Bounded to 64.
     {
+        // Cap raised 64 -> 1024: the 64-entry cap was EXACTLY saturated by the creation burst
+        // (64 events in 0.27 s at t=750.9-751.2), which made 'no uploads after creation' an
+        // artefact of the cap rather than an observation.
         static u32 s17_bank_upload_logs = 0;
-        if (s17_bank_upload_logs < 64 && image.cpu_addr < (0x29426000u + 0x1a40000u) &&
+        if (s17_bank_upload_logs < 1024 && image.cpu_addr < (0x29426000u + 0x1a40000u) &&
             static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x29426000u) {
             ++s17_bank_upload_logs;
             LOG_WARNING(Render_D3D12,
