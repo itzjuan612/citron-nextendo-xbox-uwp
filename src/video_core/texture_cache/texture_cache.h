@@ -1251,6 +1251,23 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                         diag_prefix[7]);
         }
     }
+    // TEMP DIAGNOSTIC (S17): per-upload record for the 27 MB LUT bank. The lit/black alternation
+    // observed WITHIN one run (capture_8 lit at t=1203, capture_9 black at t=1307, capture_10 lit
+    // at t=1408) is either the sampled image being re-uploaded from zero guest memory on
+    // alternating frames, or something else clobbering its resource. This logs every upload of a
+    // bank-overlapping image with its flags/tick so the two are distinguishable. Bounded to 64.
+    {
+        static u32 s17_bank_upload_logs = 0;
+        if (s17_bank_upload_logs < 64 && image.cpu_addr < (0x29426000u + 0x1a40000u) &&
+            static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x29426000u) {
+            ++s17_bank_upload_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 bank upload #{}: img={} gpu={:#x} size={} flags={:#x} tick={}",
+                        s17_bank_upload_logs, image_id.index, static_cast<u64>(image.gpu_addr),
+                        image.guest_size_bytes, static_cast<u32>(image.flags),
+                        image.modification_tick);
+        }
+    }
     UploadImageContents(image, staging);
     runtime.InsertUploadMemoryBarrier();
 }
@@ -2609,6 +2626,36 @@ template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    // TEMP DIAGNOSTIC (S17): the 27 MB LUT bank (cpu 0x29426000) is a family of small 512-byte
+    // images flagged Alias|GpuModified sharing memory with the 27 MB image the shaders sample.
+    // The sampled image only receives the LUT when this propagation runs, and the population is
+    // intermittent run-to-run, so log exactly which of the three failure modes applies:
+    //   aliases=0                     -> propagation was never registered (JoinImages missed it)
+    //   aliases>0 but newer=0 for all -> registered, but the tick comparison never admits a copy
+    //   newer=1 but copies=0          -> admitted, but the copy list is empty (nothing to copy)
+    // Bounded to 24 lines; only fires for images overlapping the bank.
+    {
+        static u32 s17_alias_logs = 0;
+        if (s17_alias_logs < 24 && image.cpu_addr < (0x29426000u + 0x1a40000u) &&
+            static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x29426000u) {
+            ++s17_alias_logs;
+            std::string s17_aliases;
+            for (const AliasedImage& s17_a : image.aliased_images) {
+                ImageBase& s17_ai = slot_images[s17_a.id];
+                s17_aliases +=
+                    fmt::format("[id={} gpu={:#x} tick={} flags={:#x} newer={} copies={}]",
+                                s17_a.id.index, static_cast<u64>(s17_ai.gpu_addr),
+                                s17_ai.modification_tick, static_cast<u32>(s17_ai.flags),
+                                image.modification_tick < s17_ai.modification_tick,
+                                s17_a.copies.size());
+            }
+            LOG_WARNING(Render_D3D12,
+                        "S17 alias: img={} gpu={:#x} tick={} flags={:#x} size={} aliases={} {}",
+                        image_id.index, static_cast<u64>(image.gpu_addr),
+                        image.modification_tick, static_cast<u32>(image.flags),
+                        image.guest_size_bytes, image.aliased_images.size(), s17_aliases);
+        }
+    }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
@@ -2693,6 +2740,27 @@ template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
+    // TEMP DIAGNOSTIC (S17): name every texture-cache-side copy touching the 27 MB LUT bank
+    // (cpu 0x29426000). This catches the JoinImages copy paths and any alias synchronisation, so
+    // together with the existing 'RefreshContents upload' line it accounts for every writer of the
+    // sampled image's resource - the run-to-run intermittency needs that attribution. Bounded 24.
+    {
+        static u32 s17_copy_logs = 0;
+        const auto s17_hits = [](const ImageBase& i) {
+            return i.cpu_addr < (0x29426000u + 0x1a40000u) &&
+                   static_cast<u64>(i.cpu_addr) + i.guest_size_bytes > 0x29426000u;
+        };
+        if (s17_copy_logs < 24 && (s17_hits(dst) || s17_hits(src))) {
+            ++s17_copy_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 copyimg: dst=({} gpu={:#x} size={} flags={:#x}) src=({} gpu={:#x} "
+                        "size={} flags={:#x}) copies={}",
+                        dst_id.index, static_cast<u64>(dst.gpu_addr), dst.guest_size_bytes,
+                        static_cast<u32>(dst.flags), src_id.index,
+                        static_cast<u64>(src.gpu_addr), src.guest_size_bytes,
+                        static_cast<u32>(src.flags), copies.size());
+        }
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));
