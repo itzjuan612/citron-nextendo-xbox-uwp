@@ -2789,6 +2789,115 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                 }
             }
+            // TEMP DIAGNOSTIC (S17): MASK causal probe. The R8 mask family's SAMPLED member
+            // (gpu 0x510fa0000, 1038x584, dxgi 0x1b TYPELESS) reads all-zero while the 960x540
+            // member (0x510f30000) IS written by 6-vertex draws - the dynamic-res family
+            // incoherence. The big 3D colour draws sample the ZERO one, so if the mask is a
+            // shading multiplier the scene is dark for a second, independent reason. One-shot
+            // clear to white, the same methodology that proved the LUT gate. If the scene
+            // brightens, the mask joins the LUT as a proven factor and the fix target is the
+            // family incoherence rather than the bank.
+            {
+                static bool s17_mask_white_done = false;
+                if (!s17_mask_white_done) {
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& mv = m_texture_cache.GetImageView(slot.view);
+                        if (static_cast<u64>(mv.GpuAddr()) != 0x510fa0000ull ||
+                            mv.Resource() == nullptr) {
+                            continue;
+                        }
+                        s17_mask_white_done = true;
+                        ID3D12Resource* const s17_mask_res = mv.Resource();
+                        static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s17_mask_heap;
+                        if (!s17_mask_heap) {
+                            D3D12_DESCRIPTOR_HEAP_DESC s17_mhd{};
+                            s17_mhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                            s17_mhd.NumDescriptors = 1;
+                            s17_mhd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                            (void)m_device.GetDevice()->CreateDescriptorHeap(
+                                &s17_mhd, IID_PPV_ARGS(&s17_mask_heap));
+                        }
+                        if (s17_mask_heap) {
+                            const D3D12_CPU_DESCRIPTOR_HANDLE s17_mrtv =
+                                s17_mask_heap->GetCPUDescriptorHandleForHeapStart();
+                            D3D12_RENDER_TARGET_VIEW_DESC s17_mrd{};
+                            s17_mrd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                            s17_mrd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                            m_device.GetDevice()->CreateRenderTargetView(s17_mask_res, &s17_mrd,
+                                                                         s17_mrtv);
+                            m_command_list.Transition(s17_mask_res,
+                                                      D3D12_RESOURCE_STATE_COMMON,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            const f32 s17_mwhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                            m_command_list.ClearRenderTargetView(s17_mrtv, s17_mwhite);
+                            m_command_list.Transition(s17_mask_res,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+                            LOG_WARNING(Render_D3D12,
+                                        "S17 MASK white probe: cleared gpu=0x510fa0000 res=0x{:x}",
+                                        reinterpret_cast<u64>(s17_mask_res));
+                        }
+                        break;
+                    }
+                }
+            }
+            // TEMP DIAGNOSTIC (S17): EXPOSURE causal probe. The scene composite samples a 1x1
+            // R32G32B32A32_FLOAT texture (img=980021, gpu 0x5d5445100) whose decoded values are
+            // small (~0.05-0.87) - if it is an exposure/tonemap scale it is the last input that
+            // can darken the WHOLE scene uniformly. One-shot: clear it to 1.0 and watch the frame.
+            // Keyed on the view's signature (1x1 + R32G32B32A32_FLOAT) rather than a hardcoded
+            // address, because ids and addresses drift between runs.
+            {
+                static bool s17_exp_done = false;
+                if (!s17_exp_done) {
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& ev = m_texture_cache.GetImageView(slot.view);
+                        if (ev.format != VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT ||
+                            ev.size.width != 1 || ev.size.height != 1 ||
+                            ev.Resource() == nullptr) {
+                            continue;
+                        }
+                        s17_exp_done = true;
+                        ID3D12Resource* const s17_exp_res = ev.Resource();
+                        static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s17_exp_heap;
+                        if (!s17_exp_heap) {
+                            D3D12_DESCRIPTOR_HEAP_DESC s17_ehd{};
+                            s17_ehd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                            s17_ehd.NumDescriptors = 1;
+                            s17_ehd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                            (void)m_device.GetDevice()->CreateDescriptorHeap(
+                                &s17_ehd, IID_PPV_ARGS(&s17_exp_heap));
+                        }
+                        if (s17_exp_heap) {
+                            const D3D12_CPU_DESCRIPTOR_HANDLE s17_ertv =
+                                s17_exp_heap->GetCPUDescriptorHandleForHeapStart();
+                            D3D12_RENDER_TARGET_VIEW_DESC s17_erd{};
+                            s17_erd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                            s17_erd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                            m_device.GetDevice()->CreateRenderTargetView(s17_exp_res, &s17_erd,
+                                                                         s17_ertv);
+                            m_command_list.Transition(s17_exp_res, D3D12_RESOURCE_STATE_COMMON,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            const f32 s17_ewhite[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                            m_command_list.ClearRenderTargetView(s17_ertv, s17_ewhite);
+                            m_command_list.Transition(s17_exp_res,
+                                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+                            LOG_WARNING(Render_D3D12,
+                                        "S17 EXPO probe: cleared 1x1 gpu={:#x} res=0x{:x} to 1.0",
+                                        static_cast<u64>(ev.GpuAddr()),
+                                        reinterpret_cast<u64>(s17_exp_res));
+                        }
+                        break;
+                    }
+                }
+            }
             if (scene3d_index < 8 ||
                 (scene3d_index % 256 == 0 && scene3d_index < 8192)) {
                 std::string texs;
