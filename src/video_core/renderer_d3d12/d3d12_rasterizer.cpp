@@ -279,12 +279,26 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
         // limiter for the LUT pass.
         static u32 s17_drop_bank_logs = 0;
         static u32 s17_drop_total = 0;
+        static u32 s17_drop_no_stored = 0;
+        static u32 s17_drop_no_pipeline = 0;
+        static u32 s17_drop_invalid = 0;
         ++s17_drop_total;
-        // S17 cycle 3: quantify the drop pressure across the whole run (the bank-only lines are
-        // capped at 24). One line per 5000 drops keeps the log bounded.
+        if (!stored) {
+            ++s17_drop_no_stored;
+        } else if (!stored->pipeline) {
+            ++s17_drop_no_pipeline;
+        } else {
+            ++s17_drop_invalid;
+        }
+        // S17 cycle 3/4: quantify the drop pressure across the whole run (the bank-only lines
+        // are capped at 24) and split it by cause. One line per 5000 drops keeps the log
+        // bounded. nostored = no channel/pipeline key at all (incl. no vertex program);
+        // nopipeline = key valid but CreatePipeline returned nullptr; invalid = failed PSO.
         if ((s17_drop_total % 5000) == 0) {
-            LOG_WARNING(Render_D3D12, "S17 LUT producer: drops_total={} (pso gate pressure)",
-                        s17_drop_total);
+            LOG_WARNING(Render_D3D12,
+                        "S17 LUT producer: drops_total={} (nostored={} nopipeline={} invalid={})",
+                        s17_drop_total, s17_drop_no_stored, s17_drop_no_pipeline,
+                        s17_drop_invalid);
         }
         if (s17_drop_bank_logs < 24 && maxwell3d != nullptr &&
             S17ProducerRange(static_cast<u64>(maxwell3d->regs.rt[0].Address()))) {
@@ -674,6 +688,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         raw_format, static_cast<u64>(view->GpuAddr()) >= 0x5e9000000ull ? 1 : 0,
                         skip_reason != nullptr ? 1 : 0, unbound ? 1 : 0,
                         stored.pipeline->State().attachments[0].raw, params.num_vertices);
+        }
+        // S17 cycle 5 (Phase 0.2): name the draw-side writer of the 1x1 R32G32B32A32 exposure
+        // input. Cap 12.
+        static u32 s17_expo_writer_logs = 0;
+        if (view != nullptr && s17_expo_writer_logs < 12 && view->size.width == 1 &&
+            view->size.height == 1 &&
+            view->format == VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
+            ++s17_expo_writer_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 EXPO writer: draw rt slot={} gpu={:#x} res=0x{:x} att={:#x} "
+                        "verts={} vp=({},{},{},{})",
+                        i, static_cast<u64>(view->GpuAddr()),
+                        reinterpret_cast<u64>(view->Resource()),
+                        stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                        MakeViewport(maxwell3d->regs).TopLeftX,
+                        MakeViewport(maxwell3d->regs).TopLeftY,
+                        MakeViewport(maxwell3d->regs).Width,
+                        MakeViewport(maxwell3d->regs).Height);
         }
         if (skip_reason != nullptr) {
             if (!logged_rt_hole) {
@@ -2786,11 +2818,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             }
                         }
                     }
+                    // S17 cycle 4: `res=` is the sampled view's resource pointer. The 1.0.268
+                    // run read nz=0 from every probe while the frame was lit - logging the
+                    // pointer per probe shows whether the incarnation the dump reads changes
+                    // (resource replaced/recreated) or stays constant (dump path suspect).
                     LOG_WARNING(Render_D3D12,
-                                "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} nz={}/{} "
-                                "hex={} verts={}",
+                                "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} res=0x{:x} "
+                                "nz={}/{} hex={} verts={}",
                                 sv.image_id.index, static_cast<u64>(sv.GpuAddr()), sv.size.width,
-                                sv.size.height, static_cast<u32>(sv.format), lut_nonzero, lut_read,
+                                sv.size.height, static_cast<u32>(sv.format),
+                                reinterpret_cast<u64>(sv.Resource()), lut_nonzero, lut_read,
                                 lut_hex, params.num_vertices);
                     // TEMP DIAGNOSTIC (session 17) - CAUSAL PROBE: is the all-zero lighting LUT
                     // what keeps the 3D scene dark? One-shot, in-stream, before the draw that
@@ -2880,6 +2917,50 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                 }
             }
+            // S17 cycle 5 (Phase 0.2): exposure-value timeline. The 1.0.268 EXPO probe (forcing
+            // the 1x1 R32G32B32A32 texture to 1.0) brightened the whole frame; with the probes
+            // off (1.0.269) the frame is under-lit again. Log the raw float4 of that texture
+            // once per 60 s (non-destructive, 16-byte guest read) to see the value's timeline
+            // and test it against the reference brightness. Cap 24.
+            {
+                static std::chrono::steady_clock::time_point s17_expo_last =
+                    std::chrono::steady_clock::now();
+                static u32 s17_expo_logs = 0;
+                if (s17_expo_logs < 24 &&
+                    std::chrono::steady_clock::now() - s17_expo_last >
+                        std::chrono::seconds(60)) {
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& xv = m_texture_cache.GetImageView(slot.view);
+                        if (xv.size.width != 1 || xv.size.height != 1 ||
+                            xv.format != VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
+                            continue;
+                        }
+                        std::array<f32, 4> v{};
+                        if (gpu_memory != nullptr) {
+                            gpu_memory->ReadBlock(static_cast<GPUVAddr>(xv.GpuAddr()), v.data(),
+                                                  sizeof(v),
+                                                  VideoCommon::CacheType::NoTextureCache);
+                        }
+                        s17_expo_last = std::chrono::steady_clock::now();
+                        ++s17_expo_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S17 EXPOSURE value: gpu={:#x} res=0x{:x} "
+                                    "f=({:.4f},{:.4f},{:.4f},{:.4f})",
+                                    static_cast<u64>(xv.GpuAddr()),
+                                    reinterpret_cast<u64>(xv.Resource()), v[0], v[1], v[2], v[3]);
+                        break;
+                    }
+                }
+            }
+            // S17 cycle 4: the MASK and EXPO white probes are DISABLED. Both served their
+            // purpose (mask: no step change, addendum 23; exposure: inconclusive by design,
+            // addendum 25) and the EXPO probe fired at t=766 in the 1.0.268 run, i.e. the lit
+            // frame has not yet been proven WITHOUT probe assistance. Keep the code for
+            // reference; do not re-enable without a same-run A/B.
+            static constexpr bool s17_enable_causal_probes = false;
             // TEMP DIAGNOSTIC (S17): MASK causal probe. The R8 mask family's SAMPLED member
             // (gpu 0x510fa0000, 1038x584, dxgi 0x1b TYPELESS) reads all-zero while the 960x540
             // member (0x510f30000) IS written by 6-vertex draws - the dynamic-res family
@@ -2890,7 +2971,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // family incoherence rather than the bank.
             {
                 static bool s17_mask_white_done = false;
-                if (!s17_mask_white_done) {
+                if (s17_enable_causal_probes && !s17_mask_white_done) {
                     for (const DrawSlot& slot : res_slots) {
                         if (slot.kind != SlotKind::Sampled) {
                             continue;
@@ -2943,7 +3024,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // address, because ids and addresses drift between runs.
             {
                 static bool s17_exp_done = false;
-                if (!s17_exp_done) {
+                if (s17_enable_causal_probes && !s17_exp_done) {
                     for (const DrawSlot& slot : res_slots) {
                         if (slot.kind != SlotKind::Sampled) {
                             continue;
@@ -4574,6 +4655,19 @@ void RasterizerD3D12::DispatchCompute() {
                 }
                 if (s17_compute_hits(s15_gpu, 0)) {
                     s17_compute_log("img", s15_gpu, 0);
+                }
+                // S17 cycle 5 (Phase 0.2): name a compute writer of the 1x1 exposure input.
+                static u32 s17_expo_compute_logs = 0;
+                if (s17_expo_compute_logs < 12 && s15_iv.size.width == 1 &&
+                    s15_iv.size.height == 1 &&
+                    s15_iv.format == VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
+                    ++s17_expo_compute_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S17 EXPO writer: compute program={:#x} img={} gpu={:#x} "
+                                "grid=({},{},{})",
+                                static_cast<u64>(qmd.program_start), s15_iv.image_id.index,
+                                static_cast<u64>(s15_gpu), qmd.grid_dim_x.Value(),
+                                qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value());
                 }
             }
         }

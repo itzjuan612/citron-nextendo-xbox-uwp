@@ -1107,10 +1107,15 @@ void WriteTextureContentDumps() {
             LOG_WARNING(Render_D3D12, "Texture dump written: {} ({}x{})", path, width, height);
         }
         // TEMP DIAGNOSTIC (S17): alongside the decoded BMP, write the RAW readback bytes for
-        // B10G11R11 dumps (the lighting LUT). In the 1.0.266 harvest the decoded BMP of a
-        // populated LUT rendered all-white, so either the R11G11B10 decode or the content is
-        // suspect - the .bin is a byte-for-byte copy of the readback for offline decoding.
-        if (static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R11G11B10_FLOAT) {
+        // B10G11R11 dumps (the lighting LUT) and for R32G32B32A32_FLOAT (the 1x1 exposure input;
+        // 16 bytes, decoded offline as four floats - Phase 0.2). In the 1.0.266 harvest the
+        // decoded BMP of a populated LUT rendered all-white, so either the R11G11B10 decode or
+        // the content is suspect - the .bin is a byte-for-byte copy of the readback.
+        // NOTE: the 1x1 exposure texture reports DXGI_FORMAT_R32G32B32A32_TYPELESS (1), not
+        // _FLOAT (2) - cover both or the exposure dump silently misses its .bin.
+        if (static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R11G11B10_FLOAT ||
+            static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_TYPELESS ||
+            static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_FLOAT) {
             const std::string bin_path = g_capture_directory + "\\texdump_" + std::to_string(i) +
                                          "_img" + std::to_string(entry.image_index) + ".bin";
             std::ofstream bin_out{bin_path, std::ios::binary};
