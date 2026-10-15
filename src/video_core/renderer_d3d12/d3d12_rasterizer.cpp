@@ -73,6 +73,23 @@ std::array<ID3D12Resource*, 6> g_display_resources{};
 // Uploads/buffer binding above the return point still run, so if the device still dies the
 // trigger is outside ConfigureDraw's state commands; if it survives, they are implicated.
 constexpr bool kSkipConfigureDrawState = false;
+
+// TEMP DIAGNOSTIC (S17): GPU-VA ranges of the 27 MB lighting-LUT bank (nvmap handle 0x370,
+// dev 0x29426000, mapped at 0x5e9900000 / 0x5eb340000 / 0x5ecd80000, 0x1a34000 bytes each)
+// and of the R8 mask family (0x510fa0000 sampled member / 0x510f30000 written member). Used
+// by the pre-guard draw producer tracers; the wide window matches the existing S15 LUT RT
+// tracer and the per-VA extent covers the third mapping's tail (0x5ecd80000 + 0x1a34000).
+constexpr bool S17ProducerRange(u64 gpu) {
+    // Bank window CORRECTED after the 1.0.266 harvest: the previous bound 0x5ed00000 is a
+    // 1.6 GB address (a typo for 0x5ed000000) and made every bank test in the S15/S17 draw
+    // tracers FALSE - the source of the long-standing "no bank RT bind, trustworthy" artefact
+    // that hid the real producer (a 6-vertex draw into 0x5eb340000). Covers all three VAs.
+    // Mask windows tightened to 1 MB: the previous 4 MB reached the 0x511270000 mip chain and
+    // ate the whole draw budget at t=741-746.
+    return (gpu >= 0x5e9000000ull && gpu < 0x5ee7b4000ull) ||
+           (gpu >= 0x510fa0000ull && gpu < 0x510fa0000ull + 0x100000ull) ||
+           (gpu >= 0x510f30000ull && gpu < 0x510f30000ull + 0x100000ull);
+}
 } // namespace
 
 using Tegra::Texture::TexturePair;
@@ -254,6 +271,32 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     m_query_cache.NotifySegment(true);
     PipelineCache::StoredPipeline* stored = m_pipeline_cache.CurrentStoredPipeline();
     if (!stored || !stored->pipeline || !stored->pipeline->IsValid()) {
+        // TEMP DIAGNOSTIC (S17): the 1.0.266 harvest proved the lighting LUT is produced by a
+        // 6-vertex draw into 0x5eb340000, and that draw's PSO compile was skipped at exactly
+        // that moment ("commit headroom below 1150 MB"). Every draw with an uncompiled PSO is
+        // dropped HERE and retried when the guest re-issues it - so count and identify the
+        // drops whose guest RT0 is a bank VA. If this stays near zero, the PSO gate is not the
+        // limiter for the LUT pass.
+        static u32 s17_drop_bank_logs = 0;
+        static u32 s17_drop_total = 0;
+        ++s17_drop_total;
+        // S17 cycle 3: quantify the drop pressure across the whole run (the bank-only lines are
+        // capped at 24). One line per 5000 drops keeps the log bounded.
+        if ((s17_drop_total % 5000) == 0) {
+            LOG_WARNING(Render_D3D12, "S17 LUT producer: drops_total={} (pso gate pressure)",
+                        s17_drop_total);
+        }
+        if (s17_drop_bank_logs < 24 && maxwell3d != nullptr &&
+            S17ProducerRange(static_cast<u64>(maxwell3d->regs.rt[0].Address()))) {
+            ++s17_drop_bank_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 LUT producer: draw rt=0x{:x} DROPPED (stored={} pipeline={} valid={}) "
+                        "drops_total={}",
+                        static_cast<u64>(maxwell3d->regs.rt[0].Address()), stored ? 1 : 0,
+                        (stored && stored->pipeline) ? 1 : 0,
+                        (stored && stored->pipeline) ? (stored->pipeline->IsValid() ? 1 : 0) : 0,
+                        s17_drop_total);
+        }
         return;
     }
     std::scoped_lock lock{m_buffer_cache.mutex, m_texture_cache.mutex};
@@ -551,6 +594,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         stored.pipeline->State().attachments[0].raw, params.num_vertices);
         }
     }
+    // TEMP DIAGNOSTIC (S17): pre-guard half of the LUT/mask producer tracer. The post-guard
+    // 'S15 LUT RT' block cannot see a draw its guards later reject (unrepresentable format,
+    // unbound RTV), so a skipped producer bind was invisible to every previous probe. Shared
+    // 32-draw budget with the color-slot half in the validation loop below.
+    static u32 s17_producer_bind_logs = 0;
+    if (depth_view != nullptr && s17_producer_bind_logs < 32 &&
+        S17ProducerRange(static_cast<u64>(depth_view->GpuAddr()))) {
+        ++s17_producer_bind_logs;
+        LOG_WARNING(Render_D3D12,
+                    "S17 LUT producer: draw depth gpu={:#x} res={:#x} {}x{} fmt={:#x} bank={} "
+                    "att={:#x} verts={}",
+                    static_cast<u64>(depth_view->GpuAddr()),
+                    reinterpret_cast<u64>(depth_view->Resource()), depth_view->size.width,
+                    depth_view->size.height, static_cast<u32>(depth_view->format),
+                    static_cast<u64>(depth_view->GpuAddr()) >= 0x5e9000000ull ? 1 : 0,
+                    stored.pipeline->State().attachments[0].raw, params.num_vertices);
+    }
     if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
         return;
     }
@@ -599,6 +659,21 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             unbound ? 1 : 0, stored.pipeline->State().attachments[0].raw,
                             params.num_vertices);
             }
+        }
+        // TEMP DIAGNOSTIC (S17): color-slot half of the pre-guard producer tracer (see the
+        // depth-side block above); runs before the skip returns below so a rejected producer
+        // bind still logs. 32-draw budget shared with the depth half.
+        if (view != nullptr && s17_producer_bind_logs < 32 &&
+            S17ProducerRange(static_cast<u64>(view->GpuAddr()))) {
+            ++s17_producer_bind_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 LUT producer: draw rt slot={} gpu={:#x} res={:#x} {}x{} raw_fmt={:#x} "
+                        "bank={} unrepresentable={} unbound={} att={:#x} verts={}",
+                        i, static_cast<u64>(view->GpuAddr()),
+                        reinterpret_cast<u64>(view->Resource()), view->size.width, view->size.height,
+                        raw_format, static_cast<u64>(view->GpuAddr()) >= 0x5e9000000ull ? 1 : 0,
+                        skip_reason != nullptr ? 1 : 0, unbound ? 1 : 0,
+                        stored.pipeline->State().attachments[0].raw, params.num_vertices);
         }
         if (skip_reason != nullptr) {
             if (!logged_rt_hole) {
@@ -691,7 +766,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // the 27 MB LUT bank (nvmap handle 0x370, mapped at 0x5e9900000 / 0x5eb340000 /
             // 0x5ecd80000, dev 0x29426000). This loop runs before the RT/vertex guards, so a
             // producer draw that is skipped later in ConfigureDraw still shows up here.
-            const bool s17_lut_bank = addr >= 0x5e9000000ull && addr < 0x5ed00000ull;
+            // S17: bank bound corrected (0x5ed00000 -> 0x5ee7b4000; the old bound was a 1.6 GB
+            // address and never matched, hiding the real bank RT binds).
+            const bool s17_lut_bank = addr >= 0x5e9000000ull && addr < 0x5ee7b4000ull;
             if (res != nullptr) {
                 const D3D12_RESOURCE_DESC s15_lut_desc = res->GetDesc();
                 const bool s17_small_lut =
@@ -2652,13 +2729,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     // else keeps the gate's original semantics.
                     const bool s17_bank_view =
                         static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull;
+                    // S17 (1.0.266 harvest): the bank-view budget used to burn all 8 probes in
+                    // 16 ms; it is now a 60-second cadence with 24 probes, so the LUT resource
+                    // content gets a timeline across the whole run (did it populate? when? does
+                    // it revert?). Non-bank LUTs keep the original one-shot/late semantics.
                     static u32 s17_bank_views = 0;
-                    if ((!s15_lut_run && !(s17_bank_view && s17_bank_views < 8)) ||
-                        s15_lut_slots >= 4) {
+                    static std::chrono::steady_clock::time_point s17_bank_last_probe =
+                        std::chrono::steady_clock::now();
+                    const bool s17_bank_ready =
+                        std::chrono::steady_clock::now() - s17_bank_last_probe >
+                        std::chrono::seconds(60);
+                    const bool s17_bank_probe =
+                        s17_bank_view && s17_bank_views < 24 && s17_bank_ready;
+                    if ((!s15_lut_run && !s17_bank_probe) || s15_lut_slots >= 4) {
                         continue;
                     }
-                    if (s17_bank_view) {
+                    if (s17_bank_probe) {
                         ++s17_bank_views;
+                        s17_bank_last_probe = std::chrono::steady_clock::now();
                     }
                     const bool is_lut =
                         (sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT &&
@@ -2674,33 +2762,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
                             sv.image_id.index, true);
                     }
-                    const auto dev = gpu_memory->GpuToCpuAddress(static_cast<GPUVAddr>(sv.GpuAddr()));
-                    std::array<u8, 64> lut_bytes{};
+                    // S17: read the sampled LUT bytes through the GPU-VA accessor. The previous
+                    // GpuToCpuAddress() + ReadBlockUnsafe pair produced stale/zero readings for
+                    // this bank (flagged in the S17 forensics), and a 64-byte prefix at the image
+                    // base is weak evidence about the whole 256 KiB view - widen to 4 KiB. This
+                    // makes 'S15 LUT probe nz' meaningful: nonzero here == the guest bytes behind
+                    // the sampled view exist.
+                    std::array<u8, 4096> lut_bytes{};
                     u32 lut_nonzero = 0;
                     u32 lut_read = 0;
                     std::string lut_hex;
-                    if (dev) {
-                        const auto read = m_device_memory.ReadBlockUnsafe(
-                            *dev, lut_bytes.data(), lut_bytes.size(), "S15.LutProbe", false);
-                        if (read.fully_mapped) {
-                            lut_read = static_cast<u32>(lut_bytes.size());
-                            for (u32 i = 0; i < lut_read; ++i) {
-                                if (lut_bytes[i] != 0) {
-                                    ++lut_nonzero;
-                                }
-                                if (i < 32) {
-                                    lut_hex += fmt::format("{:02x}", lut_bytes[i]);
-                                }
+                    if (gpu_memory != nullptr) {
+                        gpu_memory->ReadBlock(static_cast<GPUVAddr>(sv.GpuAddr()), lut_bytes.data(),
+                                              lut_bytes.size(),
+                                              VideoCommon::CacheType::NoTextureCache);
+                        lut_read = static_cast<u32>(lut_bytes.size());
+                        for (u32 i = 0; i < lut_read; ++i) {
+                            if (lut_bytes[i] != 0) {
+                                ++lut_nonzero;
+                            }
+                            if (i < 32) {
+                                lut_hex += fmt::format("{:02x}", lut_bytes[i]);
                             }
                         }
                     }
                     LOG_WARNING(Render_D3D12,
-                                "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} dev={:#x} "
-                                "nz={}/{} hex={} verts={}",
+                                "S15 LUT probe: img={} gpu={:#x} {}x{} fmt={:#x} nz={}/{} "
+                                "hex={} verts={}",
                                 sv.image_id.index, static_cast<u64>(sv.GpuAddr()), sv.size.width,
-                                sv.size.height, static_cast<u32>(sv.format),
-                                dev ? static_cast<u64>(*dev) : 0, lut_nonzero, lut_read, lut_hex,
-                                params.num_vertices);
+                                sv.size.height, static_cast<u32>(sv.format), lut_nonzero, lut_read,
+                                lut_hex, params.num_vertices);
                     // TEMP DIAGNOSTIC (session 17) - CAUSAL PROBE: is the all-zero lighting LUT
                     // what keeps the 3D scene dark? One-shot, in-stream, before the draw that
                     // samples it: clear the bank sub-view to white so every lookup returns 1.0.
@@ -4381,7 +4472,12 @@ void RasterizerD3D12::DispatchCompute() {
     // image-buffer views by guest GPU VA or CPU-translation overlap (JoinImages aliases).
     {
         static u32 s15_compute_wiper_logs = 0;
-        if (s15_compute_wiper_logs < 16) {
+        // TEMP DIAGNOSTIC (S17): the same walk, but for the LUT bank / mask VAs. The S15
+        // predicate below only covers the 0x517 window, so a compute writer of the bank was
+        // invisible; this one names it. Own 16-entry budget, and the loop breaks require BOTH
+        // budgets to be saturated so one category cannot starve the other.
+        static u32 s17_compute_producer_logs = 0;
+        if (s15_compute_wiper_logs < 16 || s17_compute_producer_logs < 16) {
             const std::optional<DAddr> s15_window_cpu = gpu_memory->GpuToCpuAddress(0x517000000ull);
             const auto s15_compute_hits = [&](GPUVAddr gpu, u64 size) {
                 if (gpu >= 0x517000000ull && gpu < 0x517200000ull) {
@@ -4405,8 +4501,32 @@ void RasterizerD3D12::DispatchCompute() {
                     qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind,
                     static_cast<u64>(gpu), size);
             };
+            const auto s17_compute_hits = [&](GPUVAddr gpu, u64 size) {
+                const u64 s17_end = gpu + (size != 0 ? size : 1);
+                const auto s17_overlap = [&](u64 base, u64 length) {
+                    return gpu < base + length && s17_end > base;
+                };
+                return s17_overlap(0x5e9900000ull, 0x1a34000ull) ||
+                       s17_overlap(0x5eb340000ull, 0x1a34000ull) ||
+                       s17_overlap(0x5ecd80000ull, 0x1a34000ull) ||
+                       s17_overlap(0x510fa0000ull, 0x100000ull) ||
+                       s17_overlap(0x510f30000ull, 0x100000ull);
+            };
+            const auto s17_compute_log = [&](const char* kind, u64 gpu, u64 size) {
+                if (s17_compute_producer_logs >= 16) {
+                    return;
+                }
+                ++s17_compute_producer_logs;
+                LOG_WARNING(
+                    Render_D3D12,
+                    "S17 LUT producer: compute program={:#x} grid=({},{},{}) kind={} gpu={:#x} "
+                    "size={}",
+                    static_cast<u64>(qmd.program_start), qmd.grid_dim_x.Value(),
+                    qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind, static_cast<u64>(gpu),
+                    size);
+            };
             for (const auto& desc : info.storage_buffers_descriptors) {
-                if (s15_compute_wiper_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
                     break;
                 }
                 if (desc.cbuf_index >= cbufs.size()) [[unlikely]] {
@@ -4419,10 +4539,13 @@ void RasterizerD3D12::DispatchCompute() {
                 if (s15_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
                     s15_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
                 }
+                if (s17_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
+                    s17_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
+                }
             }
             for (size_t i = texbuf_total; i < texbuf_total + imgbuf_total && i < views.size();
                  ++i) {
-                if (s15_compute_wiper_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
                     break;
                 }
                 if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
@@ -4433,9 +4556,12 @@ void RasterizerD3D12::DispatchCompute() {
                 if (s15_compute_hits(s15_gpu, s15_iv.BufferSize())) {
                     s15_compute_log("imgbuf", s15_gpu, s15_iv.BufferSize());
                 }
+                if (s17_compute_hits(s15_gpu, s15_iv.BufferSize())) {
+                    s17_compute_log("imgbuf", s15_gpu, s15_iv.BufferSize());
+                }
             }
             for (size_t i = sampled_views_end; i < views.size(); ++i) {
-                if (s15_compute_wiper_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
                     break;
                 }
                 if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
@@ -4445,6 +4571,9 @@ void RasterizerD3D12::DispatchCompute() {
                 const GPUVAddr s15_gpu = s15_iv.GpuAddr();
                 if (s15_compute_hits(s15_gpu, 0)) {
                     s15_compute_log("img", s15_gpu, 0);
+                }
+                if (s17_compute_hits(s15_gpu, 0)) {
+                    s17_compute_log("img", s15_gpu, 0);
                 }
             }
         }
@@ -4927,9 +5056,33 @@ bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
     if (addr == 0 || size == 0) {
         return false;
     }
+    // TEMP DIAGNOSTIC (S17): does a guest CPU store reach the rasterizer for the 27 MB LUT
+    // bank's device range? The base is resolved once via GpuToCpuAddress (every harvested run
+    // reported 0x29426000; the literal keeps the probe alive if that ever changes). The
+    // buffer-cache early return swallows the texture invalidation whenever the range is a
+    // registered GPU-modified buffer, so the swallow exit is logged explicitly - otherwise a
+    // missing 'S17 write notify' line could mean either "no store ever arrived" or "the store
+    // was eaten here". Bounded 16.
+    static const DAddr s17_bank_dev = [this]() -> DAddr {
+        if (gpu_memory != nullptr) {
+            if (const auto cpu = gpu_memory->GpuToCpuAddress(0x5eb340000ull)) {
+                return static_cast<DAddr>(*cpu);
+            }
+        }
+        return static_cast<DAddr>(0x29426000);
+    }();
+    const bool s17_bank_write = addr < s17_bank_dev + 0x1a34000 && addr + size > s17_bank_dev;
     {
         std::scoped_lock lock{m_buffer_cache.mutex};
         if (m_buffer_cache.OnCPUWrite(addr, size)) {
+            static u32 s17_cpuwrite_swallow_logs = 0;
+            if (s17_bank_write && s17_cpuwrite_swallow_logs < 16) {
+                ++s17_cpuwrite_swallow_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S17 LUT producer: cpuwrite dev={:#x} size={} swallowed by buffer "
+                            "cache (texture cache never notified)",
+                            static_cast<u64>(addr), size);
+            }
             return true;
         }
     }

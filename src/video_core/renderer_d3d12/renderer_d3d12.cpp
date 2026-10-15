@@ -1106,6 +1106,21 @@ void WriteTextureContentDumps() {
             }
             LOG_WARNING(Render_D3D12, "Texture dump written: {} ({}x{})", path, width, height);
         }
+        // TEMP DIAGNOSTIC (S17): alongside the decoded BMP, write the RAW readback bytes for
+        // B10G11R11 dumps (the lighting LUT). In the 1.0.266 harvest the decoded BMP of a
+        // populated LUT rendered all-white, so either the R11G11B10 decode or the content is
+        // suspect - the .bin is a byte-for-byte copy of the readback for offline decoding.
+        if (static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R11G11B10_FLOAT) {
+            const std::string bin_path = g_capture_directory + "\\texdump_" + std::to_string(i) +
+                                         "_img" + std::to_string(entry.image_index) + ".bin";
+            std::ofstream bin_out{bin_path, std::ios::binary};
+            if (bin_out) {
+                bin_out.write(reinterpret_cast<const char*>(base),
+                              static_cast<std::streamsize>(total_bytes));
+                LOG_WARNING(Render_D3D12, "Texture dump written: {} ({}x{}, raw {})", bin_path,
+                            width, height, total_bytes);
+            }
+        }
         entry.readback->Unmap(0, nullptr);
     }
     // Keep the dedupe list in RecordTextureContentDump so an image is never dumped twice.
@@ -1295,7 +1310,24 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> framebuf
 }
 
 void RendererD3D12::PresentPending() {
+    // TEMP INSTRUMENTATION (S17): frame-rate probe. The user reports 1-2 FPS on console and we have
+    // no number of our own, so log presents per 30 s window (bounded). Uses GetTickCount64 to avoid
+    // pulling in <chrono> here. Read this with a WARM shader cache before drawing conclusions: the
+    // first run after an install recompiles every pipeline on first use.
+    static u32 s17_frames = 0;
+    static u32 s17_logs = 0;
+    static u64 s17_window_ms = GetTickCount64();
     swapchain.PresentIfRequested();
+    ++s17_frames;
+    const u64 s17_now_ms = GetTickCount64();
+    if (s17_now_ms - s17_window_ms >= 30000 && s17_logs < 120) {
+        ++s17_logs;
+        const f64 s17_secs = static_cast<f64>(s17_now_ms - s17_window_ms) / 1000.0;
+        LOG_WARNING(Render_D3D12, "S17 perf: {} presents in {:.1f}s = {:.2f} FPS", s17_frames,
+                    s17_secs, static_cast<f64>(s17_frames) / s17_secs);
+        s17_frames = 0;
+        s17_window_ms = s17_now_ms;
+    }
 }
 
 void RendererD3D12::PrepareBlit() {

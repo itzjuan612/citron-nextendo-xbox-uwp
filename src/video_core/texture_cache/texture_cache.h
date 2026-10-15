@@ -601,11 +601,50 @@ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
 
 template <class P>
 void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
+    // TEMP DIAGNOSTIC (S17): notification side of the LUT/mask investigation. Log raw write
+    // notifications whose range covers the bank's cpu range (0x29426000 in every harvested
+    // run) before any per-image guard, so a missing line means "nothing was ever notified"
+    // rather than "a guard ate it". Bounded to 24 raw lines.
+    {
+        static u32 s17_notify_raw_logs = 0;
+        const DAddr s17_bank_cpu = 0x29426000u;
+        if (s17_notify_raw_logs < 24 && cpu_addr < s17_bank_cpu + 0x1a40000u &&
+            cpu_addr + size > s17_bank_cpu) {
+            ++s17_notify_raw_logs;
+            LOG_WARNING(Render_D3D12, "S17 write notify: raw cpu={:#x} size={} (bank range)",
+                        static_cast<u64>(cpu_addr), size);
+        }
+    }
     // Release the whole write-tracked page; GPU-written images keep exact bounds.
     const DAddr page_start = Common::AlignDown(cpu_addr, Core::DEVICE_PAGESIZE);
     const DAddr page_end = Common::AlignUp(cpu_addr + size, Core::DEVICE_PAGESIZE);
     ForEachImageInRegion(page_start, page_end - page_start,
                           [this, cpu_addr, size](ImageId image_id, Image& image) {
+        // TEMP DIAGNOSTIC (S17): per-image decision for the bank/mask images, matched by GPU
+        // VA so the mask family is covered even though its cpu range is unknown. 'mark' => the
+        // next sample re-uploads this image from guest memory; 'swallow-gpu' => the 1.0.233
+        // guard refuses it; 'pending' => already marked for upload. Bounded to 24 lines.
+        {
+            static u32 s17_notify_image_logs = 0;
+            const u64 s17_gpu = static_cast<u64>(image.gpu_addr);
+            // Bank window corrected (see S17ProducerRange): 0x5ed00000 was a 1.6 GB address.
+            const bool s17_bank = s17_gpu >= 0x5e9000000ull && s17_gpu < 0x5ee7b4000ull;
+            const bool s17_mask =
+                (s17_gpu >= 0x510fa0000ull && s17_gpu < 0x510fa0000ull + 0x100000ull) ||
+                (s17_gpu >= 0x510f30000ull && s17_gpu < 0x510f30000ull + 0x100000ull);
+            if (s17_notify_image_logs < 24 && (s17_bank || s17_mask)) {
+                ++s17_notify_image_logs;
+                const char* const s17_action =
+                    True(image.flags & ImageFlagBits::CpuModified)  ? "pending"
+                    : True(image.flags & ImageFlagBits::GpuModified) ? "swallow-gpu"
+                                                                     : "mark";
+                LOG_WARNING(Render_D3D12,
+                            "S17 write notify: img={} gpu={:#x} flags={:#x} size={} action={} "
+                            "write_cpu={:#x} write_size={}",
+                            image_id.index, s17_gpu, static_cast<u32>(image.flags),
+                            image.guest_size_bytes, s17_action, static_cast<u64>(cpu_addr), size);
+            }
+        }
         if (True(image.flags & ImageFlagBits::CpuModified)) {
             return;
         }
@@ -2717,6 +2756,61 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        // TEMP DIAGNOSTIC (S17): forced re-upload probe for the 256x256 lighting-LUT sub-view
+        // (gpu 0x5eb340000). Every producer forensic says the LUT is guest-authored, yet the
+        // sampled resource has stayed zero in most runs while the guest bytes are (per upload
+        // forensics) not reaching it. When the sub-view signature matches, the image carries no
+        // pending content, and the guest bytes are genuinely nonzero, mark the image
+        // CpuModified so the normal upload path restores the REAL data (swizzle-correct, unlike
+        // an alias byte copy or the retired white clear). Bounded: sub-view signature only,
+        // <=4 fires, <=16 state-change logs, <=8 GpuModified skips.
+        if (static_cast<u64>(image.gpu_addr) == 0x5eb340000ull &&
+            image.info.size.width == 256 && image.info.size.height == 256 &&
+            image.info.format == PixelFormat::B10G11R11_FLOAT) {
+            static u32 s17_subview_fires = 0;
+            static u32 s17_subview_evals = 0;
+            static u32 s17_subview_gpu_skips = 0;
+            static bool s17_subview_last_nonzero = false;
+            const bool s17_subview_clean =
+                False(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::GpuModified));
+            if (s17_subview_fires < 4 && s17_subview_clean && gpu_memory != nullptr) {
+                std::array<u8, 4096> s17_prefix{};
+                gpu_memory->ReadBlock(image.gpu_addr, s17_prefix.data(), s17_prefix.size(),
+                                      VideoCommon::CacheType::NoTextureCache);
+                u32 s17_nz = 0;
+                for (const u8 s17_byte : s17_prefix) {
+                    s17_nz += s17_byte != 0 ? 1u : 0u;
+                }
+                const bool s17_nonzero = s17_nz != 0;
+                if (s17_nonzero != s17_subview_last_nonzero && s17_subview_evals < 16) {
+                    s17_subview_last_nonzero = s17_nonzero;
+                    ++s17_subview_evals;
+                    LOG_WARNING(Render_D3D12,
+                                "S17 sub-view probe: img={} guest_prefix_nz={}/{} flags={:#x}",
+                                image_id.index, s17_nz, static_cast<u32>(s17_prefix.size()),
+                                static_cast<u32>(image.flags));
+                }
+                if (s17_nonzero) {
+                    ++s17_subview_fires;
+                    image.flags |= ImageFlagBits::CpuModified;
+                    if (True(image.flags & ImageFlagBits::Tracked)) {
+                        UntrackImage(image, image_id);
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "S17 sub-view refresh: img={} forcing guest re-upload "
+                                "(guest_prefix_nz={}/{}, fire {}/4)",
+                                image_id.index, s17_nz, static_cast<u32>(s17_prefix.size()),
+                                s17_subview_fires);
+                }
+            } else if (!s17_subview_clean && True(image.flags & ImageFlagBits::GpuModified) &&
+                       s17_subview_gpu_skips < 8) {
+                ++s17_subview_gpu_skips;
+                LOG_WARNING(Render_D3D12,
+                            "S17 sub-view refresh skipped: img={} is GpuModified (flags={:#x}); "
+                            "the RefreshContents guard would refuse the upload",
+                            image_id.index, static_cast<u32>(image.flags));
+            }
+        }
         RefreshContents(image, image_id);
         SynchronizeAliases(image_id);
     }
@@ -2753,7 +2847,11 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
             return i.cpu_addr < (0x29426000u + 0x1a40000u) &&
                    static_cast<u64>(i.cpu_addr) + i.guest_size_bytes > 0x29426000u;
         };
-        if (s17_copy_logs < 24 && (s17_hits(dst) || s17_hits(src))) {
+        // S17 (1.0.266 harvest): the creation burst saturates this cap with bidirectional
+        // 512-byte sibling pairs, hiding any later content-bearing copy. Require both sides
+        // > 4 KiB so the burst pairs are excluded and a later large copy is always visible.
+        if (s17_copy_logs < 24 && dst.guest_size_bytes > 4096 && src.guest_size_bytes > 4096 &&
+            (s17_hits(dst) || s17_hits(src))) {
             ++s17_copy_logs;
             LOG_WARNING(Render_D3D12,
                         "S17 copyimg: dst=({} gpu={:#x} size={} flags={:#x}) src=({} gpu={:#x} "

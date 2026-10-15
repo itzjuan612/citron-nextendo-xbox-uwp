@@ -65,7 +65,14 @@ using VideoCore::Surface::PixelFormat;
 // transient). Keep a 1150 MB reserve under the 5120 MB budget so a compile is only started
 // while the transient still fits; the pipeline is retried later.
 constexpr u64 CommitBudgetBytes = 5120ull * 1024 * 1024;
-constexpr u64 PipelineCompileReserveBytes = 1150ull * 1024 * 1024;
+// S17 cycle 3: was 1150 MB. The 1.0.267 harvest proved the gate stays closed for essentially the
+// whole run (the app lives at ~4.0-4.1 GB commit, so committed + 1150 MB never fits under
+// 5120 MB): 1664+ pipelines skipped, ~4.8 k draws dropped by t=742, and the LUT/scene content
+// passes never compiled (the lighting LUT ended up as a uniform junk fill, frame near-black).
+// 512 MB restores ~500-600 MB of compile headroom while keeping a real margin; the existing
+// bad_alloc catch turns an OOM during translation into a skipped (retried) pipeline, so the
+// failure mode stays graceful. Revert to 1150 if OOM deaths reappear.
+constexpr u64 PipelineCompileReserveBytes = 512ull * 1024 * 1024;
 
 [[nodiscard]] bool HasPipelineCompileHeadroom() {
     PROCESS_MEMORY_COUNTERS_EX pmc{};
@@ -415,9 +422,12 @@ std::unique_ptr<StoredComputePipeline> PipelineCache::CreateComputePipeline(
         static std::atomic<u32> compute_skip_count{0};
         const u32 count = compute_skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count <= 8 || count % 64 == 0) {
+            // S17: identify the skipped compute pipeline (launch program address).
             LOG_WARNING(Render_D3D12,
-                        "Pipeline compile skipped: commit headroom below {} MB (count {})",
-                        PipelineCompileReserveBytes / (1024 * 1024), count);
+                        "Pipeline compile skipped: commit headroom below {} MB (count {}) "
+                        "[S17 compute program={:#x}]",
+                        PipelineCompileReserveBytes / (1024 * 1024), count,
+                        static_cast<u64>(kepler_compute->launch_description.program_start));
         }
         return nullptr;
     }
@@ -520,9 +530,16 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
         static std::atomic<u32> skip_count{0};
         const u32 count = skip_count.fetch_add(1, std::memory_order_relaxed) + 1;
         if (count <= 8 || count % 64 == 0) {
+            // S17: identify the skipped graphics pipeline (hashes = guest shader programs,
+            // att/fmt0 = attachment mask + RT0 format as packed by FixedPipelineState). The
+            // 1.0.266 harvest showed the LUT pass (att=0xf, fmt0=0x1a) being skipped exactly
+            // when it should have produced the first LUT content.
             LOG_WARNING(Render_D3D12,
-                        "Pipeline compile skipped: commit headroom below {} MB (count {})",
-                        PipelineCompileReserveBytes / (1024 * 1024), count);
+                        "Pipeline compile skipped: commit headroom below {} MB (count {}) "
+                        "[S17 hash={:#x},{:#x},{:#x} att={:#x} fmt0={:#x}]",
+                        PipelineCompileReserveBytes / (1024 * 1024), count, key.unique_hashes[0],
+                        key.unique_hashes[1], key.unique_hashes[2], key.state.attachments[0].raw,
+                        static_cast<u32>(key.state.color_formats[0]));
         }
         return nullptr;
     }

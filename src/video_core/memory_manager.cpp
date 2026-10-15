@@ -433,6 +433,35 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer,
 template <bool is_safe>
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size,
                                    [[maybe_unused]] VideoCommon::CacheType which) {
+    // TEMP DIAGNOSTIC (S17): every guest-memory write (KeplerMemory inline upload, DMA fallback,
+    // blit, image download) funnels through here; log the ones landing on the 27 MB lighting-LUT
+    // bank VAs (0x5e9900000 / 0x5eb340000 / 0x5ecd80000, 0x1a34000 bytes each) or the mask VAs
+    // (0x510fa0000 / 0x510f30000). This is the only instrument that can see an otherwise
+    // un-instrumented writer of the bank - no previous probe covered WriteBlock* for it.
+    // Bounded to 32 lines. safe=1 => WriteBlock (invalidates the caches); safe=0 => WriteBlockUnsafe
+    // or WriteBlockCached (the latter accumulates and is flushed before draws).
+    {
+        static u32 s17_memwrite_logs = 0;
+        if (s17_memwrite_logs < 32) {
+            const u64 s17_len = size != 0 ? size : 1;
+            const u64 s17_end = gpu_dest_addr + s17_len;
+            const auto s17_overlap = [&](u64 base, u64 length) {
+                return gpu_dest_addr < base + length && s17_end > base;
+            };
+            const bool s17_hit = s17_overlap(0x5e9900000ull, 0x1a34000ull) ||
+                                 s17_overlap(0x5eb340000ull, 0x1a34000ull) ||
+                                 s17_overlap(0x5ecd80000ull, 0x1a34000ull) ||
+                                 s17_overlap(0x510fa0000ull, 0x100000ull) ||
+                                 s17_overlap(0x510f30000ull, 0x100000ull);
+            if (s17_hit) {
+                ++s17_memwrite_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S17 LUT producer: memwrite gpu={:#x} size={} safe={} which={:#x}",
+                            static_cast<u64>(gpu_dest_addr), size, is_safe ? 1 : 0,
+                            static_cast<u32>(which));
+            }
+        }
+    }
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index,
                             [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;

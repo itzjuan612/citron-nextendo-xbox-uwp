@@ -167,6 +167,37 @@ void Fermi2D::Blit() {
                         config.dst_x1, config.dst_y1);
         }
     }
+    // TEMP DIAGNOSTIC (S17): the S15 block above only watches the 0x517 window. Also catch a
+    // blit whose SOURCE or DESTINATION is in the 27 MB LUT bank VAs (0x5e9900000 / 0x5eb340000
+    // / 0x5ecd80000, 0x1a34000 bytes each) or the mask VAs (0x510fa0000 / 0x510f30000) - a
+    // producer neither the draw nor the compute tracers can see. Bounded to 16 lines.
+    static u32 s17_blit_logs = 0;
+    if (s17_blit_logs < 16) {
+        const auto s17_in = [](GPUVAddr a, GPUVAddr base, u64 length) {
+            return a >= base && a < base + length;
+        };
+        const auto s17_lut_addr = [&](GPUVAddr a) {
+            return s17_in(a, 0x5e9900000ull, 0x1a34000ull) ||
+                   s17_in(a, 0x5eb340000ull, 0x1a34000ull) ||
+                   s17_in(a, 0x5ecd80000ull, 0x1a34000ull) ||
+                   s17_in(a, 0x510fa0000ull, 0x100000ull) ||
+                   s17_in(a, 0x510f30000ull, 0x100000ull);
+        };
+        const GPUVAddr s17_src = src.Address();
+        const GPUVAddr s17_dst = regs.dst.Address();
+        const bool s17_src_hit = s17_lut_addr(s17_src);
+        const bool s17_dst_hit = s17_lut_addr(s17_dst);
+        if (s17_src_hit || s17_dst_hit) {
+            ++s17_blit_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S17 LUT producer: blit src={:#x} src_hit={} dst={:#x} dst_hit={} "
+                        "src_box=({},{})-({},{}) dst_box=({},{})-({},{})",
+                        s17_src, static_cast<u32>(s17_src_hit), s17_dst,
+                        static_cast<u32>(s17_dst_hit), config.src_x0, config.src_y0, config.src_x1,
+                        config.src_y1, config.dst_x0, config.dst_y0, config.dst_x1,
+                        config.dst_y1);
+        }
+    }
 }
 
 } // namespace Tegra::Engines
