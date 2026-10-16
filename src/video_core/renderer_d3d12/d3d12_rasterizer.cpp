@@ -62,6 +62,14 @@ std::atomic<u32> g_s15_flush_draws{0};
 // from the GPU thread (ConfigureDraw), like the flush flags above.
 bool g_s15_composite_target_dump = false;
 
+// TEMP DIAGNOSTIC (S18 cycle 3, Phase 0.2.3): repeated post-draw dumps of the composite target.
+// `g_s18_target_res` non-null = armed for that exact resource (set every 60 s by the composite
+// branch); the post-draw probe dumps it once and clears it. `g_s18_target_used` counts dumps
+// (ids 990201+, cap 8). The 1.0.272 build armed a plain counter and dumped the next 8 draws'
+// targets indiscriminately (a burst of 8 different RTs in 200 ms) - the resource key fixes that.
+ID3D12Resource* g_s18_target_res = nullptr;
+u32 g_s18_target_used = 0;
+
 // TEMP DIAGNOSTIC (session 12): resources of the images the frontend presents; ConfigureDraw
 // tags draws that render into them so the composition path is unmissable in the log.
 std::array<ID3D12Resource*, 6> g_display_resources{};
@@ -310,6 +318,29 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
                         (stored && stored->pipeline) ? 1 : 0,
                         (stored && stored->pipeline) ? (stored->pipeline->IsValid() ? 1 : 0) : 0,
                         s17_drop_total);
+        }
+        // S18 cycle 4 (Phase 0.2.4): the exposure chain's tiny passes are dropped HERE when
+        // their PSO is missing/uncompiled - the bank-only counter above cannot see them. The
+        // 1.0.273 harvest read the 128x1 histogram array as uniformly (0,0,0,1) (its clear
+        // value) even though a 2048-vertex histogram draw binds it every frame, so "the
+        // histogram pass is dropped" is the prime remaining suspect. Keyed on the tiny VAs.
+        {
+            static u32 s18_drop_tiny_logs = 0;
+            const u64 s18_drop_rt =
+                maxwell3d != nullptr ? static_cast<u64>(maxwell3d->regs.rt[0].Address()) : 0;
+            if (s18_drop_tiny_logs < 12 &&
+                (s18_drop_rt == 0x5d5445180ull || s18_drop_rt == 0x5d5445100ull ||
+                 s18_drop_rt == 0x5d5445080ull)) {
+                ++s18_drop_tiny_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S18 tiny drop: rt=0x{:x} DROPPED (stored={} pipeline={} valid={}) "
+                            "drops_total={}",
+                            s18_drop_rt, stored ? 1 : 0, (stored && stored->pipeline) ? 1 : 0,
+                            (stored && stored->pipeline)
+                                ? (stored->pipeline->IsValid() ? 1 : 0)
+                                : 0,
+                            s17_drop_total);
+            }
         }
         return;
     }
@@ -700,21 +731,40 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         static u32 s18_tiny_rt_logs = 0;
         if (view != nullptr && s18_tiny_rt_logs < 24) {
             const u64 s18_rt_gpu = static_cast<u64>(view->GpuAddr());
-            const bool s18_tiny = view->size.width <= 2 && view->size.height <= 2;
-            const bool s18_expo_va = s18_rt_gpu == 0x5d5445100ull || s18_rt_gpu == 0x5e8728480ull;
+            const bool s18_tiny =
+                (view->size.width <= 2 && view->size.height <= 2) ||
+                (view->size.width <= 128 && view->size.height <= 2);
+            const bool s18_expo_va = s18_rt_gpu == 0x5d5445100ull ||
+                                     s18_rt_gpu == 0x5d5445180ull ||
+                                     s18_rt_gpu == 0x5e8728480ull;
             if (s18_tiny || s18_expo_va) {
                 ++s18_tiny_rt_logs;
+                // S18 cycle 4: the guards' verdict and the attachment's blend state for this
+                // draw. The 1.0.273 harvest showed the 128x1 histogram array reads back as its
+                // clear value (0,0,0,1) although a 2048-vertex draw binds it with att=0x4240900f
+                // every frame - so either the draw is rejected below, or its blend writes
+                // nothing (the factors/equations are now visible here).
+                const auto& s18_att = stored.pipeline->State().attachments[0];
                 LOG_WARNING(Render_D3D12,
                             "S18 tiny RT: slot={} img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
-                            "att={:#x} verts={} vp=({},{},{},{})",
+                            "att={:#x} verts={} vp=({},{},{},{}) skip={} unbound={} "
+                            "om=({:#x},{:#x},{:#x},{:#x}) mask={:x}",
                             i, view->image_id.index, s18_rt_gpu,
                             reinterpret_cast<u64>(view->Resource()), view->size.width,
-                            view->size.height, static_cast<u32>(view->format),
-                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
-                            MakeViewport(maxwell3d->regs).TopLeftX,
+                            view->size.height, static_cast<u32>(view->format), s18_att.raw,
+                            params.num_vertices, MakeViewport(maxwell3d->regs).TopLeftX,
                             MakeViewport(maxwell3d->regs).TopLeftY,
                             MakeViewport(maxwell3d->regs).Width,
-                            MakeViewport(maxwell3d->regs).Height);
+                            MakeViewport(maxwell3d->regs).Height,
+                            skip_reason != nullptr ? 1 : 0, unbound ? 1 : 0,
+                            static_cast<u32>(s18_att.SourceRGBFactor()),
+                            static_cast<u32>(s18_att.DestRGBFactor()),
+                            static_cast<u32>(s18_att.EquationRGB()),
+                            static_cast<u32>(s18_att.EquationAlpha()),
+                            (static_cast<u32>(s18_att.mask_r ? 1 : 0)) |
+                                (static_cast<u32>(s18_att.mask_g ? 2 : 0)) |
+                                (static_cast<u32>(s18_att.mask_b ? 4 : 0)) |
+                                (static_cast<u32>(s18_att.mask_a ? 8 : 0)));
             }
         }
         if (skip_reason != nullptr) {
@@ -1555,6 +1605,80 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                       trace_vb0_size, trace_vb0_stride);
         }
         ++traced_draws;
+    }
+
+    // S18 cycle 2 (Phase 0.2.2): the tiny reduction draw's sampled inputs + the raw readback of
+    // its RT. res_slots is only populated above this point (the pre-guard RT loop at the top of
+    // the function runs before the fill), so this is the first place the reduction pass's input
+    // textures can be listed - they name what the auto-exposure chain measures. The 8x1
+    // R32G32B32A32 RT readback (id 990401+) holds eight raw float4 texels: the reduction's
+    // output, of which the composite samples the copy in the 1x1. The copy is recorded before
+    // the draw executes, so the values are the previous reduction (fine - it changes slowly).
+    // Cap 8 logs / 6 dumps.
+    {
+        static u32 s18_rt_input_logs = 0;
+        ImageView* const s18_rt_view =
+            (framebuffer != nullptr && num_rtvs > 0) ? framebuffer->ColorBuffers()[0] : nullptr;
+        if (s18_rt_view != nullptr && s18_rt_input_logs < 8) {
+            const u64 s18_rt_gpu = static_cast<u64>(s18_rt_view->GpuAddr());
+            const bool s18_rt_tiny =
+                s18_rt_view->size.width <= 2 && s18_rt_view->size.height <= 2;
+            const bool s18_rt_expo_va = s18_rt_gpu == 0x5d5445100ull ||
+                                        s18_rt_gpu == 0x5d5445080ull ||
+                                        s18_rt_gpu == 0x5d5445180ull ||
+                                        s18_rt_gpu == 0x5e8728480ull ||
+                                        s18_rt_gpu == 0x5e88a8480ull;
+            if (s18_rt_tiny || s18_rt_expo_va) {
+                ++s18_rt_input_logs;
+                std::string s18_rt_inputs;
+                u32 s18_rt_input_count = 0;
+                for (const DrawSlot& s18_slot : res_slots) {
+                    if (s18_slot.kind != SlotKind::Sampled || s18_rt_input_count >= 4) {
+                        continue;
+                    }
+                    ImageView& s18_sv = m_texture_cache.GetImageView(s18_slot.view);
+                    ++s18_rt_input_count;
+                    fmt::format_to(std::back_inserter(s18_rt_inputs),
+                                   "[img={} gpu={:#x} {}x{} fmt={:#x} res={}]",
+                                   s18_sv.image_id.index, static_cast<u64>(s18_sv.GpuAddr()),
+                                   s18_sv.size.width, s18_sv.size.height,
+                                   static_cast<u32>(s18_sv.format), s18_sv.Resource() ? 1 : 0);
+                }
+                LOG_WARNING(Render_D3D12,
+                            "S18 tiny RT inputs: img={} gpu={:#x} {}x{} verts={} inputs={}",
+                            s18_rt_view->image_id.index, s18_rt_gpu, s18_rt_view->size.width,
+                            s18_rt_view->size.height, params.num_vertices, s18_rt_inputs);
+                // S18 cycle 4 (Phase 0.2.4): when the tiny RT is the 128x1 histogram array,
+                // dump its INPUT (the reduced-scene source - img 3702, 192x108 B10G11R11 in the
+                // 1.0.273 run). The array reads back as its clear value (0,0,0,1) and a
+                // luminance-weighted histogram of a black input is black, so this dump separates
+                // "the histogram pass is dropped" from "its input is empty". Id 990701+.
+                static u32 s18_hist_in_dumps = 0;
+                if (s18_rt_gpu == 0x5d5445180ull) {
+                    for (const DrawSlot& s18_slot : res_slots) {
+                        if (s18_slot.kind != SlotKind::Sampled) {
+                            continue;
+                        }
+                        ImageView& s18_sv = m_texture_cache.GetImageView(s18_slot.view);
+                        if (s18_sv.Resource() == nullptr || s18_hist_in_dumps >= 6) {
+                            break;
+                        }
+                        ++s18_hist_in_dumps;
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, s18_sv.Resource(),
+                            static_cast<u32>(s18_sv.format), static_cast<u64>(s18_sv.GpuAddr()),
+                            990700u + s18_hist_in_dumps, /*force=*/true);
+                        LOG_WARNING(Render_D3D12,
+                                    "S18 hist input: id={} gpu={:#x} {}x{} fmt={:#x} res=0x{:x}",
+                                    990700u + s18_hist_in_dumps,
+                                    static_cast<u64>(s18_sv.GpuAddr()), s18_sv.size.width,
+                                    s18_sv.size.height, static_cast<u32>(s18_sv.format),
+                                    reinterpret_cast<u64>(s18_sv.Resource()));
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     const bool diag_fault_pipe = num_rtvs == 6 && cbv_records.size() == 3;
@@ -2402,6 +2526,105 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                     g_s15_composite_target_dump = true;
                     LOG_WARNING(Render_D3D12, "S15 composite stage dumps: ids=980021..980024");
+                }
+                // S18 cycle 2 (Phase 0.2.2): the composite is the ONLY consumer of the exposure
+                // texel, and it is a NO-depth draw - the depth-gated S18 block can never see it
+                // (1.0.271: the exposure timeline never fired; the only readback came from the
+                // one-shot S15 stage dump). Arm the periodic dumps from here instead, every 60 s:
+                //  (a) every sampled 1x1 R32G32B32A32 (the exposure texel), ids 990501+;
+                //  (b) each cached image over the 1x1's guest bytes (the 8x1 reduction RT and its
+                //      siblings) read back raw, ids 990601+;
+                //  (c) the composite target post-draw, ids 990201+ - the 1.0.271 one-shot dump
+                //      showed it nearly black (nonzero 6664 of 8294400) while the visible frame
+                //      is bright, so the visible brightness must enter DOWNSTREAM of this pass.
+                {
+                    static std::chrono::steady_clock::time_point s18c_last =
+                        std::chrono::steady_clock::now();
+                    static u32 s18c_dumps = 0;
+                    static u32 s18c_sib_dumps = 0;
+                    static bool s18c_census_done = false;
+                    if (s18c_dumps < 40 &&
+                        std::chrono::steady_clock::now() - s18c_last >
+                            std::chrono::seconds(60)) {
+                        s18c_last = std::chrono::steady_clock::now();
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ImageView& xv = m_texture_cache.GetImageView(slot.view);
+                            if (xv.size.width != 1 || xv.size.height != 1 ||
+                                xv.format !=
+                                    VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT ||
+                                xv.Resource() == nullptr) {
+                                continue;
+                            }
+                            ++s18c_dumps;
+                            const u32 s18c_id = 990500u + s18c_dumps;
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, xv.Resource(),
+                                static_cast<u32>(xv.format), static_cast<u64>(xv.GpuAddr()),
+                                s18c_id, /*force=*/true);
+                            LOG_WARNING(Render_D3D12,
+                                        "S18B EXPO dump: id={} img={} gpu={:#x} res=0x{:x}",
+                                        s18c_id, xv.image_id.index,
+                                        static_cast<u64>(xv.GpuAddr()),
+                                        reinterpret_cast<u64>(xv.Resource()));
+                            if (gpu_memory != nullptr) {
+                                const std::optional<DAddr> s18c_cpu =
+                                    gpu_memory->GpuToCpuAddress(
+                                        static_cast<GPUVAddr>(xv.GpuAddr()));
+                                if (!s18c_census_done && s18c_cpu) {
+                                    s18c_census_done = true;
+                                    LOG_WARNING(Render_D3D12,
+                                                "S18B EXPO census: gpu={:#x} cpu={:#x}",
+                                                static_cast<u64>(xv.GpuAddr()),
+                                                static_cast<u64>(*s18c_cpu));
+                                }
+                                // S18 cycle 3: the window covers 1 KiB from the 1x1's guest base
+                                // so the reduction draw's REAL input - the 128x1 R32G32B32A32
+                                // luminance array at +0x80 (img 3700 in the 1.0.272 run, sampled by
+                                // the 8x1 reduction) - is enumerated and dumped too. Cap 24 dumps
+                                // (three images per 60 s round = ~8 rounds of timeline).
+                                if (s18c_cpu && s18c_sib_dumps < 24) {
+                                    m_texture_cache.ForEachImageInRegion(
+                                        *s18c_cpu, 0x400,
+                                        [&](VideoCommon::ImageId s18c_image_id, auto& s18c_image) {
+                                            if (s18c_sib_dumps >= 24) {
+                                                return;
+                                            }
+                                            ++s18c_sib_dumps;
+                                            const u32 s18c_sib_id = 990600u + s18c_sib_dumps;
+                                            if (s18c_image.Handle() != nullptr) {
+                                                (void)D3D12::RecordTextureContentDump(
+                                                    m_device.GetDevice(), m_command_list,
+                                                    s18c_image.Handle(),
+                                                    static_cast<u32>(s18c_image.info.format),
+                                                    static_cast<u64>(s18c_image.gpu_addr),
+                                                    s18c_sib_id, /*force=*/true);
+                                            }
+                                            LOG_WARNING(
+                                                Render_D3D12,
+                                                "S18B EXPO sibling: id={} img={} gpu={:#x} "
+                                                "{}x{} fmt={:#x} flags={:#x} tick={}",
+                                                s18c_sib_id, s18c_image_id.index,
+                                                static_cast<u64>(s18c_image.gpu_addr),
+                                                s18c_image.info.size.width,
+                                                s18c_image.info.size.height,
+                                                static_cast<u32>(s18c_image.info.format),
+                                                static_cast<u32>(s18c_image.flags),
+                                                s18c_image.modification_tick);
+                                        });
+                                }
+                            }
+                            break;
+                        }
+                        if (g_s18_target_res == nullptr && s15_comp_res != nullptr &&
+                            g_s18_target_used < 8) {
+                            g_s18_target_res = s15_comp_res;
+                            LOG_WARNING(Render_D3D12, "S18B target dump armed: res=0x{:x}",
+                                        reinterpret_cast<u64>(s15_comp_res));
+                        }
+                    }
                 }
                 // TEMP DIAGNOSTIC (session 15, style-screen chain): the UI panel/icon textures
                 // the compositor samples (small textures, and not the scene composite itself).
@@ -3902,6 +4125,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()), 980024u,
                     /*force=*/true);
             }
+            // S18 cycle 3 (Phase 0.2.3): post-draw dump of the composite target, exactly once per
+            // arming and only for the armed resource (ids 990201+). The 1.0.271 one-shot showed
+            // the target nearly black right after the 3-vertex composite (nonzero 6664 of
+            // 8294400) while the visible frame is a bright smear; this turns that single
+            // observation into a 60 s-cadence timeline paired with the exposure readbacks.
+            if (g_s18_target_res != nullptr && s15_post_res == g_s18_target_res &&
+                g_s18_target_used < 8) {
+                ++g_s18_target_used;
+                const u32 s18_target_id = 990200u + g_s18_target_used;
+                (void)D3D12::RecordTextureContentDump(
+                    m_device.GetDevice(), m_command_list, s15_post_res,
+                    static_cast<u32>(VideoCore::Surface::PixelFormat::A2B10G10R10_UNORM),
+                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()), s18_target_id,
+                    /*force=*/true);
+                LOG_WARNING(Render_D3D12, "S18B target dump: id={} res=0x{:x}", s18_target_id,
+                            reinterpret_cast<u64>(s15_post_res));
+                g_s18_target_res = nullptr;
+            }
         }
     }
 
@@ -4355,8 +4596,9 @@ void RasterizerD3D12::Clear(u32 layer_count) {
             if (use_color && view != nullptr && resource != nullptr && s18_tiny_clear_logs < 12) {
                 const u64 s18_clear_gpu = static_cast<u64>(view->GpuAddr());
                 const bool s18_tiny = view->size.width <= 2 && view->size.height <= 2;
-                const bool s18_expo_va =
-                    s18_clear_gpu == 0x5d5445100ull || s18_clear_gpu == 0x5e8728480ull;
+                const bool s18_expo_va = s18_clear_gpu == 0x5d5445100ull ||
+                                         s18_clear_gpu == 0x5d5445180ull ||
+                                         s18_clear_gpu == 0x5e8728480ull;
                 if (s18_tiny || s18_expo_va) {
                     ++s18_tiny_clear_logs;
                     LOG_WARNING(Render_D3D12,
@@ -4721,17 +4963,26 @@ void RasterizerD3D12::DispatchCompute() {
                     s17_compute_log("img", s15_gpu, 0);
                 }
                 // S17 cycle 5 (Phase 0.2): name a compute writer of the 1x1 exposure input.
+                // S18 cycle 3: widened from 1x1 to the whole exposure family - a compute pass
+                // writing the 8x1 reduction RT or the 128x1 luminance array is equally a
+                // candidate producer (the 1.0.272 harvest showed the reduction draw samples
+                // img 3700 = 128x1 R32G32B32A32 at gpu +0x80).
                 static u32 s17_expo_compute_logs = 0;
-                if (s17_expo_compute_logs < 12 && s15_iv.size.width == 1 &&
-                    s15_iv.size.height == 1 &&
+                const u32 s18_cw = s15_iv.size.width;
+                const u32 s18_ch = s15_iv.size.height;
+                const bool s18_compute_tiny =
+                    (s18_cw <= 2 && s18_ch <= 2) || (s18_cw <= 128 && s18_ch <= 1) ||
+                    (s18_cw <= 1 && s18_ch <= 128);
+                if (s17_expo_compute_logs < 12 && s18_compute_tiny &&
                     s15_iv.format == VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
                     ++s17_expo_compute_logs;
                     LOG_WARNING(Render_D3D12,
-                                "S17 EXPO writer: compute program={:#x} img={} gpu={:#x} "
-                                "grid=({},{},{})",
+                                "S18 EXPO writer: compute program={:#x} img={} gpu={:#x} "
+                                "{}x{} grid=({},{},{})",
                                 static_cast<u64>(qmd.program_start), s15_iv.image_id.index,
-                                static_cast<u64>(s15_gpu), qmd.grid_dim_x.Value(),
-                                qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value());
+                                static_cast<u64>(s15_gpu), s18_cw, s18_ch,
+                                qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                qmd.grid_dim_z.Value());
                 }
             }
         }

@@ -651,8 +651,16 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
         // guard refuses the write; pending => already queued). Bounded to 12 lines.
         {
             static u32 s18_tiny_notify_logs = 0;
+            // S18 cycle 3: widened from <=2x2 so the exposure chain's other members are covered
+            // too - the 8x1 reduction RT and the 128x1 R32G32B32A32 luminance array (the
+            // reduction draw's real input, sampled by it in the 1.0.272 run).
+            const u32 s18_nw = image.info.size.width;
+            const u32 s18_nh = image.info.size.height;
+            const bool s18_notify_tiny =
+                (s18_nw <= 2 && s18_nh <= 2) || (s18_nw <= 128 && s18_nh <= 1) ||
+                (s18_nw <= 1 && s18_nh <= 128);
             if (s18_tiny_notify_logs < 12 && image.info.type == ImageType::e2D &&
-                image.info.size.width <= 2 && image.info.size.height <= 2) {
+                s18_notify_tiny) {
                 ++s18_tiny_notify_logs;
                 const char* const s18_action =
                     True(image.flags & ImageFlagBits::CpuModified)  ? "pending"
@@ -813,10 +821,15 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
     // writer of the exposure texel (a downsample chain ending in a 1x1 blit). Cap 12.
     {
         static u32 s18_tiny_blit_logs = 0;
-        const bool s18_dst_tiny =
-            dst_image.info.size.width <= 2 && dst_image.info.size.height <= 2;
-        const bool s18_src_tiny =
-            src_image.info.size.width <= 2 && src_image.info.size.height <= 2;
+        // S18 cycle 3: any member of the exposure family (1x1 // 8x1 // 128x1) on either side.
+        const auto s18_blit_tiny = [](const ImageBase& s18_img) {
+            const u32 s18_w = s18_img.info.size.width;
+            const u32 s18_h = s18_img.info.size.height;
+            return (s18_w <= 2 && s18_h <= 2) || (s18_w <= 128 && s18_h <= 1) ||
+                   (s18_w <= 1 && s18_h <= 128);
+        };
+        const bool s18_dst_tiny = s18_blit_tiny(dst_image);
+        const bool s18_src_tiny = s18_blit_tiny(src_image);
         if (s18_tiny_blit_logs < 12 && (s18_dst_tiny || s18_src_tiny)) {
             ++s18_tiny_blit_logs;
             LOG_WARNING(Render_D3D12,
@@ -1392,8 +1405,15 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
         // means the guest bytes behind the image are zero - the GPU-authored case. Cap 12.
         {
             static u32 s18_tiny_upload_logs = 0;
-            if (s18_tiny_upload_logs < 12 && image.info.size.width == 1 &&
-                image.info.size.height == 1 &&
+            // S18 cycle 3: widened to the whole exposure family (1x1 // 8x1 // 128x1) - the
+            // uploaded bytes are the guest-side source of every member; only the first texel is
+            // decoded (the rest would need per-row strides the staging buffer may not keep).
+            const u32 s18_uw = image.info.size.width;
+            const u32 s18_uh = image.info.size.height;
+            const bool s18_upload_tiny = (s18_uw <= 2 && s18_uh <= 2) ||
+                                         (s18_uw <= 128 && s18_uh <= 1) ||
+                                         (s18_uw <= 1 && s18_uh <= 128);
+            if (s18_tiny_upload_logs < 12 && s18_upload_tiny &&
                 image.info.format == PixelFormat::R32G32B32A32_FLOAT &&
                 mapped_span.size_bytes() >= 16) {
                 ++s18_tiny_upload_logs;
@@ -2909,10 +2929,15 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     // a 16-byte 1x1 copy would slip past it - this check is size-independent. Cap 12.
     {
         static u32 s18_tiny_copy_logs = 0;
-        const bool s18_dst_tiny =
-            dst.info.size.width == 1 && dst.info.size.height == 1;
-        const bool s18_src_tiny =
-            src.info.size.width == 1 && src.info.size.height == 1;
+        // S18 cycle 3: any member of the exposure family (1x1 // 8x1 // 128x1) on either side.
+        const auto s18_copy_tiny = [](const ImageBase& s18_img) {
+            const u32 s18_w = s18_img.info.size.width;
+            const u32 s18_h = s18_img.info.size.height;
+            return (s18_w <= 2 && s18_h <= 2) || (s18_w <= 128 && s18_h <= 1) ||
+                   (s18_w <= 1 && s18_h <= 128);
+        };
+        const bool s18_dst_tiny = s18_copy_tiny(dst);
+        const bool s18_src_tiny = s18_copy_tiny(src);
         if (s18_tiny_copy_logs < 12 && (s18_dst_tiny || s18_src_tiny)) {
             ++s18_tiny_copy_logs;
             LOG_WARNING(Render_D3D12,
