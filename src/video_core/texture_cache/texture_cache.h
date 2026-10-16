@@ -1820,6 +1820,31 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     ForEachSparseImageInRegion(channel_state->gpu_memory.GetID(), gpu_addr, size_bytes,
                                region_check_gpu);
 
+    // TEMP DIAGNOSTIC (S19): which branch did the join take for the LUT fills' two input
+    // windows? (0x516170000: the 256x256 probe - its producer draw writes 87% nonzero content
+    // (dump 923001) yet the sampled view reads zero at t=760; 0x5d0630800: the 256x4 sample
+    // table - uploaded with content (nonzero=2550 at t=221.1) yet zero at t=760.) The counts
+    // say whether the member content was queued for copying (solution/ignore), aliased, or
+    // dropped on the bad-overlap floor. Bounded 24.
+    const auto s19_join_window = [](u64 gpu) {
+        return (gpu >= 0x516170000ull && gpu < 0x516170000ull + 0x408000ull) ||
+               (gpu >= 0x5d0630000ull && gpu < 0x5d0631000ull);
+    };
+    if (s19_join_window(static_cast<u64>(gpu_addr))) {
+        static u32 s19_join_logs = 0;
+        if (s19_join_logs < 24) {
+            ++s19_join_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S19 join branch: gpu={:#x} {}x{} fmt={:#x} overlaps={} leftalias={} "
+                        "rightalias={} ignore={} bad={} copies={}",
+                        static_cast<u64>(gpu_addr), info.size.width, info.size.height,
+                        static_cast<u32>(info.format), join_overlap_ids.size(),
+                        join_left_aliased_ids.size(), join_right_aliased_ids.size(),
+                        join_ignore_textures.size(), join_bad_overlap_ids.size(),
+                        join_copies_to_do.size());
+        }
+    }
+
     bool can_rescale = info.rescaleable;
     bool any_rescaled = false;
     for (const auto& copy : join_copies_to_do) {
@@ -1855,6 +1880,21 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     for (const ImageId overlap_id : join_ignore_textures) {
         Image& overlap = slot_images[overlap_id];
+        if (s19_join_window(static_cast<u64>(overlap.gpu_addr)) ||
+            s19_join_window(static_cast<u64>(new_image.gpu_addr))) {
+            static u32 s19_ignore_logs = 0;
+            if (s19_ignore_logs < 24) {
+                ++s19_ignore_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S19 join ignore: new={} gpu={:#x} overlap={} gpu={:#x} {}x{} "
+                            "gpu_modified={} flags={:#x}",
+                            new_image_id.index, static_cast<u64>(new_image.gpu_addr),
+                            overlap_id.index, static_cast<u64>(overlap.gpu_addr),
+                            overlap.info.size.width, overlap.info.size.height,
+                            True(overlap.flags & ImageFlagBits::GpuModified) ? 1 : 0,
+                            static_cast<u32>(overlap.flags));
+            }
+        }
         if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             // For ignored textures that are GPU modified, try to preserve the data
             // by copying it to the new image if possible, otherwise mark as modified
@@ -1986,6 +2026,22 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
+        if (s19_join_window(static_cast<u64>(overlap.gpu_addr)) ||
+            s19_join_window(static_cast<u64>(new_image.gpu_addr))) {
+            static u32 s19_copy_logs = 0;
+            if (s19_copy_logs < 24) {
+                ++s19_copy_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S19 join copy: new={} gpu={:#x} overlap={} gpu={:#x} {}x{} alias={} "
+                            "gpu_modified={} flags={:#x}",
+                            new_image_id.index, static_cast<u64>(new_image.gpu_addr),
+                            copy_object.id.index, static_cast<u64>(overlap.gpu_addr),
+                            overlap.info.size.width, overlap.info.size.height,
+                            copy_object.is_alias ? 1 : 0,
+                            True(overlap.flags & ImageFlagBits::GpuModified) ? 1 : 0,
+                            static_cast<u32>(overlap.flags));
+            }
+        }
         if (copy_object.is_alias) {
             // FIX (S15/S16): preserve GPU-authored alias content. IsSafeDownload() is a
             // guest-download safety predicate; using it here skipped the device-local
@@ -2013,6 +2069,27 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             const u32 up_scale = can_rescale ? resolution.up_scale : 1;
             const u32 down_shift = can_rescale ? resolution.down_shift : 0;
             auto copies = MakeShrinkImageCopies(new_info, overlap.info, base, up_scale, down_shift);
+            // S19: the copy that was supposed to carry the probe member's 87%-nonzero content
+            // (t=222.6) into the new image yields a ZERO sampled view at t=749 - log the exact
+            // copy boxes so a bad offset/extent is distinguishable from a later overwrite.
+            if (s19_join_window(static_cast<u64>(overlap.gpu_addr)) ||
+                s19_join_window(static_cast<u64>(new_image.gpu_addr))) {
+                static u32 s19_boxes_logs = 0;
+                if (s19_boxes_logs < 12 && !copies.empty()) {
+                    ++s19_boxes_logs;
+                    const ImageCopy& c0 = copies.front();
+                    LOG_WARNING(Render_D3D12,
+                                "S19 join boxes: overlap={} copies={} c0=(src=({},{},{}) "
+                                "dst=({},{},{}) ext={}x{}x{} src_lvl={} src_lay={} dst_lvl={} "
+                                "dst_lay={} base_lvl={} base_lay={})",
+                                copy_object.id.index, copies.size(), c0.src_offset.x,
+                                c0.src_offset.y, c0.src_offset.z, c0.dst_offset.x, c0.dst_offset.y,
+                                c0.dst_offset.z, c0.extent.width, c0.extent.height, c0.extent.depth,
+                                c0.src_subresource.base_level, c0.src_subresource.base_layer,
+                                c0.dst_subresource.base_level, c0.dst_subresource.base_layer,
+                                base.level, base.layer);
+                }
+            }
             if (overlap.info.num_samples != new_image.info.num_samples) {
                 runtime.CopyImageMSAA(new_image, overlap, std::move(copies));
             } else {

@@ -4621,6 +4621,45 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     // two SAMPLED textures (ids 922xxx): a black source probe and a zeroed loop
                     // bound look identical in the 256x256 output otherwise. res_slots only exists
                     // here (post-descriptor-walk), hence this placement.
+                    // S19: content timeline of the probe window AS ITS CONSUMERS SEE IT. The join
+                    // copied the member's nonzero content into the new image at t=222.6 (S19 join
+                    // copy: new=4086 overlap=4094) yet the LUT fills read zero at t=749: this
+                    // 10 s cadence (ids 925xxx, budget 10) shows WHEN it goes zero and which
+                    // image incarnation each consumer sees.
+                    {
+                        static u32 s19_probe_tl_dumps = 0;
+                        static std::chrono::steady_clock::time_point s19_probe_tl_next =
+                            std::chrono::steady_clock::now();
+                        if (s19_probe_tl_dumps < 10 &&
+                            std::chrono::steady_clock::now() >= s19_probe_tl_next) {
+                            for (const DrawSlot& s19_slot : res_slots) {
+                                if (s19_slot.kind != SlotKind::Sampled) {
+                                    continue;
+                                }
+                                ImageView& s19_sv = m_texture_cache.GetImageView(s19_slot.view);
+                                const u64 s19_gpu = static_cast<u64>(s19_sv.GpuAddr());
+                                if (s19_sv.Resource() == nullptr ||
+                                    !(s19_gpu >= 0x516170000ull &&
+                                      s19_gpu < 0x516170000ull + 0x408000ull)) {
+                                    continue;
+                                }
+                                ++s19_probe_tl_dumps;
+                                s19_probe_tl_next =
+                                    std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                    static_cast<u32>(s19_sv.format), s19_gpu,
+                                    925000u + s19_probe_tl_dumps, true);
+                                LOG_WARNING(Render_D3D12,
+                                            "S19 probe timeline: id={} img={} gpu={:#x} {}x{} "
+                                            "fmt={:#x} verts={}",
+                                            925000u + s19_probe_tl_dumps, s19_sv.image_id.index,
+                                            s19_gpu, s19_sv.size.width, s19_sv.size.height,
+                                            static_cast<u32>(s19_sv.format), params.num_vertices);
+                                break;
+                            }
+                        }
+                    }
                     if (s19_post_bank) {
                         static u32 s19_lutfill_in_dumps = 0;
                         u32 s19_in_count = 0;
