@@ -126,6 +126,12 @@ private:
     /// Resolves TIC handles for one draw and fills the shader-visible descriptor tables.
     void ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeline& stored, u32 instance_count);
 
+    /// TEMP DIAGNOSTIC (S19): log the current pipeline key's shader hashes plus every guest
+    /// constant buffer the draw's stages declare (address, size, used size, first 256 bytes
+    /// as f32). Callers gate it to the auto-exposure chain's passes; the hashes select the
+    /// matching `Shader dump written ... hash=` SPIR-V files for offline disassembly.
+    void S19DumpDrawState(const char* tag, u64 aux, const PipelineCache::StoredPipeline& stored);
+
     /// Snapshot copies of render-target resources that a draw samples while rendering into
     /// them. Sampling a live RTV is undefined on D3D12 (Xbox returns zeros, which the draw
     /// then writes over the whole target - the scene RT was being wiped this way). The

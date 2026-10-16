@@ -614,7 +614,9 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
             !code.empty()) {
             static std::atomic<u32> vs_dumps{0};
             const u32 dump_index = vs_dumps.fetch_add(1, std::memory_order_relaxed);
-            if (dump_index < 16) {
+            // S19: the cap was 16 (session 13), which evicted the auto-exposure chain's
+            // early-compiled shaders long before the style phase. 4096 covers a whole run.
+            if (dump_index < 4096) {
                 const std::string path = GetCaptureDirectory() + "\\vs_" +
                                          std::to_string(dump_index) + ".spv";
                 std::ofstream out{path, std::ios::binary};
@@ -627,10 +629,11 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
                                  std::to_string(desc.count) + " ";
                     }
                     LOG_WARNING(Render_D3D12,
-                                "Shader dump written: {} (stage={} mask={:#x} descs=[{}] "
-                                "words={})",
-                                path, static_cast<u32>(program.stage),
-                                program.info.constant_buffer_mask, descs, code.size());
+                                "Shader dump written: {} (stage={} mb={} hash={:#x} mask={:#x} "
+                                "descs=[{}] words={})",
+                                path, static_cast<u32>(program.stage), index,
+                                key.unique_hashes[index], program.info.constant_buffer_mask, descs,
+                                code.size());
                 }
             }
         }
@@ -640,7 +643,7 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
         if (program.stage == Shader::Stage::Fragment && !code.empty()) {
             static std::atomic<u32> ps_dumps{0};
             const u32 dump_index = ps_dumps.fetch_add(1, std::memory_order_relaxed);
-            if (dump_index < 16) {
+            if (dump_index < 4096) {
                 const std::string path = GetCaptureDirectory() + "\\ps_" +
                                          std::to_string(dump_index) + ".spv";
                 std::ofstream out{path, std::ios::binary};
@@ -648,8 +651,10 @@ std::unique_ptr<PipelineCache::StoredPipeline> PipelineCache::CreatePipeline(
                     out.write(reinterpret_cast<const char*>(code.data()),
                               static_cast<std::streamsize>(code.size() * sizeof(u32)));
                     LOG_WARNING(Render_D3D12,
-                                "PS dump written: {} (mask={:#x} textures={} images={} words={})",
-                                path, program.info.constant_buffer_mask,
+                                "PS dump written: {} (mb={} hash={:#x} mask={:#x} textures={} "
+                                "images={} words={})",
+                                path, index, key.unique_hashes[index],
+                                program.info.constant_buffer_mask,
                                 Shader::NumDescriptors(program.info.texture_descriptors),
                                 Shader::NumDescriptors(program.info.image_descriptors),
                                 code.size());

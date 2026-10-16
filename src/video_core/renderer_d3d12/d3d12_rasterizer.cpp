@@ -515,6 +515,58 @@ D3D12_RECT MakeScissor(const Tegra::Engines::Maxwell3D::Regs& regs) {
 
 } // Anonymous namespace
 
+void RasterizerD3D12::S19DumpDrawState(const char* tag, u64 aux,
+                                       const PipelineCache::StoredPipeline& stored) {
+    const auto& s19_key = m_pipeline_cache.CurrentKey();
+    LOG_WARNING(Render_D3D12,
+                "S19 draw state {} aux={:#x} [S18 guest_frame={}]: hashes=[{:#x},{:#x},{:#x},"
+                "{:#x},{:#x},{:#x}]",
+                tag, aux, g_s18_guest_frames, s19_key.unique_hashes[0], s19_key.unique_hashes[1],
+                s19_key.unique_hashes[2], s19_key.unique_hashes[3], s19_key.unique_hashes[4],
+                s19_key.unique_hashes[5]);
+    for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
+        const Shader::Info* s19_info = stored.infos[stage];
+        if (s19_info == nullptr) {
+            continue;
+        }
+        const auto& s19_cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+        for (u32 ci = 0; ci < Shader::Info::MAX_CBUFS; ++ci) {
+            if (((s19_info->constant_buffer_mask >> ci) & 1) == 0) {
+                continue;
+            }
+            const auto& cb = s19_cbufs[ci];
+            std::array<u8, 256> bytes{};
+            const u32 dump_size = std::min<u32>(static_cast<u32>(bytes.size()), cb.size);
+            u32 read_bytes = 0;
+            u64 dev_addr = 0;
+            std::string flts = "no-dev";
+            if (gpu_memory != nullptr) {
+                if (const auto dev = gpu_memory->GpuToCpuAddress(cb.address)) {
+                    dev_addr = static_cast<u64>(*dev);
+                    const auto read = m_device_memory.ReadBlockUnsafe(*dev, bytes.data(),
+                                                                      dump_size, "S19.DrawCbuf",
+                                                                      false);
+                    if (read.fully_mapped) {
+                        read_bytes = dump_size;
+                        flts.clear();
+                        for (u32 i = 0; i + 3 < read_bytes; i += 4) {
+                            f32 v = 0.0f;
+                            std::memcpy(&v, bytes.data() + i, sizeof(v));
+                            flts += fmt::format("{} ", v);
+                        }
+                    } else {
+                        flts = "unmapped";
+                    }
+                }
+            }
+            LOG_WARNING(Render_D3D12,
+                        "S19 cbuf {} s{} i{}: gpu={:#x} dev={:#x} size={} used={} nz={} f32=[{}]",
+                        tag, stage, ci, static_cast<u64>(cb.address), dev_addr, cb.size,
+                        s19_info->constant_buffer_used_sizes[ci], read_bytes, flts);
+        }
+    }
+}
+
 void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeline& stored,
                                     u32 instance_count) {
     GraphicsPipeline* pipeline = stored.pipeline.get();
@@ -774,6 +826,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 (static_cast<u32>(s18_att.mask_g ? 2 : 0)) |
                                 (static_cast<u32>(s18_att.mask_b ? 4 : 0)) |
                                 (static_cast<u32>(s18_att.mask_a ? 8 : 0)));
+                // S19 (Phase 0.2 cycle 1): the auto-exposure loop's exact math is the owner of
+                // the "exposure tracks the measured (dim) frame" defect. Name this draw's
+                // shader hashes and dump its guest CBVs; offline, a "S19 draw state" line's
+                // hash matches a "Shader dump written ... hash=" .spv file (the 16-file cap is
+                // raised this cycle, so the early-compiled exposure shaders survive the run).
+                // The histogram array and the 8x1 reduction RT dump at first sight and once
+                // after 20 minutes (style phase); other tiny VAs once each, first sight only.
+                {
+                    static std::array<u64, 8> s19_va{};
+                    static std::array<u32, 8> s19_va_dumps{};
+                    static std::chrono::steady_clock::time_point s19_tiny_start =
+                        std::chrono::steady_clock::now();
+                    const bool s19_late = std::chrono::steady_clock::now() - s19_tiny_start >
+                                          std::chrono::minutes(20);
+                    const char* s19_tag = s18_rt_gpu == 0x5d5445180ull   ? "hist"
+                                          : s18_rt_gpu == 0x5d5445100ull ? "reduce"
+                                                                         : "tiny";
+                    const u32 s19_cap = s19_tag[0] == 't' ? 1 : 2;
+                    size_t s19_index = s19_va.size();
+                    size_t s19_free = s19_va.size();
+                    for (size_t s19_slot_i = 0; s19_slot_i < s19_va.size(); ++s19_slot_i) {
+                        if (s19_va_dumps[s19_slot_i] != 0 && s19_va[s19_slot_i] == s18_rt_gpu) {
+                            s19_index = s19_slot_i;
+                            break;
+                        }
+                        if (s19_va_dumps[s19_slot_i] == 0 && s19_free == s19_va.size()) {
+                            s19_free = s19_slot_i;
+                        }
+                    }
+                    if (s19_index == s19_va.size() && s19_free != s19_va.size()) {
+                        s19_index = s19_free;
+                        s19_va[s19_index] = s18_rt_gpu;
+                    }
+                    if (s19_index != s19_va.size()) {
+                        const u32 s19_dumps = s19_va_dumps[s19_index];
+                        if (s19_dumps < s19_cap && (s19_dumps == 0 || s19_late)) {
+                            ++s19_va_dumps[s19_index];
+                            S19DumpDrawState(s19_tag, s18_rt_gpu, stored);
+                        }
+                    }
+                }
             }
         }
         if (skip_reason != nullptr) {
@@ -2455,6 +2548,23 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 !stored.pipeline->State().attachments[0].enable.Value() &&
                 s15_stage_samples_scene_rt;
             if (s15_comp_res != nullptr && (s15_final_rt || s15_has_scene_source)) {
+                // S19 (Phase 0.2 cycle 1): the composite's shader decides how the 1x1 exposure
+                // (with its alpha ~3.0) and the 240x136 blur are consumed - the missing link
+                // between the measured value and the visible frame. Dump its shader hashes +
+                // CBVs at first sight and once after 20 minutes (style phase).
+                {
+                    static u32 s19_comp_dumps = 0;
+                    static std::chrono::steady_clock::time_point s19_comp_start =
+                        std::chrono::steady_clock::now();
+                    const bool s19_comp_late =
+                        std::chrono::steady_clock::now() - s19_comp_start >
+                        std::chrono::minutes(20);
+                    if (s15_stage_scene_composite && s19_comp_dumps < 2 &&
+                        (s19_comp_dumps == 0 || s19_comp_late)) {
+                        ++s19_comp_dumps;
+                        S19DumpDrawState("composite", 0, stored);
+                    }
+                }
                 static u32 s15_comp_logs = 0;
                 // TEMP DIAGNOSTIC (session 15): the early dumps below run in the first
                 // frames, when the compositor may still sample the pre-style scene source;

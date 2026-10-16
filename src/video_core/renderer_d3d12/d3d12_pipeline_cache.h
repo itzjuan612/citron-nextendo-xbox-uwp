@@ -108,6 +108,15 @@ public:
     /// Same as above but also exposes the stored shader infos for descriptor setup.
     [[nodiscard]] StoredPipeline* CurrentStoredPipeline();
 
+    /// TEMP DIAGNOSTIC (S19): the shader hashes of the draw `CurrentStoredPipeline` just
+    /// resolved (valid until the next call). The auto-exposure chain's passes are named at
+    /// draw time by these hashes; the matching `Shader dump written ... hash=` lines carry
+    /// the retained SPIR-V file names (the 16-file cap is raised this cycle so the early-
+    /// compiled exposure shaders survive the run).
+    [[nodiscard]] const GraphicsPipelineCacheKey& CurrentKey() const noexcept {
+        return current_key;
+    }
+
     /// Returns the compute pipeline for the currently bound Maxwell compute state,
     /// building it on a miss. Returns nullptr when the shader is invalid or
     /// translation/compilation fails.
