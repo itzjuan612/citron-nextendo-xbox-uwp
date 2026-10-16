@@ -535,7 +535,9 @@ void RasterizerD3D12::S19DumpDrawState(const char* tag, u64 aux,
                 continue;
             }
             const auto& cb = s19_cbufs[ci];
-            std::array<u8, 256> bytes{};
+            // S19: 512 bytes - the LUT-fill PS reads c3[72]/c3[75] at bytes 288/300, past the
+            // original 256-byte window (its declared used size is 512).
+            std::array<u8, 512> bytes{};
             const u32 dump_size = std::min<u32>(static_cast<u32>(bytes.size()), cb.size);
             u32 read_bytes = 0;
             u64 dev_addr = 0;
@@ -1001,6 +1003,117 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                                       B10G11R11_FLOAT),
                                                               static_cast<u64>(view->GpuAddr()),
                                                               900000u + s15_lut_rtv_dumps, true);
+                    }
+                    // S19 (bank LUT pass): the six fills EXECUTE (no drop line, guards pass) but
+                    // their post-draw readback (921xxx) is all zero - so capture their identity
+                    // (shader hashes + CBVs via S19DumpDrawState), the primitive state and the
+                    // first two vertex buffers: a degenerate triangle and a shader/CBV that
+                    // computes black look identical in the 256x256 readback otherwise.
+                    if (s17_lut_bank && view->size.width >= 64) {
+                        static u32 s19_lutfill_logs = 0;
+                        if (s19_lutfill_logs < 8 && params.num_vertices <= 8) {
+                            ++s19_lutfill_logs;
+                            S19DumpDrawState("lutfill", addr, stored);
+                            // S19: the fill VS reads a float3 vertex attribute but the runtime has
+                            // NO vertex stream bound (vb_slots=0). Log the GUEST's stream state so
+                            // the harvest can tell "the guest never bound one" from "our binding
+                            // path dropped it" (the stream sizes feed the vertex-range guard).
+                            const auto& s19_gs0 = maxwell3d->regs.vertex_streams[0];
+                            const auto& s19_gs1 = maxwell3d->regs.vertex_streams[1];
+                            const auto& s19_gl0 = maxwell3d->regs.vertex_stream_limits[0];
+                            const auto& s19_vb0 = m_runtime.GetVertexBindings()[0];
+                            LOG_WARNING(Render_D3D12,
+                                        "S19 lutfill state: gpu={:#x} verts={} topo={:#x} indexed={} "
+                                        "first={} base={} att0={:#x} vb_slots={} instances={} "
+                                        "guest_s0=(addr={:#x} stride={} enable={}) "
+                                        "guest_s1=(addr={:#x} enable={}) limit0={:#x} "
+                                        "host_s0=(size={} stride={})",
+                                        static_cast<u64>(addr), params.num_vertices,
+                                        static_cast<u32>(
+                                            stored.pipeline->State().topology.Value()),
+                                        params.is_indexed ? 1 : 0, params.first_index,
+                                        params.base_vertex,
+                                        stored.pipeline->State().attributes[0].raw,
+                                        m_runtime.MaxVertexSlot(), params.num_instances,
+                                        static_cast<u64>(s19_gs0.Address()),
+                                        static_cast<u32>(s19_gs0.stride),
+                                        static_cast<u32>(s19_gs0.enable != 0),
+                                        static_cast<u64>(s19_gs1.Address()),
+                                        static_cast<u32>(s19_gs1.enable != 0),
+                                        static_cast<u64>(s19_gl0.Address()),
+                                        s19_vb0.SizeInBytes, s19_vb0.StrideInBytes);
+                            // S19: read the vertex data the GUEST points at (the host binding
+                            // state above is read before this draw's BindHostVertexBuffers runs,
+                            // so it can be stale) - zeros/degenerate positions here explain a
+                            // fill draw that rasters nothing.
+                            if (s19_gs0.Address() != 0 && gpu_memory != nullptr) {
+                                if (const auto s19_dev = gpu_memory->GpuToCpuAddress(
+                                        static_cast<GPUVAddr>(s19_gs0.Address()))) {
+                                    std::array<u8, 32> s19_gbytes{};
+                                    const auto s19_gread = m_device_memory.ReadBlockUnsafe(
+                                        *s19_dev, s19_gbytes.data(), s19_gbytes.size(),
+                                        "S19.LutFillGuestVB", false);
+                                    std::string s19_ghex;
+                                    std::string s19_gfloats = "unmapped";
+                                    if (s19_gread.fully_mapped) {
+                                        s19_gfloats.clear();
+                                        for (u32 s19_i = 0; s19_i < s19_gbytes.size(); ++s19_i) {
+                                            s19_ghex += fmt::format("{:02x}", s19_gbytes[s19_i]);
+                                        }
+                                        for (u32 s19_i = 0; s19_i + 3 < s19_gbytes.size();
+                                             s19_i += 4) {
+                                            f32 v = 0.0f;
+                                            std::memcpy(&v, s19_gbytes.data() + s19_i, sizeof(v));
+                                            s19_gfloats += fmt::format("{} ", v);
+                                        }
+                                    }
+                                    LOG_WARNING(Render_D3D12,
+                                                "S19 lutfill guestvb: dev={:#x} hex={} f32=[{}]",
+                                                static_cast<u64>(*s19_dev), s19_ghex, s19_gfloats);
+                                } else {
+                                    LOG_WARNING(Render_D3D12,
+                                                "S19 lutfill guestvb: addr={:#x} UNMAPPED",
+                                                static_cast<u64>(s19_gs0.Address()));
+                                }
+                            }
+                            for (u32 s19_slot = 0;
+                                 s19_slot < m_runtime.MaxVertexSlot() && s19_slot < 2;
+                                 ++s19_slot) {
+                                const auto& s19_vb = m_runtime.GetVertexBindings()[s19_slot];
+                                const DAddr s19_vb_addr =
+                                    m_buffer_cache.GetVertexBufferDeviceAddress(s19_slot);
+                                std::array<u8, 32> s19_vb_bytes{};
+                                const u32 s19_read_size = std::min<u32>(
+                                    static_cast<u32>(s19_vb_bytes.size()), s19_vb.SizeInBytes);
+                                std::string s19_hex;
+                                std::string s19_floats = "empty";
+                                if (s19_vb_addr != 0 && s19_read_size >= 8) {
+                                    const auto s19_read = m_device_memory.ReadBlockUnsafe(
+                                        s19_vb_addr, s19_vb_bytes.data(), s19_read_size,
+                                        "S19.LutFillVB", false);
+                                    if (s19_read.fully_mapped) {
+                                        s19_floats.clear();
+                                        for (u32 s19_i = 0; s19_i < s19_read_size; ++s19_i) {
+                                            s19_hex += fmt::format("{:02x}", s19_vb_bytes[s19_i]);
+                                        }
+                                        for (u32 s19_i = 0; s19_i + 3 < s19_read_size; s19_i += 4) {
+                                            f32 v = 0.0f;
+                                            std::memcpy(&v, s19_vb_bytes.data() + s19_i,
+                                                        sizeof(v));
+                                            s19_floats += fmt::format("{} ", v);
+                                        }
+                                    } else {
+                                        s19_floats = "unmapped";
+                                    }
+                                }
+                                LOG_WARNING(Render_D3D12,
+                                            "S19 lutfill vb s{}: dev={:#x} size={} stride={} hex={} "
+                                            "f32=[{}]",
+                                            s19_slot, static_cast<u64>(s19_vb_addr),
+                                            s19_vb.SizeInBytes, s19_vb.StrideInBytes, s19_hex,
+                                            s19_floats);
+                            }
+                        }
                     }
                 }
             }
@@ -3456,11 +3569,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     // LUT is irrelevant and the darkness is elsewhere. Diagnostic only - remove
                     // once the producer is found. Bounded: exactly one clear per process.
                     static bool s17_lut_white_done = false;
-                    // The probe has served its purpose: with the FlushCaching() fix the LUT now
-                    // receives real guest data, so clearing it would destroy correct content.
-                    // Kept disabled (not deleted) until the whole S17 set is cleaned up.
-                    static constexpr bool s17_enable_white_probe = false;
-                    if (s17_enable_white_probe && !s17_lut_white_done &&
+                    // S19 (Phase 0.2.11): re-armed as the causal A/B for the LUT-content fix.
+                    // It fires ONCE at the settled style phase (guest_frame > 13500, after the
+                    // 12600/13500 captures document the post-fix state): if the character then
+                    // lights up, the LUT content is proven to be the lever; if the frames are
+                    // already bright before the clear, the S19 join-inherit fix worked.
+                    static constexpr bool s17_enable_white_probe = true;
+                    const bool s19_white_gate = g_s18_guest_frames > 13500;
+                    if (s17_enable_white_probe && s19_white_gate && !s17_lut_white_done &&
                         static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull &&
                         sv.Resource() != nullptr) {
                         s17_lut_white_done = true;
@@ -4427,17 +4543,29 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
                 static u32 s15_post_scene_dumps = 0;
                 static u32 s15_post_lut_dumps = 0;
+                // S19 (the LUT bank fix): the shared small-LUT budget (8) was exhausted by the
+                // boot 128x128 LUTs at t=222, so the bank producers' POST-draw content was never
+                // captured. Dedicated bank budget (ids 921xxx) so the harvest can see whether
+                // the six fill draws actually write content into the bank RTs.
+                static u32 s19_post_bank_dumps = 0;
+                const u64 s19_post_bank_gpu =
+                    framebuffer->ColorBuffers()[0]->GpuAddr();
+                const bool s19_post_bank =
+                    s15_post_lut && s19_post_bank_gpu >= 0x5e9000000ull &&
+                    s19_post_bank_gpu < 0x5ee7b4000ull && s19_post_bank_dumps < 8;
                 static std::chrono::steady_clock::time_point s15_post_start =
                     std::chrono::steady_clock::now();
                 const bool s15_post_late =
                     std::chrono::steady_clock::now() - s15_post_start > std::chrono::minutes(20);
                 const bool s15_post_scene_budget =
                     s15_post_scene && s15_post_late && s15_post_scene_dumps < 4;
-                const bool s15_post_lut_budget = s15_post_lut && s15_post_lut_dumps < 8;
-                if (s15_post_scene_budget || s15_post_lut_budget) {
+                const bool s15_post_lut_budget =
+                    s15_post_lut && !s19_post_bank && s15_post_lut_dumps < 8;
+                if (s15_post_scene_budget || s15_post_lut_budget || s19_post_bank) {
                     const u32 s15_post_index =
                         s15_post_scene_budget ? (930000u + ++s15_post_scene_dumps)
-                                              : (920000u + ++s15_post_lut_dumps);
+                        : s19_post_bank      ? (921000u + ++s19_post_bank_dumps)
+                                             : (920000u + ++s15_post_lut_dumps);
                     LOG_WARNING(Render_D3D12,
                                 "S15 post-draw RT: gpu={:#x} res=0x{:x} {}x{} depth={} verts={} "
                                 "lut={}",
@@ -4450,6 +4578,38 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
                         static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
                         s15_post_index, true);
+                    // S19 (bank LUT pass): the fills produce a zero RT although their geometry is
+                    // sound (the guest VB holds fp16 fullscreen corners). Dump the draw's first
+                    // two SAMPLED textures (ids 922xxx): a black source probe and a zeroed loop
+                    // bound look identical in the 256x256 output otherwise. res_slots only exists
+                    // here (post-descriptor-walk), hence this placement.
+                    if (s19_post_bank) {
+                        static u32 s19_lutfill_in_dumps = 0;
+                        u32 s19_in_count = 0;
+                        for (const DrawSlot& s19_slot : res_slots) {
+                            if (s19_slot.kind != SlotKind::Sampled || s19_in_count >= 2 ||
+                                s19_lutfill_in_dumps >= 6) {
+                                continue;
+                            }
+                            ImageView& s19_sv = m_texture_cache.GetImageView(s19_slot.view);
+                            if (s19_sv.Resource() == nullptr) {
+                                continue;
+                            }
+                            ++s19_in_count;
+                            ++s19_lutfill_in_dumps;
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                static_cast<u32>(s19_sv.format), static_cast<u64>(s19_sv.GpuAddr()),
+                                922000u + s19_lutfill_in_dumps, true);
+                            LOG_WARNING(Render_D3D12,
+                                        "S19 lutfill input: id={} img={} gpu={:#x} {}x{} fmt={:#x} "
+                                        "verts={}",
+                                        922000u + s19_lutfill_in_dumps, s19_sv.image_id.index,
+                                        static_cast<u64>(s19_sv.GpuAddr()), s19_sv.size.width,
+                                        s19_sv.size.height, static_cast<u32>(s19_sv.format),
+                                        params.num_vertices);
+                        }
+                    }
                     if (s15_post_scene_budget) {
                         D3D12::RecordScene3dCaptureMidFrame(m_device.GetDevice(), m_command_list,
                                                             s15_post_res);

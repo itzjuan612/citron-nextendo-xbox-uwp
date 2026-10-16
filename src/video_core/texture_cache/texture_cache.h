@@ -1921,6 +1921,57 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     }
     for (const ImageId aliased_id : join_bad_overlap_ids) {
         ImageBase& aliased = slot_images[aliased_id];
+        // TEMP FIX (S19, the lighting-LUT bank): an overlap the join could not classify as a
+        // subresource in either direction, but which holds GPU-authored content, is the
+        // producer of the new image's content. The six 256x256 LUT fill draws render into
+        // per-slot images at the bank VAs (0x5eb340000 + k*0x56000); the joined 27 MB array
+        // image is created afterwards, uploads ZERO guest bytes (the LUT is GPU-authored) and
+        // previously never received that content - so every sampled 256x256 sub-view read zero
+        // and the scene rendered unlit (black silhouettes). Inherit the content exactly like
+        // the ignore-textures path above does, then retire the overlap so one image owns each
+        // guest range again. When the base or the format does not line up, keep the old
+        // BadOverlap linking (no copy, no delete) - the behaviour before this fix.
+        // Deliberately bounded to the LUT bank window this cycle (the same range the S17
+        // producer tracers use): the dynamic-res family has the same shape but its joins are
+        // load-bearing for the whole scene chain, so generalising waits for its own A/B.
+        const bool s19_lut_bank_overlap = aliased.gpu_addr >= 0x5e9000000ull &&
+                                          aliased.gpu_addr < 0x5ee7b4000ull;
+        if (s19_lut_bank_overlap && True(aliased.flags & ImageFlagBits::GpuModified) &&
+            aliased.info.num_samples == 1 &&
+            aliased.guest_size_bytes < new_image.guest_size_bytes) {
+            const auto s19_inherit_base = new_image.TryFindBase(aliased.gpu_addr);
+            if (s19_inherit_base.has_value() && aliased.info.format == new_info.format) {
+                static u32 s19_inherit_logs = 0;
+                const auto& resolution = Settings::values.resolution_info;
+                const u32 up_scale = can_rescale ? resolution.up_scale : 1;
+                const u32 down_shift = can_rescale ? resolution.down_shift : 0;
+                auto copies = MakeShrinkImageCopies(new_info, aliased.info,
+                                                    s19_inherit_base.value(), up_scale, down_shift);
+                const size_t s19_num_copies = copies.size();
+                new_image.flags |= ImageFlagBits::GpuModified;
+                Image& s19_inherit_src = slot_images[aliased_id];
+                runtime.CopyImage(new_image, s19_inherit_src, std::move(copies));
+                new_image.modification_tick =
+                    std::max(new_image.modification_tick, aliased.modification_tick);
+                if (s19_inherit_logs < 24) {
+                    ++s19_inherit_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S19 join inherit #{}: overlap={} gpu={:#x} {}x{} fmt={:#x} -> "
+                                "new={} gpu={:#x} copies={}",
+                                s19_inherit_logs, aliased_id.index,
+                                static_cast<u64>(aliased.gpu_addr), aliased.info.size.width,
+                                aliased.info.size.height, static_cast<u32>(aliased.info.format),
+                                new_image_id.index, static_cast<u64>(new_image.gpu_addr),
+                                s19_num_copies);
+                }
+                if (True(aliased.flags & ImageFlagBits::Tracked)) {
+                    UntrackImage(aliased, aliased_id);
+                }
+                UnregisterImage(aliased_id);
+                DeleteImage(aliased_id);
+                continue;
+            }
+        }
         aliased.overlapping_images.push_back(new_image_id);
         new_image.overlapping_images.push_back(aliased_id);
         if (aliased.info.resources.levels == 1 && aliased.info.block.depth == 0 &&
