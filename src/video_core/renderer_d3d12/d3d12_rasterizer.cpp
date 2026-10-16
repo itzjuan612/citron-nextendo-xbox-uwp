@@ -103,9 +103,17 @@ constexpr bool S17ProducerRange(u64 gpu) {
     // that hid the real producer (a 6-vertex draw into 0x5eb340000). Covers all three VAs.
     // Mask windows tightened to 1 MB: the previous 4 MB reached the 0x511270000 mip chain and
     // ate the whole draw budget at t=741-746.
+    // S19: the two inputs of the bank LUT fills read all-zero on console - the 256x256 RG32F
+    // environment probe at 0x516170000 (a member of the joined 4 MB image whose producer draws
+    // land in separate resources) and the 256x4 RGBA16F sample table at 0x5d0630800 (inside a
+    // 64 KB mapped heap, dev 0xbaec8000, with no writer anywhere in the logs). Widen the
+    // producer tracing to those windows so every writer class (draw RT/DSV binds, compute
+    // storage binds, Fermi2D blits) is named; memwrite/cpuwrite have their own range checks.
     return (gpu >= 0x5e9000000ull && gpu < 0x5ee7b4000ull) ||
            (gpu >= 0x510fa0000ull && gpu < 0x510fa0000ull + 0x100000ull) ||
-           (gpu >= 0x510f30000ull && gpu < 0x510f30000ull + 0x100000ull);
+           (gpu >= 0x510f30000ull && gpu < 0x510f30000ull + 0x100000ull) ||
+           (gpu >= 0x516170000ull && gpu < 0x516170000ull + 0x408000ull) ||
+           (gpu >= 0x5d0630000ull && gpu < 0x5d0631000ull);
 }
 } // namespace
 
@@ -4198,7 +4206,17 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             framebuffer->ColorBuffers()[0]->Resource() != nullptr) {
             ID3D12Resource* const s15_post_res = framebuffer->ColorBuffers()[0]->Resource();
             const D3D12_RESOURCE_DESC s15_post_desc = s15_post_res->GetDesc();
-            if (s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT) {
+            // S19: also allow the LUT fills' two zero inputs' formats (RG32F probe, RGBA16F
+            // sample table) so their producers get post-draw dumps; the pre-existing flags
+            // below keep requiring R11G11B10 so their semantics are unchanged.
+            // NOTE: the resources are TYPELESS on console (the DIAG line for the probe's own
+            // draw reads "pso_fmt=0xa view_res_fmt=0x9"): the 256x256 probe image is
+            // R16G16B16A16_TYPELESS and the sample table R32_TYPELESS - a typed-format check
+            // silently skipped both in 1.0.285.0 (no 923xxx/924xxx dump ever fired).
+            const bool s19_input_format =
+                s15_post_desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS ||
+                s15_post_desc.Format == DXGI_FORMAT_R32_TYPELESS;
+            if (s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT || s19_input_format) {
                 // The scene-class probe must latch the COLOR pass, not the depth-only prepass
                 // (att mask 0 writes no color, so its post-draw RT readback is legitimately
                 // unchanged). Require at least one color channel to be written.
@@ -4208,8 +4226,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 const bool s15_post_scene = depth_view != nullptr && s15_post_color &&
                                             params.num_vertices >= 4000 &&
                                             s15_post_desc.Width >= 960 && s15_post_desc.Width <= 1400;
-                const bool s15_post_lut = depth_view == nullptr && s15_post_desc.Width <= 512 &&
-                                          s15_post_desc.Height <= 512;
+                const bool s15_post_lut =
+                    depth_view == nullptr && s15_post_desc.Width <= 512 &&
+                    s15_post_desc.Height <= 512 &&
+                    s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT;
                 // TEMP DIAGNOSTIC (session 15): feedback-loop detector. A draw that both
                 // samples and renders the SAME resource (rt == tex) is invalid on D3D12
                 // (sampling a live RTV returns undefined data, often zeros) and a prime
@@ -4553,6 +4573,17 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 const bool s19_post_bank =
                     s15_post_lut && s19_post_bank_gpu >= 0x5e9000000ull &&
                     s19_post_bank_gpu < 0x5ee7b4000ull && s19_post_bank_dumps < 8;
+                // S19: post-draw content of the LUT fills' two zero inputs' own producers - any
+                // draw whose RT is inside the 4 MB probe image (923xxx) or the 64 KB sample-table
+                // heap's view (924xxx). Separate budgets so the bank fills cannot starve them.
+                static u32 s19_post_probe_dumps = 0;
+                static u32 s19_post_table_dumps = 0;
+                const bool s19_post_probe = s19_post_bank_gpu >= 0x516170000ull &&
+                                            s19_post_bank_gpu < 0x516170000ull + 0x408000ull &&
+                                            s19_post_probe_dumps < 6;
+                const bool s19_post_table = s19_post_bank_gpu >= 0x5d0630000ull &&
+                                            s19_post_bank_gpu < 0x5d0631000ull &&
+                                            s19_post_table_dumps < 4;
                 static std::chrono::steady_clock::time_point s15_post_start =
                     std::chrono::steady_clock::now();
                 const bool s15_post_late =
@@ -4561,10 +4592,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     s15_post_scene && s15_post_late && s15_post_scene_dumps < 4;
                 const bool s15_post_lut_budget =
                     s15_post_lut && !s19_post_bank && s15_post_lut_dumps < 8;
-                if (s15_post_scene_budget || s15_post_lut_budget || s19_post_bank) {
+                if (s15_post_scene_budget || s15_post_lut_budget || s19_post_bank || s19_post_probe ||
+                    s19_post_table) {
                     const u32 s15_post_index =
                         s15_post_scene_budget ? (930000u + ++s15_post_scene_dumps)
                         : s19_post_bank      ? (921000u + ++s19_post_bank_dumps)
+                        : s19_post_probe     ? (923000u + ++s19_post_probe_dumps)
+                        : s19_post_table     ? (924000u + ++s19_post_table_dumps)
                                              : (920000u + ++s15_post_lut_dumps);
                     LOG_WARNING(Render_D3D12,
                                 "S15 post-draw RT: gpu={:#x} res=0x{:x} {}x{} depth={} verts={} "
@@ -4573,9 +4607,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 reinterpret_cast<u64>(s15_post_res), s15_post_desc.Width,
                                 s15_post_desc.Height, depth_view != nullptr ? 1 : 0,
                                 params.num_vertices, s15_post_lut ? 1 : 0);
+                    const auto s15_post_guest_fmt =
+                        s19_post_probe ? VideoCore::Surface::PixelFormat::R16G16B16A16_FLOAT
+                        : s19_post_table ? VideoCore::Surface::PixelFormat::R32_FLOAT
+                                         : VideoCore::Surface::PixelFormat::B10G11R11_FLOAT;
                     (void)D3D12::RecordTextureContentDump(
                         m_device.GetDevice(), m_command_list, s15_post_res,
-                        static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                        static_cast<u32>(s15_post_guest_fmt),
                         static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
                         s15_post_index, true);
                     // S19 (bank LUT pass): the fills produce a zero RT although their geometry is
@@ -6080,6 +6118,23 @@ bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
         return static_cast<DAddr>(0x29426000);
     }();
     const bool s17_bank_write = addr < s17_bank_dev + 0x1a34000 && addr + size > s17_bank_dev;
+    // S19: a guest CPU store into either of the LUT fills' two zero inputs would name the writer
+    // immediately (the sample table is constant data - a CPU upload is the most likely source).
+    // Dev windows: the 256x4 table's 64 KB heap (dev 0xbaec8000) and the probe heap region
+    // (dev 0x9418a000, the 4 MB joined image at its base). Bounded 12.
+    {
+        static u32 s19_input_cpuwrite_logs = 0;
+        const auto s19_overlap = [addr, size](DAddr base, DAddr length) {
+            return addr < base + length && addr + size > base;
+        };
+        if (s19_input_cpuwrite_logs < 12 &&
+            (s19_overlap(0xbaec8000u, 0x10000u) || s19_overlap(0x9418a000u, 0x408000u))) {
+            ++s19_input_cpuwrite_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S19 input cpuwrite: dev={:#x} size={} (LUT fill input window)",
+                        static_cast<u64>(addr), size);
+        }
+    }
     {
         std::scoped_lock lock{m_buffer_cache.mutex};
         if (m_buffer_cache.OnCPUWrite(addr, size)) {

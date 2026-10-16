@@ -452,7 +452,11 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
                                  s17_overlap(0x5eb340000ull, 0x1a34000ull) ||
                                  s17_overlap(0x5ecd80000ull, 0x1a34000ull) ||
                                  s17_overlap(0x510fa0000ull, 0x100000ull) ||
-                                 s17_overlap(0x510f30000ull, 0x100000ull);
+                                 s17_overlap(0x510f30000ull, 0x100000ull) ||
+                                 // S19: the LUT fills' two zero inputs (the 256x256 RG32F
+                                 // probe and the 256x4 RGBA16F sample table).
+                                 s17_overlap(0x516170000ull, 0x408000ull) ||
+                                 s17_overlap(0x5d0630000ull, 0x10000ull);
             if (s17_hit) {
                 ++s17_memwrite_logs;
                 LOG_WARNING(Render_D3D12,
