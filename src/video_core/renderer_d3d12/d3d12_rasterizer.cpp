@@ -2943,6 +2943,61 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             stored.pipeline->State().attachments[0].enable ? 1 : 0);
             }
         }
+        // S18 cycle 8 (Phase 0.2.8): CONSECUTIVE-FRAME BURST. The 1.0.277 mid-sweep harvest
+        // proved the 3D/blur layer alternates present/black while the UI and the exposure are
+        // constant (capture_12 mean 4.1 vs capture_13 mean 84.5, identical UI, same forced
+        // exposure). This one-shot burst dumps the composite target (the flinger's SOURCE, ids
+        // 991201+) and the display buffer (its RT, ids 991301+) once per presented frame for 16
+        // consecutive frames after guest frame 12000, so the alternation's period is directly
+        // readable from consecutive ids. Dumps are flushed per present, so the transient memory
+        // stays bounded.
+        if (flinger_draw) {
+            static bool s18i_started = false;
+            static u32 s18i_frames = 0;
+            if (!s18i_started && g_s18_guest_frames > 12000) {
+                s18i_started = true;
+                LOG_WARNING(Render_D3D12,
+                            "S18I burst: starting 16 consecutive display+target dumps at "
+                            "guest_frame={}",
+                            g_s18_guest_frames);
+            }
+            if (s18i_started && s18i_frames < 16) {
+                ++s18i_frames;
+                const u32 s18i_id = 991200u + s18i_frames;
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled) {
+                        continue;
+                    }
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    if (sv.Resource() == nullptr ||
+                        static_cast<u64>(sv.GpuAddr()) != 0x5158f0000ull) {
+                        continue;
+                    }
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, sv.Resource(),
+                        static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()), s18i_id,
+                        /*force=*/true);
+                    break;
+                }
+                if (framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr &&
+                    framebuffer->ColorBuffers()[0]->Resource() != nullptr) {
+                    const u32 s18i_disp_id = 991300u + s18i_frames;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list,
+                        framebuffer->ColorBuffers()[0]->Resource(),
+                        static_cast<u32>(framebuffer->ColorBuffers()[0]->format),
+                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                        s18i_disp_id, /*force=*/true);
+                    if (s18i_frames <= 4 || (s18i_frames % 4) == 0) {
+                        LOG_WARNING(Render_D3D12,
+                                    "S18I burst frame {}: target_id={} disp_id={} disp_res=0x{:x}",
+                                    s18i_frames, s18i_id, s18i_disp_id,
+                                    reinterpret_cast<u64>(
+                                        framebuffer->ColorBuffers()[0]->Resource()));
+                    }
+                }
+            }
+        }
         // S18 cycle 6 (Phase 0.2.6): what the flinger pass actually samples - the FINISHED
         // composite (after the 3-vertex composite AND the UI draws) - dumped every 60 s together
         // with its resource pointer. If this dump matches the presented capture, the visible frame
