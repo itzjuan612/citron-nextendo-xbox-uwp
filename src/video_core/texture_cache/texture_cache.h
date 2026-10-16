@@ -645,6 +645,28 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
                             image.guest_size_bytes, s17_action, static_cast<u64>(cpu_addr), size);
             }
         }
+        // TEMP DIAGNOSTIC (S18, Phase 0.2.1): 1x1 images (the exposure candidates) fall outside
+        // the bank/mask filter above; log a write notification touching one with the action the
+        // guards below take (mark => the next sample re-uploads it; swallow-gpu => the GPU-owned
+        // guard refuses the write; pending => already queued). Bounded to 12 lines.
+        {
+            static u32 s18_tiny_notify_logs = 0;
+            if (s18_tiny_notify_logs < 12 && image.info.type == ImageType::e2D &&
+                image.info.size.width <= 2 && image.info.size.height <= 2) {
+                ++s18_tiny_notify_logs;
+                const char* const s18_action =
+                    True(image.flags & ImageFlagBits::CpuModified)  ? "pending"
+                    : True(image.flags & ImageFlagBits::GpuModified) ? "swallow-gpu"
+                                                                     : "mark";
+                LOG_WARNING(Render_D3D12,
+                            "S18 tiny notify: img={} gpu={:#x} flags={:#x} {}x{} fmt={:#x} "
+                            "write_cpu={:#x} write_size={} action={}",
+                            image_id.index, static_cast<u64>(image.gpu_addr),
+                            static_cast<u32>(image.flags), image.info.size.width,
+                            image.info.size.height, static_cast<u32>(image.info.format),
+                            static_cast<u64>(cpu_addr), size, s18_action);
+            }
+        }
         if (True(image.flags & ImageFlagBits::CpuModified)) {
             return;
         }
@@ -787,6 +809,30 @@ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
 
     Image& dst_image = slot_images[dst_id];
     Image& src_image = slot_images[src_id];
+    // TEMP DIAGNOSTIC (S18, Phase 0.2.1): Fermi2D blits with a 1x1 side - the other candidate
+    // writer of the exposure texel (a downsample chain ending in a 1x1 blit). Cap 12.
+    {
+        static u32 s18_tiny_blit_logs = 0;
+        const bool s18_dst_tiny =
+            dst_image.info.size.width <= 2 && dst_image.info.size.height <= 2;
+        const bool s18_src_tiny =
+            src_image.info.size.width <= 2 && src_image.info.size.height <= 2;
+        if (s18_tiny_blit_logs < 12 && (s18_dst_tiny || s18_src_tiny)) {
+            ++s18_tiny_blit_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S18 tiny blit: dst=({} gpu={:#x} {}x{} fmt={:#x}) src=({} gpu={:#x} "
+                        "{}x{} fmt={:#x}) src_region=({},{})-({},{}) dst_region=({},{})-({},{}) "
+                        "filter={} op={}",
+                        dst_id.index, static_cast<u64>(dst_image.gpu_addr),
+                        dst_image.info.size.width, dst_image.info.size.height,
+                        static_cast<u32>(dst_image.info.format), src_id.index,
+                        static_cast<u64>(src_image.gpu_addr), src_image.info.size.width,
+                        src_image.info.size.height, static_cast<u32>(src_image.info.format),
+                        copy.src_x0, copy.src_y0, copy.src_x1, copy.src_y1, copy.dst_x0,
+                        copy.dst_y0, copy.dst_x1, copy.dst_y1, static_cast<u32>(copy.filter),
+                        static_cast<u32>(copy.operation));
+        }
+    }
     bool is_src_rescaled = True(src_image.flags & ImageFlagBits::Rescaled);
     bool is_dst_rescaled = True(dst_image.flags & ImageFlagBits::Rescaled);
 
@@ -1340,6 +1386,27 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     } else {
         const auto copies =
             UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);
+        // TEMP DIAGNOSTIC (S18, Phase 0.2.1): an upload INTO a 1x1 R32G32B32A32 image is a
+        // candidate writer of the exposure texel. Log the exact floats being pushed into the
+        // resource (read after the unswizzle, so the bytes are what the upload uses); all-zero
+        // means the guest bytes behind the image are zero - the GPU-authored case. Cap 12.
+        {
+            static u32 s18_tiny_upload_logs = 0;
+            if (s18_tiny_upload_logs < 12 && image.info.size.width == 1 &&
+                image.info.size.height == 1 &&
+                image.info.format == PixelFormat::R32G32B32A32_FLOAT &&
+                mapped_span.size_bytes() >= 16) {
+                ++s18_tiny_upload_logs;
+                f32 s18_vals[4]{};
+                std::memcpy(s18_vals, mapped_span.data(), sizeof(s18_vals));
+                LOG_WARNING(Render_D3D12,
+                            "S18 tiny upload: gpu={:#x} size={} f=({:.6f},{:.6f},{:.6f},{:.6f}) "
+                            "bytes={:02x}{:02x}{:02x}{:02x}",
+                            static_cast<u64>(gpu_addr), image.guest_size_bytes, s18_vals[0],
+                            s18_vals[1], s18_vals[2], s18_vals[3], mapped_span[0],
+                            mapped_span[1], mapped_span[2], mapped_span[3]);
+            }
+        }
         image.UploadMemory(staging, copies);
     }
 }
@@ -2837,6 +2904,28 @@ template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
+    // TEMP DIAGNOSTIC (S18, Phase 0.2.1): a copy with a 1x1 side is a candidate writer (alias
+    // propagation) of the exposure texel. The bank filter below requires both sides > 4 KiB, so
+    // a 16-byte 1x1 copy would slip past it - this check is size-independent. Cap 12.
+    {
+        static u32 s18_tiny_copy_logs = 0;
+        const bool s18_dst_tiny =
+            dst.info.size.width == 1 && dst.info.size.height == 1;
+        const bool s18_src_tiny =
+            src.info.size.width == 1 && src.info.size.height == 1;
+        if (s18_tiny_copy_logs < 12 && (s18_dst_tiny || s18_src_tiny)) {
+            ++s18_tiny_copy_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S18 tiny copyimg: dst=({} gpu={:#x} {}x{} fmt={:#x} flags={:#x} size={}) "
+                        "src=({} gpu={:#x} {}x{} fmt={:#x} flags={:#x} size={}) copies={}",
+                        dst_id.index, static_cast<u64>(dst.gpu_addr), dst.info.size.width,
+                        dst.info.size.height, static_cast<u32>(dst.info.format),
+                        static_cast<u32>(dst.flags), dst.guest_size_bytes, src_id.index,
+                        static_cast<u64>(src.gpu_addr), src.info.size.width,
+                        src.info.size.height, static_cast<u32>(src.info.format),
+                        static_cast<u32>(src.flags), src.guest_size_bytes, copies.size());
+        }
+    }
     // TEMP DIAGNOSTIC (S17): name every texture-cache-side copy touching the 27 MB LUT bank
     // (cpu 0x29426000). This catches the JoinImages copy paths and any alias synchronisation, so
     // together with the existing 'RefreshContents upload' line it accounts for every writer of the

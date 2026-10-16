@@ -523,7 +523,13 @@ void WriteFrameCapture() {
                 out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
             }
         }
-        LOG_WARNING(Render_D3D12, "Frame capture written: {} ({}x{})", path, width, height);
+        // TEMP DIAGNOSTIC (S18, Phase 0.2.1): the guest-frame counter and the newest exposure
+        // readback are the phase fingerprint - two runs' captures can only be compared when
+        // they sit at the same guest phase (the style-screen dolly advances on guest time).
+        LOG_WARNING(Render_D3D12,
+                    "Frame capture written: {} ({}x{}) [S18 guest_frame={} expo={}]", path, width,
+                    height, g_s18_guest_frames,
+                    g_s18_last_exposure.empty() ? "none" : g_s18_last_exposure);
         ++g_frame_capture.index;
     }
     g_frame_capture.readback->Unmap(0, nullptr);
@@ -1125,6 +1131,24 @@ void WriteTextureContentDumps() {
                 LOG_WARNING(Render_D3D12, "Texture dump written: {} ({}x{}, raw {})", bin_path,
                             width, height, total_bytes);
             }
+            // TEMP DIAGNOSTIC (S18, Phase 0.2.1): a 1x1 R32G32B32A32 readback IS the exposure
+            // value (four floats, 16 bytes). Decode it from the raw bytes and keep it as the
+            // phase fingerprint for subsequent captures; the guest-memory read of this texture
+            // always returns zeros (GPU-authored), so this readback is the ground truth.
+            if (width == 1 && height == 1 && total_bytes >= 16 &&
+                (static_cast<DXGI_FORMAT>(entry.dxgi_format) ==
+                     DXGI_FORMAT_R32G32B32A32_TYPELESS ||
+                 static_cast<DXGI_FORMAT>(entry.dxgi_format) ==
+                     DXGI_FORMAT_R32G32B32A32_FLOAT)) {
+                f32 s18_expo[4]{};
+                std::memcpy(s18_expo, base, sizeof(s18_expo));
+                g_s18_last_exposure = fmt::format("{:.6f},{:.6f},{:.6f},{:.6f}", s18_expo[0],
+                                                  s18_expo[1], s18_expo[2], s18_expo[3]);
+                LOG_WARNING(Render_D3D12,
+                            "S18 EXPOSURE readback: img={} f=({:.6f},{:.6f},{:.6f},{:.6f})",
+                            entry.image_index, s18_expo[0], s18_expo[1], s18_expo[2],
+                            s18_expo[3]);
+            }
         }
         entry.readback->Unmap(0, nullptr);
     }
@@ -1146,6 +1170,12 @@ std::string GetCaptureDirectory() {
 // draw (the compositor/UI target), set in ConfigureDraw and dumped by the mid-frame scene3d
 // capture (declared in d3d12_texture_cache.h).
 Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_ui;
+
+// TEMP DIAGNOSTIC (S18, Phase 0.2.1): phase fingerprints for captures (declared in
+// d3d12_capture.h). Both are only touched from the GPU thread (TickFrame / RenderBlit /
+// WriteTextureContentDumps all run inside RendererD3D12::Composite), so no locking is needed.
+u64 g_s18_guest_frames = 0;
+std::string g_s18_last_exposure;
 
 void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
                                   ID3D12Resource* src) {

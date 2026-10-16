@@ -29,4 +29,18 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
                               u32 guest_format, u64 guest_addr, u32 image_index,
                               bool force = false);
 
+/// TEMP DIAGNOSTIC (S18, Phase 0.2.1): guest frame counter, incremented once per guest present
+/// in RasterizerD3D12::TickFrame (RendererD3D12::Composite calls it once per guest frame, while
+/// the S17 "perf" probe counts HOST presents - the two rates differ by a large factor). Every
+/// "Frame capture written" line carries it so captures can be sorted by guest phase: the
+/// style-screen camera dolly advances on guest time, which makes wall-clock timestamps useless
+/// for cross-run comparisons.
+extern u64 g_s18_guest_frames;
+
+/// TEMP DIAGNOSTIC (S18, Phase 0.2.1): the float4 of the newest 1x1 R32G32B32A32 exposure
+/// readback, written by WriteTextureContentDumps and appended to every "Frame capture written"
+/// line. The guest-memory read of that texture always returns zeros (GPU-authored - standing
+/// trap), so the resource readback is the only ground truth for the value.
+extern std::string g_s18_last_exposure;
+
 } // namespace D3D12

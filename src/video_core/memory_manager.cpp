@@ -462,6 +462,28 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
             }
         }
     }
+    // TEMP DIAGNOSTIC (S18, Phase 0.2.1): the two 1x1 R32G32B32A32 exposure textures seen so
+    // far (gpu 0x5d5445100 = the texel the scene composite samples, decoded (.03125,.03125,
+    // .03125,3.0); 0x5e8728480 = a second 1x1 sampled by the big draws). A DMA / KeplerMemory
+    // inline-upload write landing in a 4 KiB window around either would name the exposure
+    // writer - no previous probe covered WriteBlock* for these VAs. Bounded to 12 lines.
+    {
+        static u32 s18_memwrite_logs = 0;
+        if (s18_memwrite_logs < 12) {
+            const u64 s18_len = size != 0 ? size : 1;
+            const u64 s18_end = gpu_dest_addr + s18_len;
+            const bool s18_hit =
+                (gpu_dest_addr < 0x5d5446000ull && s18_end > 0x5d5445000ull) ||
+                (gpu_dest_addr < 0x5e8729000ull && s18_end > 0x5e8728000ull);
+            if (s18_hit) {
+                ++s18_memwrite_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S18 EXPO memwrite: gpu={:#x} size={} safe={} which={:#x}",
+                            static_cast<u64>(gpu_dest_addr), size, is_safe ? 1 : 0,
+                            static_cast<u32>(which));
+            }
+        }
+    }
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index,
                             [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;

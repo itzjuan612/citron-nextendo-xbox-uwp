@@ -689,23 +689,33 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         skip_reason != nullptr ? 1 : 0, unbound ? 1 : 0,
                         stored.pipeline->State().attachments[0].raw, params.num_vertices);
         }
-        // S17 cycle 5 (Phase 0.2): name the draw-side writer of the 1x1 R32G32B32A32 exposure
-        // input. Cap 12.
-        static u32 s17_expo_writer_logs = 0;
-        if (view != nullptr && s17_expo_writer_logs < 12 && view->size.width == 1 &&
-            view->size.height == 1 &&
-            view->format == VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
-            ++s17_expo_writer_logs;
-            LOG_WARNING(Render_D3D12,
-                        "S17 EXPO writer: draw rt slot={} gpu={:#x} res=0x{:x} att={:#x} "
-                        "verts={} vp=({},{},{},{})",
-                        i, static_cast<u64>(view->GpuAddr()),
-                        reinterpret_cast<u64>(view->Resource()),
-                        stored.pipeline->State().attachments[0].raw, params.num_vertices,
-                        MakeViewport(maxwell3d->regs).TopLeftX,
-                        MakeViewport(maxwell3d->regs).TopLeftY,
-                        MakeViewport(maxwell3d->regs).Width,
-                        MakeViewport(maxwell3d->regs).Height);
+        // S18 (Phase 0.2.1) - replaces the S17 "EXPO writer" draw tracer, which required
+        // `format == R32G32B32A32_FLOAT` AND a 1x1 view size and NEVER fired in the 1.0.270
+        // run even though the "Draw RTs" decimation shows a recurring 3-vertex draw with
+        // vp=(0,0,1,1) rendering into gpu=[0x5d5445100] (ids=[3961:0x182e9d0fda0]) - the
+        // 1x1-viewport final reduction pass that produces the exposure texel. Log ANY tiny
+        // color RT bind (<= 2x2) plus the two 1x1 exposure VAs regardless of size/format, so
+        // the writer is named even when the RT view's PixelFormat differs from the sampled
+        // view's. Pre-guard placement: a draw the guards reject below still logs. Cap 24.
+        static u32 s18_tiny_rt_logs = 0;
+        if (view != nullptr && s18_tiny_rt_logs < 24) {
+            const u64 s18_rt_gpu = static_cast<u64>(view->GpuAddr());
+            const bool s18_tiny = view->size.width <= 2 && view->size.height <= 2;
+            const bool s18_expo_va = s18_rt_gpu == 0x5d5445100ull || s18_rt_gpu == 0x5e8728480ull;
+            if (s18_tiny || s18_expo_va) {
+                ++s18_tiny_rt_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S18 tiny RT: slot={} img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
+                            "att={:#x} verts={} vp=({},{},{},{})",
+                            i, view->image_id.index, s18_rt_gpu,
+                            reinterpret_cast<u64>(view->Resource()), view->size.width,
+                            view->size.height, static_cast<u32>(view->format),
+                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                            MakeViewport(maxwell3d->regs).TopLeftX,
+                            MakeViewport(maxwell3d->regs).TopLeftY,
+                            MakeViewport(maxwell3d->regs).Width,
+                            MakeViewport(maxwell3d->regs).Height);
+            }
         }
         if (skip_reason != nullptr) {
             if (!logged_rt_hole) {
@@ -2917,41 +2927,71 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                 }
             }
-            // S17 cycle 5 (Phase 0.2): exposure-value timeline. The 1.0.268 EXPO probe (forcing
-            // the 1x1 R32G32B32A32 texture to 1.0) brightened the whole frame; with the probes
-            // off (1.0.269) the frame is under-lit again. Log the raw float4 of that texture
-            // once per 60 s (non-destructive, 16-byte guest read) to see the value's timeline
-            // and test it against the reference brightness. Cap 24.
+            // S18 (Phase 0.2.1) - replaces the S17 "EXPOSURE value" guest read, which always
+            // printed zeros (GPU-authored texture - the standing trap). The live value can only
+            // come from a resource readback, so every 60 s force a texdump of EVERY distinct
+            // sampled 1x1 R32G32B32A32 view (the composite samples one such texel; a second 1x1
+            // is sampled by the big draws). The .bin sidecar and the "S18 EXPOSURE readback"
+            // line in WriteTextureContentDumps carry the floats. Ids 990001+; cap 48 dumps
+            // (2 per minute -> ~24 min of timeline). A one-shot census enumerates every cached
+            // image registered over the first 1x1's guest bytes (the alias/incarnation set).
             {
-                static std::chrono::steady_clock::time_point s17_expo_last =
+                static std::chrono::steady_clock::time_point s18_expo_last =
                     std::chrono::steady_clock::now();
-                static u32 s17_expo_logs = 0;
-                if (s17_expo_logs < 24 &&
-                    std::chrono::steady_clock::now() - s17_expo_last >
+                static u32 s18_expo_dumps = 0;
+                static bool s18_expo_census_done = false;
+                if (s18_expo_dumps < 48 &&
+                    std::chrono::steady_clock::now() - s18_expo_last >
                         std::chrono::seconds(60)) {
+                    s18_expo_last = std::chrono::steady_clock::now();
                     for (const DrawSlot& slot : res_slots) {
                         if (slot.kind != SlotKind::Sampled) {
                             continue;
                         }
                         ImageView& xv = m_texture_cache.GetImageView(slot.view);
                         if (xv.size.width != 1 || xv.size.height != 1 ||
-                            xv.format != VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
+                            xv.format != VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT ||
+                            xv.Resource() == nullptr) {
                             continue;
                         }
-                        std::array<f32, 4> v{};
-                        if (gpu_memory != nullptr) {
-                            gpu_memory->ReadBlock(static_cast<GPUVAddr>(xv.GpuAddr()), v.data(),
-                                                  sizeof(v),
-                                                  VideoCommon::CacheType::NoTextureCache);
-                        }
-                        s17_expo_last = std::chrono::steady_clock::now();
-                        ++s17_expo_logs;
+                        ++s18_expo_dumps;
+                        const u32 s18_expo_id = 990000u + s18_expo_dumps;
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, xv.Resource(),
+                            static_cast<u32>(xv.format), static_cast<u64>(xv.GpuAddr()),
+                            s18_expo_id, /*force=*/true);
                         LOG_WARNING(Render_D3D12,
-                                    "S17 EXPOSURE value: gpu={:#x} res=0x{:x} "
-                                    "f=({:.4f},{:.4f},{:.4f},{:.4f})",
+                                    "S18 EXPO dump: id={} img={} gpu={:#x} res=0x{:x}",
+                                    s18_expo_id, xv.image_id.index,
                                     static_cast<u64>(xv.GpuAddr()),
-                                    reinterpret_cast<u64>(xv.Resource()), v[0], v[1], v[2], v[3]);
-                        break;
+                                    reinterpret_cast<u64>(xv.Resource()));
+                        if (!s18_expo_census_done && gpu_memory != nullptr) {
+                            s18_expo_census_done = true;
+                            const std::optional<DAddr> s18_expo_cpu =
+                                gpu_memory->GpuToCpuAddress(
+                                    static_cast<GPUVAddr>(xv.GpuAddr()));
+                            LOG_WARNING(Render_D3D12, "S18 EXPO census: gpu={:#x} cpu={:#x}",
+                                        static_cast<u64>(xv.GpuAddr()),
+                                        s18_expo_cpu ? static_cast<u64>(*s18_expo_cpu) : 0ull);
+                            if (s18_expo_cpu) {
+                                m_texture_cache.ForEachImageInRegion(
+                                    *s18_expo_cpu, 16,
+                                    [&](VideoCommon::ImageId s18_image_id, auto& s18_image) {
+                                        LOG_WARNING(
+                                            Render_D3D12,
+                                            "S18 EXPO census: img={} gpu={:#x} size={} flags={:#x} "
+                                            "{}x{} fmt={:#x} tick={}",
+                                            s18_image_id.index,
+                                            static_cast<u64>(s18_image.gpu_addr),
+                                            s18_image.guest_size_bytes,
+                                            static_cast<u32>(s18_image.flags),
+                                            s18_image.info.size.width,
+                                            s18_image.info.size.height,
+                                            static_cast<u32>(s18_image.info.format),
+                                            s18_image.modification_tick);
+                                    });
+                            }
+                        }
                     }
                 }
             }
@@ -4306,6 +4346,30 @@ void RasterizerD3D12::Clear(u32 layer_count) {
                 }
             }
         }
+        {
+            // TEMP DIAGNOSTIC (S18, Phase 0.2.1): clear-path writer of the 1x1 R32G32B32A32
+            // exposure textures. The S17 draw/compute tracer pairs saw 0 binds for a 1x1, so a
+            // clear is a remaining candidate (the whole-image clear value would BE the texel).
+            // Keyed on the two 1x1 exposure VAs and on any tiny RT. Cap 12.
+            static u32 s18_tiny_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr && s18_tiny_clear_logs < 12) {
+                const u64 s18_clear_gpu = static_cast<u64>(view->GpuAddr());
+                const bool s18_tiny = view->size.width <= 2 && view->size.height <= 2;
+                const bool s18_expo_va =
+                    s18_clear_gpu == 0x5d5445100ull || s18_clear_gpu == 0x5e8728480ull;
+                if (s18_tiny || s18_expo_va) {
+                    ++s18_tiny_clear_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S18 tiny clear: img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
+                                "color=({},{},{},{}) scissor={}",
+                                view->image_id.index, s18_clear_gpu,
+                                reinterpret_cast<u64>(resource), view->size.width,
+                                view->size.height, static_cast<u32>(view->format),
+                                regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                                regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0);
+                }
+            }
+        }
         if (view != nullptr && resource != nullptr && view->RenderTarget().ptr != 0) {
             // Clear-value conversion mirrors RasterizerVulkan::Clear: regs.clear_color is
             // a std::array<f32, 4>, so a non-integer render target takes its components
@@ -5265,6 +5329,10 @@ void RasterizerD3D12::FlushCommands() {
     }
 }
 void RasterizerD3D12::TickFrame() {
+    // TEMP DIAGNOSTIC (S18, Phase 0.2.1): guest-frame counter. RendererD3D12::Composite calls
+    // this once per guest present request (not per host present - the S17 "perf" probe counts
+    // those), so this is the guest's frame count; captures carry it as their phase fingerprint.
+    ++g_s18_guest_frames;
     // Detect a GPU hang/TDR before it can silently kill the process: D3D12 exposes the
     // removal reason here, and this log is the only in-app trace (fail-fast paths never
     // reach the crash/terminate handlers).
