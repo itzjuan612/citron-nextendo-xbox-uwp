@@ -2619,10 +2619,160 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             break;
                         }
                         if (g_s18_target_res == nullptr && s15_comp_res != nullptr &&
-                            g_s18_target_used < 8) {
+                            g_s18_target_used < 40) {
                             g_s18_target_res = s15_comp_res;
                             LOG_WARNING(Render_D3D12, "S18B target dump armed: res=0x{:x}",
                                         reinterpret_cast<u64>(s15_comp_res));
+                        }
+                    }
+                }
+                // S18 cycle 5 (Phase 0.2.5): matched input set for every capture phase. The
+                // composite's other two inputs - the 960x540 B10G11R11 scene RT and the 240x136
+                // blur - are dumped on the same 60 s cadence as the exposure texel, so a phase's
+                // visible frame (capture) can be compared directly against the exact inputs the
+                // 3-vertex composite consumed. Ids 990801+ (scene) / 990901+ (blur); cap 30 each.
+                {
+                    static std::chrono::steady_clock::time_point s18d_last =
+                        std::chrono::steady_clock::now();
+                    static u32 s18d_scene_dumps = 0;
+                    static u32 s18d_blur_dumps = 0;
+                    if ((s18d_scene_dumps < 30 || s18d_blur_dumps < 30) &&
+                        std::chrono::steady_clock::now() - s18d_last >
+                            std::chrono::seconds(60)) {
+                        s18d_last = std::chrono::steady_clock::now();
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                            if (sv.Resource() == nullptr ||
+                                sv.format !=
+                                    VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+                                continue;
+                            }
+                            if (sv.size.width == 960 && sv.size.height == 540 &&
+                                s18d_scene_dumps < 30) {
+                                ++s18d_scene_dumps;
+                                const u32 s18d_id = 990800u + s18d_scene_dumps;
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, sv.Resource(),
+                                    static_cast<u32>(sv.format),
+                                    static_cast<u64>(sv.GpuAddr()), s18d_id, /*force=*/true);
+                                LOG_WARNING(Render_D3D12,
+                                            "S18D scene input: id={} img={} gpu={:#x} {}x{}",
+                                            s18d_id, sv.image_id.index,
+                                            static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                            sv.size.height);
+                            } else if (sv.size.width == 240 && sv.size.height == 136 &&
+                                       s18d_blur_dumps < 30) {
+                                ++s18d_blur_dumps;
+                                const u32 s18d_id = 990900u + s18d_blur_dumps;
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, sv.Resource(),
+                                    static_cast<u32>(sv.format),
+                                    static_cast<u64>(sv.GpuAddr()), s18d_id, /*force=*/true);
+                                LOG_WARNING(Render_D3D12,
+                                            "S18D blur input: id={} img={} gpu={:#x} {}x{}",
+                                            s18d_id, sv.image_id.index,
+                                            static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                            sv.size.height);
+                            }
+                        }
+                    }
+                }
+                // S18 cycle 5 (Phase 0.2.5): PHASE-GATED SAME-RUN EXPOSURE A/B (the clean causal
+                // test the plan asks for). The auto-exposure is display-referred and
+                // self-referencing - a dark composite yields an empty histogram, which yields
+                // ~zero exposure, which keeps the composite dark - and the settled phase sits at
+                // a stable 3/64 that only leaves the brightest HDR objects (the fish fins)
+                // visible. Once past guest frame 12500 (after the load, camera settled), force
+                // the composite's sampled 1x1 to 1.0 for 150 s, then to 8.0 for 150 s, then stop
+                // and let the game's loop resume: the captures before/during/after sit at the
+                // SAME camera phase, so the difference is purely the exposure. Bounded: one
+                // window, and the clears are logged at a 1-in-64 cadence.
+                {
+                    static bool s18ab_started = false;
+                    static bool s18ab_second = false;
+                    static bool s18ab_done = false;
+                    static std::chrono::steady_clock::time_point s18ab_t0{};
+                    static u32 s18ab_clears = 0;
+                    if (!s18ab_started && g_s18_guest_frames > 12500) {
+                        s18ab_started = true;
+                        s18ab_t0 = std::chrono::steady_clock::now();
+                        LOG_WARNING(Render_D3D12,
+                                    "S18 EXPOSURE A/B: forcing the composite 1x1 to 1.0 for 150 s "
+                                    "(guest_frame={})",
+                                    g_s18_guest_frames);
+                    }
+                    const auto s18ab_elapsed =
+                        std::chrono::steady_clock::now() - s18ab_t0;
+                    if (s18ab_started && !s18ab_done && !s18ab_second &&
+                        s18ab_elapsed > std::chrono::seconds(150)) {
+                        s18ab_second = true;
+                        LOG_WARNING(Render_D3D12,
+                                    "S18 EXPOSURE A/B: switching to 8.0 for 150 s (clears={})",
+                                    s18ab_clears);
+                    }
+                    if (s18ab_started && !s18ab_done && s18ab_second &&
+                        s18ab_elapsed > std::chrono::seconds(300)) {
+                        s18ab_done = true;
+                        LOG_WARNING(Render_D3D12,
+                                    "S18 EXPOSURE A/B: window closed after {} clears (game loop "
+                                    "resumes)",
+                                    s18ab_clears);
+                    }
+                    const bool s18ab_armed = s18ab_started && !s18ab_done;
+                    if (s18ab_armed) {
+                        const f32 s18ab_value = s18ab_second ? 8.0f : 1.0f;
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ImageView& xv = m_texture_cache.GetImageView(slot.view);
+                            if (xv.size.width != 1 || xv.size.height != 1 ||
+                                xv.format !=
+                                    VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT ||
+                                xv.Resource() == nullptr) {
+                                continue;
+                            }
+                            ID3D12Resource* const s18ab_res = xv.Resource();
+                            // Own 1-descriptor RTV heap (the runtime's is private).
+                            static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s18ab_heap;
+                            if (!s18ab_heap) {
+                                D3D12_DESCRIPTOR_HEAP_DESC s18ab_hd{};
+                                s18ab_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                                s18ab_hd.NumDescriptors = 1;
+                                s18ab_hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+                                (void)m_device.GetDevice()->CreateDescriptorHeap(
+                                    &s18ab_hd, IID_PPV_ARGS(&s18ab_heap));
+                            }
+                            if (s18ab_heap) {
+                                const D3D12_CPU_DESCRIPTOR_HANDLE s18ab_rtv =
+                                    s18ab_heap->GetCPUDescriptorHandleForHeapStart();
+                                D3D12_RENDER_TARGET_VIEW_DESC s18ab_rd{};
+                                s18ab_rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                                s18ab_rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                                m_device.GetDevice()->CreateRenderTargetView(
+                                    s18ab_res, &s18ab_rd, s18ab_rtv);
+                                m_command_list.Transition(s18ab_res,
+                                                          D3D12_RESOURCE_STATE_COMMON,
+                                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                const f32 s18ab_color[4] = {s18ab_value, s18ab_value,
+                                                            s18ab_value, 1.0f};
+                                m_command_list.ClearRenderTargetView(s18ab_rtv, s18ab_color);
+                                m_command_list.Transition(s18ab_res,
+                                                          D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                                          D3D12_RESOURCE_STATE_COMMON);
+                                ++s18ab_clears;
+                                if (s18ab_clears <= 4 || (s18ab_clears % 64) == 0) {
+                                    LOG_WARNING(Render_D3D12,
+                                                "S18 EXPOSURE A/B: forced {} on img={} gpu={:#x} "
+                                                "(n={})",
+                                                s18ab_value, xv.image_id.index,
+                                                static_cast<u64>(xv.GpuAddr()), s18ab_clears);
+                                }
+                            }
+                            break;
                         }
                     }
                 }
@@ -4131,7 +4281,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // 8294400) while the visible frame is a bright smear; this turns that single
             // observation into a 60 s-cadence timeline paired with the exposure readbacks.
             if (g_s18_target_res != nullptr && s15_post_res == g_s18_target_res &&
-                g_s18_target_used < 8) {
+                g_s18_target_used < 40) {
                 ++g_s18_target_used;
                 const u32 s18_target_id = 990200u + g_s18_target_used;
                 (void)D3D12::RecordTextureContentDump(
@@ -4142,6 +4292,34 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 LOG_WARNING(Render_D3D12, "S18B target dump: id={} res=0x{:x}", s18_target_id,
                             reinterpret_cast<u64>(s15_post_res));
                 g_s18_target_res = nullptr;
+            }
+            // S18 cycle 5 (Phase 0.2.5): the DISPLAY buffer (the flinger's render target) dumped
+            // on a 60 s cadence - the visible frame's own GPU content, so each capture can be
+            // compared against the resource it was blitted from (and against the composite
+            // target it was composed from). Ids 991001+; cap 30.
+            {
+                static std::chrono::steady_clock::time_point s18e_last =
+                    std::chrono::steady_clock::now();
+                static u32 s18e_dumps = 0;
+                bool s18e_is_display = false;
+                for (ID3D12Resource* const s18e_r : g_display_resources) {
+                    if (s18e_r != nullptr && s18e_r == s15_post_res) {
+                        s18e_is_display = true;
+                    }
+                }
+                if (s18e_is_display && s18e_dumps < 30 &&
+                    std::chrono::steady_clock::now() - s18e_last > std::chrono::seconds(60)) {
+                    s18e_last = std::chrono::steady_clock::now();
+                    ++s18e_dumps;
+                    const u32 s18e_id = 991000u + s18e_dumps;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, s15_post_res,
+                        static_cast<u32>(framebuffer->ColorBuffers()[0]->format),
+                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()), s18e_id,
+                        /*force=*/true);
+                    LOG_WARNING(Render_D3D12, "S18E display dump: id={} res=0x{:x}", s18e_id,
+                                reinterpret_cast<u64>(s15_post_res));
+                }
             }
         }
     }
