@@ -2720,66 +2720,50 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         }
                     }
                 }
-                // S18 cycle 5 (Phase 0.2.5): PHASE-GATED SAME-RUN EXPOSURE A/B (the clean causal
-                // test the plan asks for). The auto-exposure is display-referred and
-                // self-referencing - a dark composite yields an empty histogram, which yields
-                // ~zero exposure, which keeps the composite dark - and the settled phase sits at
-                // a stable 3/64 that only leaves the brightest HDR objects (the fish fins)
-                // visible. Once past guest frame 12500 (after the load, camera settled), force
-                // the composite's sampled 1x1 to 1.0 for 150 s, then to 8.0 for 150 s, then stop
-                // and let the game's loop resume: the captures before/during/after sit at the
-                // SAME camera phase, so the difference is purely the exposure. Bounded: one
-                // window, and the clears are logged at a 1-in-64 cadence.
+                // S18 cycle 9 (Phase 0.2.9): CAUSAL PROBE - blank the composite's BLUR input.
+                // The settled frame (1.0.277 end-of-sweep) is a stable washed blur: crisp UI + a
+                // heavily blurred scene backdrop, with the SHARP 3D scene invisible because the
+                // composite scales it by the small exposure (~1/64) while the 240x136 blur term
+                // is mixed in unscaled (session 16: "the composite mixes the 240x136 buffer
+                // heavily; the reference only blurs the far background"). If clearing that blur
+                // input to black for 120 s (once, after guest frame 12500) makes the sharp 3D
+                // scene appear, the blur-mix hypothesis is proven and the fix target is the blur
+                // weight/scale rather than the exposure. One window, clears logged 1-in-64.
                 {
                     // S18 cycle 7 (Phase 0.2.7): the sweep is 5 log steps of 150 s each (0.03125 ->
                     // 2.53), preserving the game's alpha (3.0). The 1.0.275 A/B forced alpha=1.0,
                     // which is a real confound (the game's texel alpha drifts 2.60 -> 3.0), and it
                     // used only two points (1.0, 8.0) which is too coarse to read a transfer curve.
-                    static constexpr f32 kS18AbSteps[5] = {0.03125f, 0.09375f, 0.28125f, 0.84375f,
-                                                           2.53125f};
                     static bool s18ab_started = false;
                     static bool s18ab_done = false;
                     static std::chrono::steady_clock::time_point s18ab_t0{};
-                    static u32 s18ab_step = 0;
                     static u32 s18ab_clears = 0;
                     if (!s18ab_started && g_s18_guest_frames > 12500) {
                         s18ab_started = true;
                         s18ab_t0 = std::chrono::steady_clock::now();
                         LOG_WARNING(Render_D3D12,
-                                    "S18 EXPOSURE A/B: sweep start at {} for 150 s (guest_frame={}, "
-                                    "alpha kept at 3.0)",
-                                    kS18AbSteps[0], g_s18_guest_frames);
+                                    "S18 BLUR probe: forcing the composite's 240x136 blur input to "
+                                    "black for 120 s (guest_frame={})",
+                                    g_s18_guest_frames);
                     }
-                    const auto s18ab_elapsed = std::chrono::steady_clock::now() - s18ab_t0;
-                    if (s18ab_started && !s18ab_done) {
-                        const u32 s18ab_want = static_cast<u32>(
-                            std::chrono::duration_cast<std::chrono::seconds>(s18ab_elapsed)
-                                .count() /
-                            150);
-                        if (s18ab_want >= 5) {
-                            s18ab_done = true;
-                            LOG_WARNING(Render_D3D12,
-                                        "S18 EXPOSURE A/B: sweep done after {} clears (game loop "
-                                        "resumes)",
-                                        s18ab_clears);
-                        } else if (s18ab_want != s18ab_step) {
-                            s18ab_step = s18ab_want;
-                            LOG_WARNING(Render_D3D12,
-                                        "S18 EXPOSURE A/B: step {} -> {} (clears={})",
-                                        s18ab_step, kS18AbSteps[s18ab_step], s18ab_clears);
-                        }
+                    if (s18ab_started && !s18ab_done &&
+                        std::chrono::steady_clock::now() - s18ab_t0 > std::chrono::seconds(120)) {
+                        s18ab_done = true;
+                        LOG_WARNING(Render_D3D12, "S18 BLUR probe: window closed after {} clears",
+                                    s18ab_clears);
                     }
                     const bool s18ab_armed = s18ab_started && !s18ab_done;
                     if (s18ab_armed) {
-                        const f32 s18ab_value = kS18AbSteps[s18ab_step];
                         for (const DrawSlot& slot : res_slots) {
                             if (slot.kind != SlotKind::Sampled) {
                                 continue;
                             }
                             ImageView& xv = m_texture_cache.GetImageView(slot.view);
-                            if (xv.size.width != 1 || xv.size.height != 1 ||
+                            // S18 cycle 9: the composite's BLUR input (240x136 B10G11R11), not
+                            // the 1x1 exposure texel the cycle-5/7 A/B used.
+                            if (xv.size.width != 240 || xv.size.height != 136 ||
                                 xv.format !=
-                                    VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT ||
+                                    VideoCore::Surface::PixelFormat::B10G11R11_FLOAT ||
                                 xv.Resource() == nullptr) {
                                 continue;
                             }
@@ -2798,17 +2782,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 const D3D12_CPU_DESCRIPTOR_HANDLE s18ab_rtv =
                                     s18ab_heap->GetCPUDescriptorHandleForHeapStart();
                                 D3D12_RENDER_TARGET_VIEW_DESC s18ab_rd{};
-                                s18ab_rd.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+                                s18ab_rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
                                 s18ab_rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
                                 m_device.GetDevice()->CreateRenderTargetView(
                                     s18ab_res, &s18ab_rd, s18ab_rtv);
                                 m_command_list.Transition(s18ab_res,
                                                           D3D12_RESOURCE_STATE_COMMON,
                                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
-                                // alpha 3.0 = the game's own texel alpha (it drifts 2.60 -> 3.0);
-                                // alpha=1.0 was the 1.0.275 build's confound.
-                                const f32 s18ab_color[4] = {s18ab_value, s18ab_value,
-                                                            s18ab_value, 3.0f};
+                                const f32 s18ab_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                                 m_command_list.ClearRenderTargetView(s18ab_rtv, s18ab_color);
                                 m_command_list.Transition(s18ab_res,
                                                           D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -2816,9 +2797,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 ++s18ab_clears;
                                 if (s18ab_clears <= 4 || (s18ab_clears % 64) == 0) {
                                     LOG_WARNING(Render_D3D12,
-                                                "S18 EXPOSURE A/B: forced {} on img={} gpu={:#x} "
+                                                "S18 BLUR probe: forced black on img={} gpu={:#x} "
                                                 "(n={})",
-                                                s18ab_value, xv.image_id.index,
+                                                xv.image_id.index,
                                                 static_cast<u64>(xv.GpuAddr()), s18ab_clears);
                                 }
                             }
