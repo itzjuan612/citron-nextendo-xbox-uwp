@@ -62,6 +62,15 @@ std::atomic<u32> g_s15_flush_draws{0};
 // from the GPU thread (ConfigureDraw), like the flush flags above.
 bool g_s15_composite_target_dump = false;
 
+// TEMP DIAGNOSTIC (S18 cycle 7, Phase 0.2.7): the composite target's resource pointer as last
+// seen by `RasterizerD3D12::Clear` (the guest clears it to (0,0,0,0) full-screen every frame),
+// plus a clear counter. The brightness downscale (rt 192x108) and the flinger draw can then be
+// compared against it in one log line - if the downscale samples this resource while it is in
+// its cleared state, the auto-exposure loop is structurally starved (it measures a cleared
+// frame); if it samples a different resource, the readers/writers disagree after all.
+ID3D12Resource* g_s18_cleared_composite = nullptr;
+u32 g_s18_clear_count = 0;
+
 // TEMP DIAGNOSTIC (S18 cycle 3, Phase 0.2.3): repeated post-draw dumps of the composite target.
 // `g_s18_target_res` non-null = armed for that exact resource (set every 60 s by the composite
 // branch); the post-draw probe dumps it once and clears it. `g_s18_target_used` counts dumps
@@ -2358,6 +2367,37 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 rt_gpu, sv.image_id.index, gpu, sv.size.width, sv.size.height,
                                 static_cast<u32>(sv.format), depth_view != nullptr ? 1 : 0);
                 }
+                // S18 cycle 6 (Phase 0.2.6): the brightness downscale (rt 0x5101a0000, 192x108)
+                // reading the composite-target VA - log the resource pointer it samples so it can
+                // be compared with the pointer the composite/UI draws write (S18B target dump) and
+                // the one the flinger samples (S18F flinger sample). Three readers, one VA: this
+                // line settles whether they disagree. Cap 12.
+                {
+                    // S18 cycle 7: the brightness downscale identified by its RT SIZE (192x108)
+                    // sampling a 1920x1080 target, independent of VA drift, with the resource
+                    // pointers of both sides and whether the sampled resource is the one the
+                    // guest just cleared (g_s18_cleared_composite). Cap 24.
+                    const bool s18g_rt_down =
+                        framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr &&
+                        framebuffer->ColorBuffers()[0]->size.width == 192 &&
+                        framebuffer->ColorBuffers()[0]->size.height == 108;
+                    if (s18g_rt_down && sv.Resource() != nullptr && sv.size.width >= 1920 &&
+                        sv.size.height >= 1080) {
+                        static u32 s18g_logs = 0;
+                        if (s18g_logs < 24) {
+                            ++s18g_logs;
+                            LOG_WARNING(Render_D3D12,
+                                        "S18G downscale sample: img={} src_res=0x{:x} {}x{} "
+                                        "fmt={:#x} cleared_res=0x{:x} clears={} same={}",
+                                        sv.image_id.index, reinterpret_cast<u64>(sv.Resource()),
+                                        sv.size.width, sv.size.height,
+                                        static_cast<u32>(sv.format),
+                                        reinterpret_cast<u64>(g_s18_cleared_composite),
+                                        g_s18_clear_count,
+                                        sv.Resource() == g_s18_cleared_composite ? 1 : 0);
+                        }
+                    }
+                }
                 // TEMP DIAGNOSTIC (session 15): the 1080p scene source is finally sampled only
                 // once the game is fully loaded; force a dump and a mid-frame capture of it
                 // repeatedly after 20 minutes (every ~4 min, cap 6), when the under-lit frame
@@ -2691,39 +2731,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // SAME camera phase, so the difference is purely the exposure. Bounded: one
                 // window, and the clears are logged at a 1-in-64 cadence.
                 {
+                    // S18 cycle 7 (Phase 0.2.7): the sweep is 5 log steps of 150 s each (0.03125 ->
+                    // 2.53), preserving the game's alpha (3.0). The 1.0.275 A/B forced alpha=1.0,
+                    // which is a real confound (the game's texel alpha drifts 2.60 -> 3.0), and it
+                    // used only two points (1.0, 8.0) which is too coarse to read a transfer curve.
+                    static constexpr f32 kS18AbSteps[5] = {0.03125f, 0.09375f, 0.28125f, 0.84375f,
+                                                           2.53125f};
                     static bool s18ab_started = false;
-                    static bool s18ab_second = false;
                     static bool s18ab_done = false;
                     static std::chrono::steady_clock::time_point s18ab_t0{};
+                    static u32 s18ab_step = 0;
                     static u32 s18ab_clears = 0;
                     if (!s18ab_started && g_s18_guest_frames > 12500) {
                         s18ab_started = true;
                         s18ab_t0 = std::chrono::steady_clock::now();
                         LOG_WARNING(Render_D3D12,
-                                    "S18 EXPOSURE A/B: forcing the composite 1x1 to 1.0 for 150 s "
-                                    "(guest_frame={})",
-                                    g_s18_guest_frames);
+                                    "S18 EXPOSURE A/B: sweep start at {} for 150 s (guest_frame={}, "
+                                    "alpha kept at 3.0)",
+                                    kS18AbSteps[0], g_s18_guest_frames);
                     }
-                    const auto s18ab_elapsed =
-                        std::chrono::steady_clock::now() - s18ab_t0;
-                    if (s18ab_started && !s18ab_done && !s18ab_second &&
-                        s18ab_elapsed > std::chrono::seconds(150)) {
-                        s18ab_second = true;
-                        LOG_WARNING(Render_D3D12,
-                                    "S18 EXPOSURE A/B: switching to 8.0 for 150 s (clears={})",
-                                    s18ab_clears);
-                    }
-                    if (s18ab_started && !s18ab_done && s18ab_second &&
-                        s18ab_elapsed > std::chrono::seconds(300)) {
-                        s18ab_done = true;
-                        LOG_WARNING(Render_D3D12,
-                                    "S18 EXPOSURE A/B: window closed after {} clears (game loop "
-                                    "resumes)",
-                                    s18ab_clears);
+                    const auto s18ab_elapsed = std::chrono::steady_clock::now() - s18ab_t0;
+                    if (s18ab_started && !s18ab_done) {
+                        const u32 s18ab_want = static_cast<u32>(
+                            std::chrono::duration_cast<std::chrono::seconds>(s18ab_elapsed)
+                                .count() /
+                            150);
+                        if (s18ab_want >= 5) {
+                            s18ab_done = true;
+                            LOG_WARNING(Render_D3D12,
+                                        "S18 EXPOSURE A/B: sweep done after {} clears (game loop "
+                                        "resumes)",
+                                        s18ab_clears);
+                        } else if (s18ab_want != s18ab_step) {
+                            s18ab_step = s18ab_want;
+                            LOG_WARNING(Render_D3D12,
+                                        "S18 EXPOSURE A/B: step {} -> {} (clears={})",
+                                        s18ab_step, kS18AbSteps[s18ab_step], s18ab_clears);
+                        }
                     }
                     const bool s18ab_armed = s18ab_started && !s18ab_done;
                     if (s18ab_armed) {
-                        const f32 s18ab_value = s18ab_second ? 8.0f : 1.0f;
+                        const f32 s18ab_value = kS18AbSteps[s18ab_step];
                         for (const DrawSlot& slot : res_slots) {
                             if (slot.kind != SlotKind::Sampled) {
                                 continue;
@@ -2757,8 +2805,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 m_command_list.Transition(s18ab_res,
                                                           D3D12_RESOURCE_STATE_COMMON,
                                                           D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                // alpha 3.0 = the game's own texel alpha (it drifts 2.60 -> 3.0);
+                                // alpha=1.0 was the 1.0.275 build's confound.
                                 const f32 s18ab_color[4] = {s18ab_value, s18ab_value,
-                                                            s18ab_value, 1.0f};
+                                                            s18ab_value, 3.0f};
                                 m_command_list.ClearRenderTargetView(s18ab_rtv, s18ab_color);
                                 m_command_list.Transition(s18ab_res,
                                                           D3D12_RESOURCE_STATE_RENDER_TARGET,
@@ -2891,6 +2941,46 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             ps_info ? Shader::NumDescriptors(ps_info->image_descriptors) : 0,
                             ps_info ? ps_info->constant_buffer_mask : 0,
                             stored.pipeline->State().attachments[0].enable ? 1 : 0);
+            }
+        }
+        // S18 cycle 6 (Phase 0.2.6): what the flinger pass actually samples - the FINISHED
+        // composite (after the 3-vertex composite AND the UI draws) - dumped every 60 s together
+        // with its resource pointer. If this dump matches the presented capture, the visible frame
+        // IS the composite output and the defect is upstream (the sharp scene input); if it is
+        // black while the capture is bright, the writers and readers disagree on the resource at
+        // VA 0x5158f0000. Ids 991101+; cap 30.
+        if (flinger_draw) {
+            static std::chrono::steady_clock::time_point s18f_last =
+                std::chrono::steady_clock::now();
+            static u32 s18f_dumps = 0;
+            if (s18f_dumps < 30 &&
+                std::chrono::steady_clock::now() - s18f_last > std::chrono::seconds(60)) {
+                s18f_last = std::chrono::steady_clock::now();
+                for (const DrawSlot& slot : res_slots) {
+                    if (slot.kind != SlotKind::Sampled) {
+                        continue;
+                    }
+                    ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                    if (sv.Resource() == nullptr ||
+                        static_cast<u64>(sv.GpuAddr()) != 0x5158f0000ull) {
+                        continue;
+                    }
+                    ++s18f_dumps;
+                    const u32 s18f_id = 991100u + s18f_dumps;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, sv.Resource(),
+                        static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()), s18f_id,
+                        /*force=*/true);
+                    LOG_WARNING(Render_D3D12,
+                                "S18F flinger sample: id={} img={} res=0x{:x} {}x{} fmt={:#x} "
+                                "cleared_res=0x{:x} clears={} same={}",
+                                s18f_id, sv.image_id.index,
+                                reinterpret_cast<u64>(sv.Resource()), sv.size.width,
+                                sv.size.height, static_cast<u32>(sv.format),
+                                reinterpret_cast<u64>(g_s18_cleared_composite), g_s18_clear_count,
+                                sv.Resource() == g_s18_cleared_composite ? 1 : 0);
+                    break;
+                }
             }
         }
         // TEMP DIAGNOSTIC (session 13): the depth-tested 3D draws (the scene behind the UI)
@@ -4788,6 +4878,31 @@ void RasterizerD3D12::Clear(u32 layer_count) {
                                 regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
                                 regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0);
                 }
+            }
+        }
+        {
+            // S18 cycle 6 (Phase 0.2.6): is the composite target (VA 0x5158f0000) CLEARED each
+            // frame? A clear that lands between the brightness downscale and the composite/UI
+            // draws would explain why the game's own 192x108 downscale of that VA reads all zero
+            // at every sampled moment. Cap 12.
+            static u32 s18h_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr &&
+                static_cast<u64>(view->GpuAddr()) == 0x5158f0000ull) {
+                g_s18_cleared_composite = resource;
+                ++g_s18_clear_count;
+                // Log the first 8 clears and then every 32nd, so the clear CADENCE and its
+                // interleaving with the downscale/UI draws stay visible for the whole run.
+                if (s18h_clear_logs < 8 || (s18h_clear_logs % 32) == 0) {
+                    LOG_WARNING(Render_D3D12,
+                                "S18H composite clear #{}: res=0x{:x} color=({},{},{},{}) "
+                                "scissor={} rect=({},{},{},{})",
+                                g_s18_clear_count, reinterpret_cast<u64>(resource),
+                                regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                                regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0,
+                                clear_rect.left, clear_rect.top, clear_rect.right,
+                                clear_rect.bottom);
+                }
+                ++s18h_clear_logs;
             }
         }
         if (view != nullptr && resource != nullptr && view->RenderTarget().ptr != 0) {
