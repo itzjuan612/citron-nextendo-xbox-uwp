@@ -1535,6 +1535,15 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     const bool flexible_formats = True(options & RelaxedOptions::Format);
     ImageId image_id{};
     boost::container::small_vector<ImageId, 8> image_ids;
+    boost::container::small_vector<ImageId, 8> exact_image_ids;
+    // S20 fix: the scan must not stop at the first exact-format match. Guest scratch heaps
+    // (the LUT bank VA, the env-probe VA) host INCARNATION CHAINS - several images over the
+    // same guest range, the stale older ones still registered as bad overlaps. The old
+    // early-out returned the FIRST registered (oldest) compatible image, so a sampled view
+    // could resolve to a stale incarnation whose resource no longer holds the guest's data
+    // (the 27 MB LUT image read real content at t=764 and all-zero at t=828 while the guest
+    // kept writing the newest incarnation). Collect every compatible image and let the
+    // selection below pick the one the guest last wrote.
     const auto lambda = [&](ImageId existing_image_id, ImageBase& existing_image) {
         if (True(existing_image.flags & ImageFlagBits::Remapped)) {
             return false;
@@ -1550,26 +1559,45 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
                 IsViewCompatible(existing.format, info.format, broken_views, native_bgr)) {
                 image_id = existing_image_id;
                 image_ids.push_back(existing_image_id);
-                return !flexible_formats && existing.format == info.format;
+                if (existing.format == info.format) {
+                    exact_image_ids.push_back(existing_image_id);
+                }
             }
         } else if (IsSubresource(info, existing_image, gpu_addr, options, broken_views,
                                  native_bgr)) {
             image_id = existing_image_id;
             image_ids.push_back(existing_image_id);
-            return !flexible_formats && existing_image.info.format == info.format;
+            if (existing_image.info.format == info.format) {
+                exact_image_ids.push_back(existing_image_id);
+            }
         }
         return false;
     };
     ForEachImageInRegion(*cpu_addr, CalculateGuestSizeInBytes(info), lambda);
-    if (image_ids.size() <= 1) [[likely]] {
+    if (image_ids.empty()) {
         return image_id;
     }
+    // Exact-format matches win when the caller did not relax the format; among the pool, a
+    // pending guest upload (CpuModified) is the freshest guest intent, then the newest GPU
+    // modification tick.
+    const auto& pool = (!flexible_formats && !exact_image_ids.empty()) ? exact_image_ids
+                                                                       : image_ids;
+    if (pool.size() <= 1) [[likely]] {
+        return pool.front();
+    }
+    boost::container::small_vector<ImageId, 8> cpu_ids;
+    for (const ImageId id : pool) {
+        if (True(slot_images[id].flags & ImageFlagBits::CpuModified)) {
+            cpu_ids.push_back(id);
+        }
+    }
+    const auto& pick = cpu_ids.empty() ? pool : cpu_ids;
     auto image_ids_compare = [this](ImageId a, ImageId b) {
         auto& image_a = slot_images[a];
         auto& image_b = slot_images[b];
         return image_a.modification_tick < image_b.modification_tick;
     };
-    return *std::ranges::max_element(image_ids, image_ids_compare);
+    return *std::ranges::max_element(pick, image_ids_compare);
 }
 
 template <class P>
@@ -2140,6 +2168,43 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         DeleteImage(copy_object.id);
     }
 
+    // S20 fix: a join that creates a new image over a guest range where other images already
+    // live (subresources, bad overlaps, ignored stale siblings) makes every cached descriptor
+    // -> view mapping of those images ambiguous: the newest image now holds the guest's
+    // current content at that VA, while a sample that reuses the cached mapping keeps reading
+    // the stale incarnation (the bank LUT image held real content at t=764 and read all-zero
+    // at t=828 through one unresolved view). Purge the affected images' cached views and force
+    // every descriptor to re-resolve on its next use, so a sample binds the image the guest
+    // last wrote. Same cleanup DeleteImage performs for the views it retires.
+    {
+        boost::container::small_vector<ImageViewId, 32> s20_stale_views;
+        const auto s20_collect_views = [this, &s20_stale_views](ImageId id) {
+            const std::span<const ImageViewId> view_ids = slot_images[id].image_view_ids;
+            s20_stale_views.insert(s20_stale_views.end(), view_ids.begin(), view_ids.end());
+        };
+        for (const ImageId id : join_overlap_ids) {
+            s20_collect_views(id);
+        }
+        for (const ImageId id : join_left_aliased_ids) {
+            s20_collect_views(id);
+        }
+        for (const ImageId id : join_right_aliased_ids) {
+            s20_collect_views(id);
+        }
+        for (const ImageId id : join_ignore_textures) {
+            s20_collect_views(id);
+        }
+        for (const ImageId id : join_bad_overlap_ids) {
+            s20_collect_views(id);
+        }
+        for (const auto& join_copy : join_copies_to_do) {
+            s20_collect_views(join_copy.id);
+        }
+        if (!s20_stale_views.empty()) {
+            RemoveImageViewReferences(s20_stale_views);
+            InvalidateImageTables();
+        }
+    }
     RegisterImage(new_image_id);
     return new_image_id;
 }

@@ -1004,13 +1004,39 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     MakeViewport(maxwell3d->regs).TopLeftY,
                                     MakeViewport(maxwell3d->regs).Width,
                                     MakeViewport(maxwell3d->regs).Height);
-                        (void)D3D12::RecordTextureContentDump(m_device.GetDevice(),
-                                                              m_command_list, res,
-                                                              static_cast<u32>(
-                                                                  VideoCore::Surface::PixelFormat::
-                                                                      B10G11R11_FLOAT),
-                                                              static_cast<u64>(view->GpuAddr()),
-                                                              900000u + s15_lut_rtv_dumps, true);
+                        // S20: no readback recording for bank-window draws (log line only). The
+                        // readbacks recorded in the LUT-fill batch are the strongest remaining
+                        // suspect for the Close failure that drops the batch every run; the boot
+                        // 128x128 LUT dumps (small_lut, nonzero on console) stay enabled.
+                        if (!s17_lut_bank) {
+                            (void)D3D12::RecordTextureContentDump(m_device.GetDevice(),
+                                                                  m_command_list, res,
+                                                                  static_cast<u32>(
+                                                                      VideoCore::Surface::PixelFormat::
+                                                                          B10G11R11_FLOAT),
+                                                                  static_cast<u64>(view->GpuAddr()),
+                                                                  900000u + s15_lut_rtv_dumps, true);
+                        }
+                    }
+                    // S20: the one-shot bank LUT fill pass dies with its whole command batch in
+                    // every run: a CommandList::Close failure lands ~0.5-1 s after the six fill
+                    // draws (the batch stays open across the slow loading-phase frames) and drops
+                    // the fills AND every readback recorded in that batch - which is why the
+                    // fills' post-draw dumps (921xxx/922xxx) always read zero. Flush (execute +
+                    // wait + reset) before each 3-vertex bank fill so each fill starts a fresh
+                    // list that cannot inherit whatever invalidates its predecessor list. Capped
+                    // (the fills run once per LUT generation) so this never becomes a per-frame
+                    // sync.
+                    if (s17_lut_bank && params.num_vertices == 3) {
+                        static u32 s20_fill_flush_count = 0;
+                        if (s20_fill_flush_count < 12) {
+                            ++s20_fill_flush_count;
+                            LOG_WARNING(Render_D3D12,
+                                        "S20 fill flush #{}: gpu={:#x} verts={}",
+                                        s20_fill_flush_count, static_cast<u64>(addr),
+                                        params.num_vertices);
+                            FlushCommands();
+                        }
                     }
                     // S19 (bank LUT pass): the six fills EXECUTE (no drop line, guards pass) but
                     // their post-draw readback (921xxx) is all zero - so capture their identity
@@ -4611,11 +4637,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         s19_post_probe ? VideoCore::Surface::PixelFormat::R16G16B16A16_FLOAT
                         : s19_post_table ? VideoCore::Surface::PixelFormat::R32_FLOAT
                                          : VideoCore::Surface::PixelFormat::B10G11R11_FLOAT;
-                    (void)D3D12::RecordTextureContentDump(
-                        m_device.GetDevice(), m_command_list, s15_post_res,
-                        static_cast<u32>(s15_post_guest_fmt),
-                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
-                        s15_post_index, true);
+                    // S20: bank-window draws record no readback (log only) - see the fill-flush
+                    // note above; the 921xxx readbacks lived in the batch the Close failure
+                    // dropped every run.
+                    if (!s19_post_bank) {
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, s15_post_res,
+                            static_cast<u32>(s15_post_guest_fmt),
+                            static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                            s15_post_index, true);
+                    }
                     // S19 (bank LUT pass): the fills produce a zero RT although their geometry is
                     // sound (the guest VB holds fp16 fullscreen corners). Dump the draw's first
                     // two SAMPLED textures (ids 922xxx): a black source probe and a zeroed loop
@@ -4646,10 +4677,12 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 ++s19_probe_tl_dumps;
                                 s19_probe_tl_next =
                                     std::chrono::steady_clock::now() + std::chrono::seconds(10);
-                                (void)D3D12::RecordTextureContentDump(
-                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
-                                    static_cast<u32>(s19_sv.format), s19_gpu,
-                                    925000u + s19_probe_tl_dumps, true);
+                                if (!s19_post_bank) {
+                                    (void)D3D12::RecordTextureContentDump(
+                                        m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                        static_cast<u32>(s19_sv.format), s19_gpu,
+                                        925000u + s19_probe_tl_dumps, true);
+                                }
                                 LOG_WARNING(Render_D3D12,
                                             "S19 probe timeline: id={} img={} gpu={:#x} res={:#x} "
                                             "{}x{} fmt={:#x} verts={}",
@@ -4675,10 +4708,17 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             }
                             ++s19_in_count;
                             ++s19_lutfill_in_dumps;
-                            (void)D3D12::RecordTextureContentDump(
-                                m_device.GetDevice(), m_command_list, s19_sv.Resource(),
-                                static_cast<u32>(s19_sv.format), static_cast<u64>(s19_sv.GpuAddr()),
-                                922000u + s19_lutfill_in_dumps, true);
+                            // S20: readback recording disabled for bank draws - the readbacks
+                            // recorded in the LUT-fill batch are the strongest remaining suspect
+                            // for the Close failure that drops the batch every run (log kept).
+                            static constexpr bool s20_record_lutfill_inputs = false;
+                            if (s20_record_lutfill_inputs) {
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                    static_cast<u32>(s19_sv.format),
+                                    static_cast<u64>(s19_sv.GpuAddr()),
+                                    922000u + s19_lutfill_in_dumps, true);
+                            }
                             LOG_WARNING(Render_D3D12,
                                         "S19 lutfill input: id={} img={} gpu={:#x} res={:#x} {}x{} "
                                         "fmt={:#x} verts={}",

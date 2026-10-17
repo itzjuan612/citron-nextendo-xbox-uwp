@@ -48,12 +48,16 @@ inline void Push(CmdKind kind, u64 a = 0, u64 b = 0, u64 c = 0, u64 d = 0) {
 }
 
 inline void Dump() {
-    static std::atomic<bool> dumped{false};
-    if (dumped.exchange(true, std::memory_order_relaxed)) {
+    // S20: dump on EVERY Close failure (was once per run) - the run's systematic failures hit
+    // *different* batches, and only the failing batch's tail names the invalid command. Last
+    // 512 entries per dump, up to 3 dumps per run.
+    static std::atomic<u32> dumps_done{0};
+    if (dumps_done.fetch_add(1, std::memory_order_relaxed) >= 3) {
         return;
     }
     const u32 total = g_cmd_ring_index.load(std::memory_order_relaxed);
-    const u32 count = total < CMD_RING_SIZE ? total : CMD_RING_SIZE;
+    constexpr u32 WINDOW = 512;
+    const u32 count = total < WINDOW ? total : WINDOW;
     LOG_CRITICAL(Render_D3D12, "DIAG cmd ring (last {} of {}):", count, total);
     for (u32 i = 0; i < count; ++i) {
         const u32 idx = (total - count + i) % CMD_RING_SIZE;
