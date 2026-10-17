@@ -608,11 +608,22 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
     {
         static u32 s17_notify_raw_logs = 0;
         const DAddr s17_bank_cpu = 0x29426000u;
-        if (s17_notify_raw_logs < 24 && cpu_addr < s17_bank_cpu + 0x1a40000u &&
-            cpu_addr + size > s17_bank_cpu) {
+        // S19: the LUT-fill input windows (probe heap dev 0x9418a000, sample-table heap dev
+        // 0xbaec8000) - a raw write notification touching them means the guest (or a download)
+        // wrote the scratch heap the GPU-authored probe/table lives in.
+        const bool s19_input_cpu =
+            (cpu_addr < 0x9418a000u + 0x408000u && cpu_addr + size > 0x9418a000u) ||
+            (cpu_addr < 0xbaec8000u + 0x10000u && cpu_addr + size > 0xbaec8000u);
+        if (s17_notify_raw_logs < 64 &&
+            ((cpu_addr < s17_bank_cpu + 0x1a40000u && cpu_addr + size > s17_bank_cpu) ||
+             s19_input_cpu)) {
             ++s17_notify_raw_logs;
-            LOG_WARNING(Render_D3D12, "S17 write notify: raw cpu={:#x} size={} (bank range)",
-                        static_cast<u64>(cpu_addr), size);
+            LOG_WARNING(Render_D3D12,
+                        "S17 write notify: raw cpu={:#x} size={} (bank={} input={})",
+                        static_cast<u64>(cpu_addr), size,
+                        (cpu_addr < s17_bank_cpu + 0x1a40000u && cpu_addr + size > s17_bank_cpu) ? 1
+                                                                                                : 0,
+                        s19_input_cpu ? 1 : 0);
         }
     }
     // Release the whole write-tracked page; GPU-written images keep exact bounds.
@@ -632,7 +643,11 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
             const bool s17_mask =
                 (s17_gpu >= 0x510fa0000ull && s17_gpu < 0x510fa0000ull + 0x100000ull) ||
                 (s17_gpu >= 0x510f30000ull && s17_gpu < 0x510f30000ull + 0x100000ull);
-            if (s17_notify_image_logs < 24 && (s17_bank || s17_mask)) {
+            // S19: the two LUT-fill input windows (the probe image and the sample table).
+            const bool s19_input_img =
+                (s17_gpu >= 0x516170000ull && s17_gpu < 0x516170000ull + 0x408000ull) ||
+                (s17_gpu >= 0x5d0630000ull && s17_gpu < 0x5d0631000ull);
+            if (s17_notify_image_logs < 64 && (s17_bank || s17_mask || s19_input_img)) {
                 ++s17_notify_image_logs;
                 const char* const s17_action =
                     True(image.flags & ImageFlagBits::CpuModified)  ? "pending"
@@ -1322,11 +1337,19 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         const u64 diag_gpu = static_cast<u64>(image.gpu_addr);
         // Scene RT, the 256x256 lighting-LUT bank (JoinImages layer stack), the mask, and
         // the wiper-input images (480x270 R16G16 window at 0x517000000/0x517180000).
+        // S19: the two LUT-fill input windows joined the list - the probe image (4086 @
+        // 0x516170000) held 87% content right after its join copy and read zero 555 s later
+        // (timeline 925001/925002). An upload recorded here means an upload happened despite
+        // the GpuModified guard OR the image lost that flag; prefix_nz says whether the guest
+        // bytes behind it are zero (a zero re-upload = the wipe).
         const bool diag_addr = diag_gpu == 0x5103e0000ULL || diag_gpu == 0x5eb340000ULL ||
                                diag_gpu == 0x510f30000ULL || diag_gpu == 0x517000000ULL ||
-                               diag_gpu == 0x517180000ULL;
+                               diag_gpu == 0x517180000ULL ||
+                               (diag_gpu >= 0x516170000ull &&
+                                diag_gpu < 0x516170000ull + 0x408000ull) ||
+                               (diag_gpu >= 0x5d0630000ull && diag_gpu < 0x5d0631000ull);
         const bool diag_size_match = (diag_size >= 2000000ULL && diag_size <= 2100000ULL);
-        if (refresh_diag_logs < 24 && (diag_addr || diag_size_match)) {
+        if (refresh_diag_logs < 64 && (diag_addr || diag_size_match)) {
             ++refresh_diag_logs;
             std::array<u8, 16> diag_prefix{};
             u32 diag_nz = 0;
@@ -1340,13 +1363,15 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
                 }
             }
             LOG_WARNING(Render_D3D12,
-                        "S15 RefreshContents upload: gpu={:#x} size={} {}x{} fmt={:#x} "
-                        "prefix_nz={}/{} prefix={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        static_cast<u64>(image.gpu_addr), diag_size, image.info.size.width,
-                        image.info.size.height, static_cast<u32>(image.info.format), diag_nz,
-                        static_cast<u32>(diag_read), diag_prefix[0], diag_prefix[1], diag_prefix[2],
-                        diag_prefix[3], diag_prefix[4], diag_prefix[5], diag_prefix[6],
-                        diag_prefix[7]);
+                        "S15 RefreshContents upload: img={} gpu={:#x} size={} {}x{} fmt={:#x} "
+                        "flags={:#x} prefix_nz={}/{} "
+                        "prefix={:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        image_id.index, static_cast<u64>(image.gpu_addr), diag_size,
+                        image.info.size.width, image.info.size.height,
+                        static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
+                        diag_nz, static_cast<u32>(diag_read), diag_prefix[0], diag_prefix[1],
+                        diag_prefix[2], diag_prefix[3], diag_prefix[4], diag_prefix[5],
+                        diag_prefix[6], diag_prefix[7]);
         }
     }
     // TEMP DIAGNOSTIC (S17): per-upload record for the 27 MB LUT bank. The lit/black alternation
@@ -1359,14 +1384,25 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         // (64 events in 0.27 s at t=750.9-751.2), which made 'no uploads after creation' an
         // artefact of the cap rather than an observation.
         static u32 s17_bank_upload_logs = 0;
-        if (s17_bank_upload_logs < 1024 && image.cpu_addr < (0x29426000u + 0x1a40000u) &&
-            static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x29426000u) {
+        // S19: the LUT-fill input windows are recorded here too. This block sits BELOW the
+        // GpuModified early-return, so any line for the probe image (0x516170000) or the sample
+        // table (0x5d0630000) IS a real upload over their content - the wipe, if it is an upload.
+        const bool s19_input_upload =
+            (static_cast<u64>(image.cpu_addr) < 0x9418a000u + 0x408000u &&
+             static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x9418a000u) ||
+            (static_cast<u64>(image.cpu_addr) < 0xbaec8000u + 0x10000u &&
+             static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0xbaec8000u);
+        if (s17_bank_upload_logs < 1024 &&
+            ((image.cpu_addr < (0x29426000u + 0x1a40000u) &&
+              static_cast<u64>(image.cpu_addr) + image.guest_size_bytes > 0x29426000u) ||
+             s19_input_upload)) {
             ++s17_bank_upload_logs;
             LOG_WARNING(Render_D3D12,
-                        "S17 bank upload #{}: img={} gpu={:#x} size={} flags={:#x} tick={}",
+                        "S17 bank upload #{}: img={} gpu={:#x} size={} flags={:#x} tick={} "
+                        "input={}",
                         s17_bank_upload_logs, image_id.index, static_cast<u64>(image.gpu_addr),
                         image.guest_size_bytes, static_cast<u32>(image.flags),
-                        image.modification_tick);
+                        image.modification_tick, s19_input_upload ? 1 : 0);
         }
     }
     UploadImageContents(image, staging);
@@ -3077,6 +3113,34 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                         static_cast<u64>(src.gpu_addr), src.info.size.width,
                         src.info.size.height, static_cast<u32>(src.info.format),
                         static_cast<u32>(src.flags), src.guest_size_bytes, copies.size());
+        }
+    }
+    // TEMP DIAGNOSTIC (S19): any cache-level copy with a LUT-fill input window on either side.
+    // The probe image (4086 @ 0x516170000) held 87% content at t=220.9 and zero at t=741.8 with
+    // the SAME resource, no upload and no write notification - the alias path (which copies from
+    // an aliased image with a newer modification_tick) is the prime remaining writer; a
+    // zero-valued sibling would wipe it exactly like this. Bounded 24.
+    {
+        static u32 s19_input_copy_logs = 0;
+        const auto s19_copy_window = [](u64 gpu) {
+            return (gpu >= 0x516170000ull && gpu < 0x516170000ull + 0x408000ull) ||
+                   (gpu >= 0x5d0630000ull && gpu < 0x5d0631000ull);
+        };
+        const u64 s19_copy_dst = static_cast<u64>(dst.gpu_addr);
+        const u64 s19_copy_src = static_cast<u64>(src.gpu_addr);
+        if (s19_input_copy_logs < 24 &&
+            (s19_copy_window(s19_copy_dst) || s19_copy_window(s19_copy_src))) {
+            ++s19_input_copy_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S19 input copy: dst=({} gpu={:#x} {}x{} fmt={:#x} flags={:#x} size={}) "
+                        "src=({} gpu={:#x} {}x{} fmt={:#x} flags={:#x} size={}) copies={} "
+                        "tick_dst={} tick_src={}",
+                        dst_id.index, s19_copy_dst, dst.info.size.width, dst.info.size.height,
+                        static_cast<u32>(dst.info.format), static_cast<u32>(dst.flags),
+                        dst.guest_size_bytes, src_id.index, s19_copy_src, src.info.size.width,
+                        src.info.size.height, static_cast<u32>(src.info.format),
+                        static_cast<u32>(src.flags), src.guest_size_bytes, copies.size(),
+                        dst.modification_tick, src.modification_tick);
         }
     }
     // TEMP DIAGNOSTIC (S17): name every texture-cache-side copy touching the 27 MB LUT bank

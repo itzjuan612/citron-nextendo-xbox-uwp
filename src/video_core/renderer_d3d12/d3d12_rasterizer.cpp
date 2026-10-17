@@ -4651,10 +4651,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     static_cast<u32>(s19_sv.format), s19_gpu,
                                     925000u + s19_probe_tl_dumps, true);
                                 LOG_WARNING(Render_D3D12,
-                                            "S19 probe timeline: id={} img={} gpu={:#x} {}x{} "
-                                            "fmt={:#x} verts={}",
+                                            "S19 probe timeline: id={} img={} gpu={:#x} res={:#x} "
+                                            "{}x{} fmt={:#x} verts={}",
                                             925000u + s19_probe_tl_dumps, s19_sv.image_id.index,
-                                            s19_gpu, s19_sv.size.width, s19_sv.size.height,
+                                            s19_gpu, reinterpret_cast<u64>(s19_sv.Resource()),
+                                            s19_sv.size.width, s19_sv.size.height,
                                             static_cast<u32>(s19_sv.format), params.num_vertices);
                                 break;
                             }
@@ -4679,12 +4680,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 static_cast<u32>(s19_sv.format), static_cast<u64>(s19_sv.GpuAddr()),
                                 922000u + s19_lutfill_in_dumps, true);
                             LOG_WARNING(Render_D3D12,
-                                        "S19 lutfill input: id={} img={} gpu={:#x} {}x{} fmt={:#x} "
-                                        "verts={}",
+                                        "S19 lutfill input: id={} img={} gpu={:#x} res={:#x} {}x{} "
+                                        "fmt={:#x} verts={}",
                                         922000u + s19_lutfill_in_dumps, s19_sv.image_id.index,
-                                        static_cast<u64>(s19_sv.GpuAddr()), s19_sv.size.width,
-                                        s19_sv.size.height, static_cast<u32>(s19_sv.format),
-                                        params.num_vertices);
+                                        static_cast<u64>(s19_sv.GpuAddr()),
+                                        reinterpret_cast<u64>(s19_sv.Resource()),
+                                        s19_sv.size.width, s19_sv.size.height,
+                                        static_cast<u32>(s19_sv.format), params.num_vertices);
                         }
                     }
                     if (s15_post_scene_budget) {
@@ -5260,6 +5262,33 @@ void RasterizerD3D12::Clear(u32 layer_count) {
                                 view->size.height, static_cast<u32>(view->format),
                                 regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
                                 regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0);
+                }
+            }
+        }
+        {
+            // S19: guest clears of the LUT-fill input windows. The probe image showed an
+            // in-place wipe with no upload and no write notification; a guest clear binding
+            // that VA (the heap is a scratch pool) is the other silent writer. Bounded 12.
+            static u32 s19_input_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr &&
+                s19_input_clear_logs < 12) {
+                const u64 s19_clear_gpu = static_cast<u64>(view->GpuAddr());
+                const bool s19_clear_input =
+                    (s19_clear_gpu >= 0x516170000ull &&
+                     s19_clear_gpu < 0x516170000ull + 0x408000ull) ||
+                    (s19_clear_gpu >= 0x5d0630000ull && s19_clear_gpu < 0x5d0631000ull);
+                if (s19_clear_input) {
+                    ++s19_input_clear_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S19 input clear: img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
+                                "color=({},{},{},{}) scissor={} rect=({},{},{},{})",
+                                view->image_id.index, s19_clear_gpu,
+                                reinterpret_cast<u64>(resource), view->size.width,
+                                view->size.height, static_cast<u32>(view->format),
+                                regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                                regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0,
+                                clear_rect.left, clear_rect.top, clear_rect.right,
+                                clear_rect.bottom);
                 }
             }
         }
