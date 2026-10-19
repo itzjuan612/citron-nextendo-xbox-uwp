@@ -3503,6 +3503,135 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                 }
             }
+            // S21 (settled-phase shading witness): the one-shot S15 probes above all latched
+            // the loading->style transition (t~1492), where the bank LUT is still being
+            // regenerated - so every "this input is zero" reading predates the settled frame.
+            // Re-dump the scene draw's sampled set every 60 s from the style phase on with real
+            // GPU readbacks, plus this draw's shader hashes/CBVs, so the content of every
+            // shading input at the settled phase is on record.
+            {
+                static std::chrono::steady_clock::time_point s21_last =
+                    std::chrono::steady_clock::now();
+                static u32 s21_windows = 0;
+                static u32 s21_in_window = 0;
+                // S21 cycle 4: the first three cycles latched only the FIRST qualifying scene draw
+                // of each window (a 1722-vert draw into the 960x540 RT), which turned out to be the
+                // terrain/lighting draw - its missing textures were real and are now fixed, but the
+                // character stayed dark. Latch up to four qualifying draws per window so the
+                // character/fish draws (6798/17550 verts into the dynamic-res family, 264/6789 into
+                // 1920x1080) are captured too.
+                if (s21_windows < 16 && g_s18_guest_frames >= 11700 && params.num_vertices >= 512 &&
+                    s15_sampled >= 5 &&
+                    std::chrono::steady_clock::now() - s21_last > std::chrono::seconds(60)) {
+                    s21_last = std::chrono::steady_clock::now();
+                    ++s21_windows;
+                    s21_in_window = 0;
+                }
+                if (s21_windows >= 1 && s21_in_window < 4 && params.num_vertices >= 512 &&
+                    s15_sampled >= 5 && g_s18_guest_frames >= 11700) {
+                    ++s21_in_window;
+                    const u64 s21_rt_gpu =
+                        (framebuffer && !framebuffer->ColorBuffers().empty())
+                            ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                            : 0;
+                    LOG_WARNING(Render_D3D12,
+                                "S21 scene inputs #{} draw{} [gf={}]: verts={} sampled={} rt_gpu={:#x}",
+                                s21_windows, s21_in_window, g_s18_guest_frames,
+                                params.num_vertices, s15_sampled, s21_rt_gpu);
+                    S19DumpDrawState("scene", s21_rt_gpu, stored);
+                    std::array<ID3D12Resource*, 8> s21_dumped{};
+                    u32 s21_dumped_count = 0;
+                    u32 s21_seen = 0;
+                    for (const DrawSlot& slot : res_slots) {
+                        if (slot.kind != SlotKind::Sampled || s21_seen >= 8) {
+                            continue;
+                        }
+                        ++s21_seen;
+                        ImageView& sv = m_texture_cache.GetImageView(slot.view);
+                        bool s21_dup = false;
+                        for (u32 d = 0; d < s21_dumped_count; ++d) {
+                            s21_dup |= s21_dumped[d] == sv.Resource();
+                        }
+                        u32 s21_id = 0;
+                        if (sv.Resource() != nullptr && !s21_dup &&
+                            !s15_is_current_rt(sv.Resource()) && sv.size.width <= 2048 &&
+                            sv.size.height <= 2048 && s21_dumped_count < s21_dumped.size()) {
+                            s21_id = 995000u + (s21_windows - 1) * 64u + (s21_in_window - 1) * 16u +
+                                     s21_seen;
+                            if (D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, sv.Resource(),
+                                    static_cast<u32>(sv.format), static_cast<u64>(sv.GpuAddr()),
+                                    s21_id, /*force=*/true)) {
+                                s21_dumped[s21_dumped_count++] = sv.Resource();
+                            }
+                        }
+                        // S21 cycle 2: the first harvest showed the scene draw sampling images that
+                        // are GPU-zero while their GUEST bytes are non-zero (the S15 bug class). Log
+                        // the view's own flags/ticks, a guest-memory nonzero count, and the sibling
+                        // images registered over the same guest range - that discriminates "never
+                        // uploaded / no write notification" (view tick 0, no CpuModified) from
+                        // "the view resolved to a stale incarnation" (a sibling with newer ticks).
+                        const auto s21_cpu =
+                            gpu_memory
+                                ? gpu_memory->GpuToCpuAddress(static_cast<GPUVAddr>(sv.GpuAddr()))
+                                : std::nullopt;
+                        u32 s21_pfx_nz = 0;
+                        std::string s21_sibs;
+                        // S21 cycle 3 probe: if the PREVIOUS window's readback proved this
+                        // texture empty on the GPU, re-seed it from guest memory (which holds the
+                        // real bytes) and let the normal upload path run for this draw. If the
+                        // scene lights up in the captures, the missing-upload diagnosis is proven.
+                        bool s21_forced = false;
+                        if (D3D12::S21IsZeroGpuTexture(static_cast<u64>(sv.GpuAddr()))) {
+                            s21_forced = m_texture_cache.ForceGuestReupload(sv.image_id);
+                            if (s21_forced) {
+                                LOG_WARNING(Render_D3D12,
+                                            "S21 force upload #{} slot={}: img={} gpu={:#x} {}x{}",
+                                            s21_windows, s21_seen, sv.image_id.index,
+                                            static_cast<u64>(sv.GpuAddr()), sv.size.width,
+                                            sv.size.height);
+                            }
+                        }
+                        if (s21_cpu) {
+                            std::array<u8, 16> s21_pfx{};
+                            const auto s21_read = m_device_memory.ReadBlockUnsafe(
+                                *s21_cpu, s21_pfx.data(), s21_pfx.size(), "S21.Prefix", false);
+                            if (s21_read.fully_mapped) {
+                                for (const u8 v : s21_pfx) {
+                                    s21_pfx_nz += v != 0 ? 1 : 0;
+                                }
+                            }
+                            u32 s21_sib_n = 0;
+                            m_texture_cache.ForEachImageInRegion(
+                                *s21_cpu, 0x1000,
+                                [&](VideoCommon::ImageId sid, auto& sib) {
+                                    if (s21_sib_n >= 4) {
+                                        return;
+                                    }
+                                    ++s21_sib_n;
+                                    s21_sibs += fmt::format(
+                                        "id{}:fl{:#x}:gpu{:#x}:room{}:tick{} ", sid.index,
+                                        static_cast<u32>(sib.flags),
+                                        static_cast<u64>(sib.gpu_addr), sib.guest_size_bytes,
+                                        sib.modification_tick);
+                                });
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S21 scene input #{} draw{} slot={}: id={} img={} gpu={:#x} {}x{} "
+                                    "fmt={:#x} dxgi={:#x} vfl={:#x} inv={} mod={} pfx_nz={} "
+                                    "forced={} sib=[{}]",
+                                    s21_windows, s21_in_window, s21_seen, s21_id,
+                                    sv.image_id.index,
+                                    static_cast<u64>(sv.GpuAddr()), sv.size.width, sv.size.height,
+                                    static_cast<u32>(sv.format),
+                                    sv.Resource()
+                                        ? static_cast<u32>(sv.Resource()->GetDesc().Format)
+                                        : 0,
+                                    static_cast<u32>(sv.flags), sv.invalidation_tick,
+                                    sv.modification_tick, s21_pfx_nz, s21_forced, s21_sibs);
+                    }
+                }
+            }
             // TEMP DIAGNOSTIC (session 15): the scene's lighting LUTs are small B10G11R11 /
             // R16G16_FLOAT textures; dump the first draw that samples them and probe their
             // guest memory, independent of the larger draw-latched dump above.

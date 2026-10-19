@@ -3064,6 +3064,29 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 }
 
 template <class P>
+bool TextureCache<P>::ForceGuestReupload(ImageId image_id) {
+    if (!image_id) {
+        return false;
+    }
+    Image& image = slot_images[image_id];
+    // Only images that hold NO content at all may be re-seeded from guest memory: no pending CPU
+    // upload and never authored by the GPU. That cannot destroy rendered content, and the S21
+    // harvest proved these images' guest bytes hold the real data while their resource stayed
+    // empty (six scene-shading inputs read 0.0-0.1% nonzero on the GPU for a whole run).
+    if (True(image.flags & (ImageFlagBits::CpuModified | ImageFlagBits::GpuModified))) {
+        return false;
+    }
+    if (image.info.type != ImageType::e2D || image.info.num_samples > 1) {
+        return false;
+    }
+    image.flags |= ImageFlagBits::CpuModified;
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    return true;
+}
+
+template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
     if (invalidate) {

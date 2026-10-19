@@ -266,6 +266,10 @@ struct TextureContentDump {
 
 std::vector<TextureContentDump> g_texture_dumps;
 
+// S21: guest addresses whose newest witness readback (dump id 995xxx) was all-zero on the GPU.
+// See S21IsZeroGpuTexture in d3d12_capture.h.
+std::vector<u64> g_s21_zero_gpu;
+
 bool CaptureWanted() {
     if (g_capture_directory.empty() || !Settings::values.uwp_frame_capture.GetValue()) {
         return false;
@@ -1078,6 +1082,19 @@ void WriteTextureContentDumps() {
                     "nonzero={} min={} max={}",
                     i, entry.image_index, entry.guest_format, entry.dxgi_format, width, height,
                     total_bytes, nonzero, min_value, max_value);
+        // S21: remember which witness-dumped textures came back empty on the GPU (and forget
+        // them once they hold content again) so the witness can force a guest re-upload.
+        if (entry.image_index >= 995000u && entry.image_index < 997000u) {
+            const auto it = std::find(g_s21_zero_gpu.begin(), g_s21_zero_gpu.end(),
+                                      entry.guest_addr);
+            if (nonzero == 0 && total_bytes != 0) {
+                if (it == g_s21_zero_gpu.end() && g_s21_zero_gpu.size() < 64) {
+                    g_s21_zero_gpu.push_back(entry.guest_addr);
+                }
+            } else if (it != g_s21_zero_gpu.end()) {
+                g_s21_zero_gpu.erase(it);
+            }
+        }
         std::vector<u8> pixels;
         DecodeTextureToBgra(entry.dxgi_format, width, height, row_pitch, total_bytes, base,
                             pixels);
@@ -1157,6 +1174,11 @@ void WriteTextureContentDumps() {
 }
 
 } // Anonymous namespace
+
+bool S21IsZeroGpuTexture(u64 gpu_addr) {
+    return std::find(g_s21_zero_gpu.begin(), g_s21_zero_gpu.end(), gpu_addr) !=
+           g_s21_zero_gpu.end();
+}
 
 void SetCaptureDirectory(std::string directory) {
     g_capture_directory = std::move(directory);
@@ -1504,8 +1526,14 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     const u32 capture_this = capture_present_counter++;
     // TEMP DIAGNOSTIC (session 13): spread captures over long runs, so boot progress can be
     // watched over time (newest kept by PruneCaptures).
-    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 40 &&
-                               capture_this >= 600 && (capture_this % 900) == 0;
+    // S21: a dense window across the style phase (guest frames 16200-22500) - the 900-frame
+    // cadence aliases the ~3-frame "UI-only black" dips and the camera dolly, so the
+    // settled-phase framing and the dip frequency were never measurable.
+    const bool capture_dense = capture_this >= 16200 && capture_this <= 22500 &&
+                               (capture_this % 150) == 0;
+    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 120 &&
+                               ((capture_this >= 600 && (capture_this % 900) == 0) ||
+                                capture_dense);
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
     }

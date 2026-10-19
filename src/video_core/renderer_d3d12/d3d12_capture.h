@@ -43,4 +43,10 @@ extern u64 g_s18_guest_frames;
 /// trap), so the resource readback is the only ground truth for the value.
 extern std::string g_s18_last_exposure;
 
+/// TEMP DIAGNOSTIC (S21): true when a texture at this guest address was read back ALL-ZERO by a
+/// recent S21 witness dump (id 995xxx). WriteTextureContentDumps fills the set; the S21 witness
+/// consults it to force exactly those images to re-upload their guest bytes, which the S21
+/// harvest proved hold the real data while the GPU resource stayed empty.
+[[nodiscard]] bool S21IsZeroGpuTexture(u64 gpu_addr);
+
 } // namespace D3D12

@@ -376,7 +376,6 @@ public:
     /// Iterates over all the images in a region calling func
     template <typename Func>
     void ForEachImageInRegion(DAddr cpu_addr, size_t size, Func&& func);
-
     template <typename Func>
     void ForEachImageInRegionGPU(size_t as_id, GPUVAddr gpu_addr, size_t size, Func&& func);
 
@@ -392,6 +391,11 @@ public:
 
     /// Register image in the page table
     void RegisterImage(ImageId image);
+
+    /// TEMP DIAGNOSTIC (S21): mark an image that holds no content at all (no pending CPU upload
+    /// and never GPU-authored) so the normal upload path re-seeds it from guest memory. Returns
+    /// true when the image was marked. See S21IsZeroGpuTexture.
+    bool ForceGuestReupload(ImageId image_id);
 
     /// Unregister image from the page table
     void UnregisterImage(ImageId image);
