@@ -3646,7 +3646,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         const auto& s21_pipe = stored.pipeline->State();
                         std::string s21_attrs;
                         std::array<bool, 32> s21_slot_seen{};
-                        std::array<u32, 2> s21_dump_slots{};
+                        std::array<u32, 6> s21_dump_slots{};
                         u32 s21_attr_dumps = 0;
                         for (u32 i = 0; i < s21_pipe.attributes.size(); ++i) {
                             const auto& s21_attr = s21_pipe.attributes[i];
