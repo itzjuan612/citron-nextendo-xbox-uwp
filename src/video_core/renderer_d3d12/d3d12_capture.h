@@ -49,4 +49,15 @@ extern std::string g_s18_last_exposure;
 /// harvest proved hold the real data while the GPU resource stayed empty.
 [[nodiscard]] bool S21IsZeroGpuTexture(u64 gpu_addr);
 
+/// TEMP DIAGNOSTIC (S21 cycle 9): the present index that the frame-capture path will use for the
+/// CURRENT frame (RenderBlit increments it after the frame is drawn). The scene-RT dump uses it to
+/// fire on exactly the captured frames, so a capture and its scene source can be compared as a
+/// true same-frame pair.
+[[nodiscard]] u32 GetCapturePresentIndex();
+
+/// TEMP DIAGNOSTIC (S21 cycle 9): one-shot flag set when a frame capture is written; the next
+/// composite draw consumes it and dumps the scene RT, giving a capture + scene pair <=1 frame
+/// apart regardless of cadence ordering.
+[[nodiscard]] bool ConsumeCaptureAlignDumpRequest();
+
 } // namespace D3D12

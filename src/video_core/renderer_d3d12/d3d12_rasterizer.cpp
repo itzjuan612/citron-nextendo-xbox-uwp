@@ -2768,9 +2768,18 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 static std::chrono::steady_clock::time_point s15_comp_src_next =
                     std::chrono::steady_clock::now();
                 static u32 s15_comp_src_dumps = 0;
+                const bool s21_capture_align = D3D12::ConsumeCaptureAlignDumpRequest();
+                const u32 s21_present = D3D12::GetCapturePresentIndex();
                 const bool s15_comp_src_due =
-                    std::chrono::steady_clock::now() >= s15_comp_src_next &&
-                    s15_comp_src_dumps < 24;
+                    (std::chrono::steady_clock::now() >= s15_comp_src_next ||
+                     s21_capture_align ||
+                     (s21_present >= 600 &&
+                      (s21_present % 900 == 0 || s21_present % 900 == 1 ||
+                       s21_present % 900 == 899))) &&
+                    s15_comp_src_dumps < 40;
+                // S21 cycle 9: the capture cadence is the PRESENT counter, not the guest frame;
+                // the one-shot flag from WriteFrameCapture gives a capture + scene pair <=1 frame
+                // apart, so "scene RT saturated vs frame black" can be settled without aliasing.
                 for (const DrawSlot& slot : res_slots) {
                     if (slot.kind != SlotKind::Sampled || s15_comp_dumps >= 2) {
                         continue;

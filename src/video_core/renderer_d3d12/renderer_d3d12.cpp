@@ -29,6 +29,15 @@ namespace D3D12 {
 
 namespace {
 
+// S21 cycle 9: the present counter RenderBlit uses for the frame-capture cadence. The scene-RT
+// dump reads it during the frame (before RenderBlit increments it), so the dump fires on the
+// exact frames that produce a capture (a true same-frame pair).
+u32 g_capture_present_counter = 0;
+
+// S21 cycle 9: set when a capture is written; consumed by the next composite draw so the scene
+// RT is dumped for a near-same-frame pair even when the cadences cannot be aligned.
+std::atomic<bool> g_capture_align_dump{false};
+
 // TEMP DIAGNOSTIC (session 12): read back a 64x64 corner of the sampled display image,
 // to separate "the guest never wrote the presented buffer" from "the blit/present path
 // loses the content". 32-bit color formats only; capped after a few probes.
@@ -534,6 +543,9 @@ void WriteFrameCapture() {
                     "Frame capture written: {} ({}x{}) [S18 guest_frame={} expo={}]", path, width,
                     height, g_s18_guest_frames,
                     g_s18_last_exposure.empty() ? "none" : g_s18_last_exposure);
+        // S21 cycle 9: ask the next composite draw to dump the scene RT so this capture and its
+        // scene source can be compared (<=1 frame apart; the cadence ordering is not knowable).
+        g_capture_align_dump.store(true, std::memory_order_relaxed);
         ++g_frame_capture.index;
     }
     g_frame_capture.readback->Unmap(0, nullptr);
@@ -1180,6 +1192,14 @@ bool S21IsZeroGpuTexture(u64 gpu_addr) {
            g_s21_zero_gpu.end();
 }
 
+u32 GetCapturePresentIndex() {
+    return g_capture_present_counter;
+}
+
+bool ConsumeCaptureAlignDumpRequest() {
+    return g_capture_align_dump.exchange(false, std::memory_order_relaxed);
+}
+
 void SetCaptureDirectory(std::string directory) {
     g_capture_directory = std::move(directory);
 }
@@ -1525,8 +1545,7 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
         RecordCalibrationProbe(device.GetDevice(), command_list);
     }
 
-    static u32 capture_present_counter = 0;
-    const u32 capture_this = capture_present_counter++;
+    const u32 capture_this = g_capture_present_counter++;
     // TEMP DIAGNOSTIC (session 13): spread captures over long runs, so boot progress can be
     // watched over time (newest kept by PruneCaptures).
     // S21: a dense window across the style phase (guest frames 16200-22500) - the 900-frame
