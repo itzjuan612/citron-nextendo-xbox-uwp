@@ -2715,6 +2715,35 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         (s19_comp_dumps == 0 || s19_comp_late)) {
                         ++s19_comp_dumps;
                         S19DumpDrawState("composite", 0, stored);
+                        // S21 cycle 8: the composite PS computes scene * in_attr1.w + blur, and
+                        // in_attr1.w is a VERTEX-stage texture fetch (exposure texel .a * c3[0]).
+                        // Log every sampled slot of the draw (both stages) so the VS texture and
+                        // its content are identified - a zero there silently drops the sharp
+                        // scene layer and leaves only the blur.
+                        u32 s21_cslots = 0;
+                        for (const DrawSlot& slot : res_slots) {
+                            if (slot.kind != SlotKind::Sampled) {
+                                continue;
+                            }
+                            ImageView& cview = m_texture_cache.GetImageView(slot.view);
+                            LOG_WARNING(Render_D3D12,
+                                        "S21 composite slot{}: img={} gpu={:#x} {}x{} fmt={:#x} "
+                                        "dxgi={:#x} res={}",
+                                        ++s21_cslots, cview.image_id.index, cview.GpuAddr(),
+                                        cview.size.width, cview.size.height,
+                                        static_cast<u32>(cview.format),
+                                        cview.Resource() ? static_cast<u32>(
+                                                               cview.Resource()->GetDesc().Format)
+                                                         : 0u,
+                                        cview.Resource() != nullptr ? 1 : 0);
+                            if (cview.Resource() != nullptr && cview.size.width <= 4 &&
+                                cview.size.height <= 4) {
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, cview.Resource(),
+                                    static_cast<u32>(cview.format),
+                                    static_cast<u64>(cview.GpuAddr()), 994001, /*force=*/true);
+                            }
+                        }
                     }
                 }
                 static u32 s15_comp_logs = 0;
