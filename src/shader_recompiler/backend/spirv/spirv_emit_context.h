@@ -141,6 +141,7 @@ enum class InputGenericLoadOp {
     Bitcast,
     SToF,
     UToF,
+    SNormPacked10,
 };
 
 struct InputGenericInfo {
@@ -208,6 +209,20 @@ public:
     // Force type cohercion for f64
     Id Const(f64 value) {
         return Constant(F64[1], Sirit::Literal(double(value)));
+    }
+
+    // No API has a SNORM 10-10-10-2 vertex format that D3D12 can use; the backend then
+    // supplies the raw bits as uint4 and the shader decodes them here. Maxwell semantics:
+    // R/G/B are signed 10-bit two's complement scaled by 1/511, A is unsigned 2-bit by 1/3.
+    Id DecodeSNormPacked10(Id value, bool alpha_component) {
+        if (alpha_component) {
+            const Id masked = OpBitwiseAnd(U32[1], value, Const(3u));
+            return OpFMul(F32[1], OpConvertUToF(F32[1], masked), Const(1.0f / 3.0f));
+        }
+        const Id as_s32 = OpBitcast(S32[1], value);
+        const Id shifted = OpShiftLeftLogical(S32[1], as_s32, SConst(22));
+        const Id extended = OpShiftRightArithmetic(S32[1], shifted, SConst(22));
+        return OpFMul(F32[1], OpConvertSToF(F32[1], extended), Const(1.0f / 511.0f));
     }
 
     const Profile& profile;

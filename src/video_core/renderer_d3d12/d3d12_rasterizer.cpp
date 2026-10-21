@@ -2468,8 +2468,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             g_s15_flush_verts.store(params.num_vertices, std::memory_order_relaxed);
         }
     }
+    // S21 cycle 5 draw-isolation probe REMOVED after its run: it answered the question
+    // (1722 = card panel; 3426/3810/6750/9600 = four redundant full-scene warp/copy passes)
+    // and the skipped-draw window left the post-window frames without the sharp scene term
+    // in both 1.0.298 and 1.0.299, so it must not stay in the pipeline.
     if (params.is_indexed && index_binding.valid) {
-        m_command_list.DrawIndexed(params.num_vertices, params.num_instances, params.first_index,
+        m_command_list.DrawIndexed(params.num_vertices, params.num_instances,
+                                   params.first_index,
                                    static_cast<s32>(params.base_vertex), params.base_instance);
     } else {
         m_command_list.Draw(params.num_vertices, params.num_instances, params.base_vertex,
@@ -3520,14 +3525,17 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // character stayed dark. Latch up to four qualifying draws per window so the
                 // character/fish draws (6798/17550 verts into the dynamic-res family, 264/6789 into
                 // 1920x1080) are captured too.
-                if (s21_windows < 16 && g_s18_guest_frames >= 11700 && params.num_vertices >= 512 &&
+                // S21 cycle 6: gate on the BIG scene draws (>= 4000 verts) - the character
+                // (6798/17550) and the copy warps. The small card-panel draws were fully
+                // characterised in cycle 5; the remaining darkness is on the character draw.
+                if (s21_windows < 16 && g_s18_guest_frames >= 11700 && params.num_vertices >= 4000 &&
                     s15_sampled >= 5 &&
                     std::chrono::steady_clock::now() - s21_last > std::chrono::seconds(60)) {
                     s21_last = std::chrono::steady_clock::now();
                     ++s21_windows;
                     s21_in_window = 0;
                 }
-                if (s21_windows >= 1 && s21_in_window < 4 && params.num_vertices >= 512 &&
+                if (s21_windows >= 1 && s21_in_window < 4 && params.num_vertices >= 4000 &&
                     s15_sampled >= 5 && g_s18_guest_frames >= 11700) {
                     ++s21_in_window;
                     const u64 s21_rt_gpu =
@@ -3539,11 +3547,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 s21_windows, s21_in_window, g_s18_guest_frames,
                                 params.num_vertices, s15_sampled, s21_rt_gpu);
                     S19DumpDrawState("scene", s21_rt_gpu, stored);
-                    std::array<ID3D12Resource*, 8> s21_dumped{};
+                    std::array<ID3D12Resource*, 16> s21_dumped{};
                     u32 s21_dumped_count = 0;
                     u32 s21_seen = 0;
                     for (const DrawSlot& slot : res_slots) {
-                        if (slot.kind != SlotKind::Sampled || s21_seen >= 8) {
+                        if (slot.kind != SlotKind::Sampled || s21_seen >= 16) {
                             continue;
                         }
                         ++s21_seen;
@@ -3629,6 +3637,74 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         : 0,
                                     static_cast<u32>(sv.flags), sv.invalidation_tick,
                                     sv.modification_tick, s21_pfx_nz, s21_forced, s21_sibs);
+                    }
+                    // S21 cycle 5: the big scene draws (>= 4000 verts: the character/fish
+                    // candidates) also get their vertex attributes and raw vertex bytes logged -
+                    // a mis-decoded normal or UV attribute looks exactly like "geometry right,
+                    // diffuse dark, specular fine".
+                    if (params.num_vertices >= 4000) {
+                        const auto& s21_pipe = stored.pipeline->State();
+                        std::string s21_attrs;
+                        std::array<bool, 32> s21_slot_seen{};
+                        std::array<u32, 2> s21_dump_slots{};
+                        u32 s21_attr_dumps = 0;
+                        for (u32 i = 0; i < s21_pipe.attributes.size(); ++i) {
+                            const auto& s21_attr = s21_pipe.attributes[i];
+                            if (s21_attr.enabled == 0) {
+                                continue;
+                            }
+                            const u32 s21_slot = s21_attr.buffer.Value();
+                            s21_attrs += fmt::format("[a{}:s{} off={} type={} size={} div={}]", i,
+                                                     s21_slot, s21_attr.offset.Value(),
+                                                     static_cast<u32>(s21_attr.Type()),
+                                                     static_cast<u32>(s21_attr.Size()),
+                                                     s21_pipe.binding_divisors[s21_slot]);
+                            if (s21_slot < s21_slot_seen.size() && !s21_slot_seen[s21_slot] &&
+                                s21_attr_dumps < s21_dump_slots.size()) {
+                                s21_slot_seen[s21_slot] = true;
+                                s21_dump_slots[s21_attr_dumps++] = s21_slot;
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S21 scene attrs #{} draw{}: verts={} {} vb_slots={} "
+                                    "instances={}",
+                                    s21_windows, s21_in_window, params.num_vertices, s21_attrs,
+                                    m_runtime.MaxVertexSlot(), params.num_instances);
+                        for (u32 d = 0; d < s21_attr_dumps; ++d) {
+                            const u32 s21_slot = s21_dump_slots[d];
+                            const auto& s21_vb = m_runtime.GetVertexBindings()[s21_slot];
+                            const DAddr s21_vb_addr =
+                                m_buffer_cache.GetVertexBufferDeviceAddress(s21_slot);
+                            std::array<u8, 32> s21_vb_bytes{};
+                            const u32 s21_read_size =
+                                std::min<u32>(static_cast<u32>(s21_vb_bytes.size()),
+                                              s21_vb.SizeInBytes);
+                            std::string s21_vb_hex;
+                            std::string s21_vb_floats;
+                            if (s21_vb_addr != 0 && s21_read_size >= 8) {
+                                const auto s21_vb_read = m_device_memory.ReadBlockUnsafe(
+                                    s21_vb_addr, s21_vb_bytes.data(), s21_read_size, "S21.VB",
+                                    false);
+                                if (s21_vb_read.fully_mapped) {
+                                    for (u32 i = 0; i < s21_read_size; ++i) {
+                                        s21_vb_hex += fmt::format("{:02x}", s21_vb_bytes[i]);
+                                    }
+                                    for (u32 i = 0; i + 3 < s21_read_size; i += 4) {
+                                        f32 v = 0.0f;
+                                        std::memcpy(&v, s21_vb_bytes.data() + i, sizeof(v));
+                                        s21_vb_floats += fmt::format("{} ", v);
+                                    }
+                                } else {
+                                    s21_vb_floats = "unmapped";
+                                }
+                            }
+                            LOG_WARNING(Render_D3D12,
+                                        "S21 scene vb s{}: dev={:#x} size={} stride={} hex={} "
+                                        "f32=[{}]",
+                                        s21_slot, static_cast<u64>(s21_vb_addr),
+                                        s21_vb.SizeInBytes, s21_vb.StrideInBytes, s21_vb_hex,
+                                        s21_vb_floats);
+                        }
                     }
                 }
             }

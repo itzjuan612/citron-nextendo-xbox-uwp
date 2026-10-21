@@ -267,6 +267,11 @@ DXGI_FORMAT VertexFormat(Maxwell3D::Regs::VertexAttribute::Type type,
         }
         return pick(DXGI_FORMAT_R8_UNORM, DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM);
     case Type::SNorm:
+        if (size == Size::Size_A2_B10_G10_R10) {
+            // DXGI has no SNORM 10-10-10-2 vertex format; feed the raw bits and let the
+            // shader decode them (Shader::AttributeType::SignedNormPacked10).
+            return DXGI_FORMAT_R10G10B10A2_UINT;
+        }
         if (is_16) {
             return pick(DXGI_FORMAT_R16_SNORM, DXGI_FORMAT_R16G16_SNORM,
                         DXGI_FORMAT_R16G16B16A16_SNORM);

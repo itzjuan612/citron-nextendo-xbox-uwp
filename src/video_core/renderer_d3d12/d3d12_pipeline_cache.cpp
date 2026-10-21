@@ -122,6 +122,12 @@ Shader::AttributeType CastAttributeType(const FixedPipelineState::VertexAttribut
     }
     switch (attr.Type()) {
     case Maxwell3D::Regs::VertexAttribute::Type::SNorm:
+        // D3D12 cannot convert a SNORM 10-10-10-2 attribute (DXGI has only the UNORM/UINT
+        // variants); the raw bits are fed through R10G10B10A2_UINT and the shader decodes.
+        if (attr.Size() == Maxwell3D::Regs::VertexAttribute::Size::Size_A2_B10_G10_R10) {
+            return Shader::AttributeType::SignedNormPacked10;
+        }
+        return Shader::AttributeType::Float;
     case Maxwell3D::Regs::VertexAttribute::Type::UNorm:
     case Maxwell3D::Regs::VertexAttribute::Type::Float:
         return Shader::AttributeType::Float;

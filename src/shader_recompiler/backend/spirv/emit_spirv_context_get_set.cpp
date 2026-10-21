@@ -313,7 +313,7 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
         const Id pointer{
             AttrPointer(ctx, generic.pointer_type, vertex, generic.id, ctx.Const(element))};
         const Id value{ctx.OpLoad(generic.component_type, pointer)};
-        return [&ctx, generic, value]() {
+        return [&ctx, generic, value, element]() {
             switch (generic.load_op) {
             case InputGenericLoadOp::Bitcast:
                 return ctx.OpBitcast(ctx.F32[1], value);
@@ -321,6 +321,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, Id vertex) {
                 return ctx.OpConvertSToF(ctx.F32[1], value);
             case InputGenericLoadOp::UToF:
                 return ctx.OpConvertUToF(ctx.F32[1], value);
+            case InputGenericLoadOp::SNormPacked10:
+                return ctx.DecodeSNormPacked10(value, element == 3);
             default:
                 return value;
             };

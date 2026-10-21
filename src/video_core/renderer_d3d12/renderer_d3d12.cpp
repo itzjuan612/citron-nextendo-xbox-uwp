@@ -1209,7 +1209,10 @@ void RecordScene3dCaptureMidFrame(ID3D12Device* d3d, CommandList& command_list,
 bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D12Resource* src,
                               u32 guest_format, u64 guest_addr, u32 image_index, bool force) {
     static std::vector<std::pair<u64, u32>> seen;
-    if (!src || g_texture_dumps.size() >= 32) {
+    // S21 cycle 7: the per-frame dump queue was capped at 32; a witness window arms up to
+    // 4 draws (14+8+14+7 sampled slots) so the 4th draw's readbacks (the character) were
+    // silently dropped. 64 covers the whole window.
+    if (!src || g_texture_dumps.size() >= 64) {
         return false;
     }
     if (!force &&
@@ -1531,9 +1534,13 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
     // settled-phase framing and the dip frequency were never measurable.
     const bool capture_dense = capture_this >= 16200 && capture_this <= 22500 &&
                                (capture_this % 150) == 0;
-    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 120 &&
-                               ((capture_this >= 600 && (capture_this % 900) == 0) ||
-                                capture_dense);
+    // S21 cycle 6: dense captures across the style phase (gf 11700-15000) - the character is
+    // the fragment cloud there, so ~4 frames per 900-frame cadence show the animation state.
+    const bool capture_iso = capture_this >= 11700 && capture_this <= 15000 &&
+                             (capture_this % 150) == 0;
+    const bool capture_frame = CaptureWanted() && g_frame_capture.index < 200 &&
+                               ((capture_this >= 600 && (capture_this % 900) == 0) || capture_dense ||
+                                capture_iso);
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
     }

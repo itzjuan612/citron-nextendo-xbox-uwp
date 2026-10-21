@@ -20,6 +20,7 @@ enum class AttributeType : u8 {
     UnsignedInt,
     SignedScaled,
     UnsignedScaled,
+    SignedNormPacked10,
     Disabled,
 };
 

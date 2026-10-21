@@ -230,6 +230,10 @@ Id GetAttributeType(EmitContext& ctx, AttributeType type) {
                                                      : ctx.TypeVector(ctx.TypeInt(32, true), 4);
     case AttributeType::UnsignedScaled:
         return ctx.profile.support_scaled_attributes ? ctx.F32[4] : ctx.U32[4];
+    case AttributeType::SignedNormPacked10:
+        // Raw 10-10-10-2 bits: the backend cannot convert them in the IA (no SNORM
+        // 10-10-10-2 format), so the shader decodes them itself.
+        return ctx.U32[4];
     case AttributeType::Disabled:
         break;
     }
@@ -254,6 +258,9 @@ InputGenericInfo GetAttributeInfo(EmitContext& ctx, AttributeType type, Id id) {
         return ctx.profile.support_scaled_attributes
                    ? InputGenericInfo{id, ctx.input_f32, ctx.F32[1], InputGenericLoadOp::None}
                    : InputGenericInfo{id, ctx.input_u32, ctx.U32[1], InputGenericLoadOp::UToF};
+    case AttributeType::SignedNormPacked10:
+        return InputGenericInfo{id, ctx.input_u32, ctx.U32[1],
+                                InputGenericLoadOp::SNormPacked10};
     case AttributeType::Disabled:
         return InputGenericInfo{};
     }
@@ -820,6 +827,10 @@ void EmitContext::DefineAttributeMemAccess(const Info& info) {
                     return OpConvertSToF(F32[1], value);
                 case InputGenericLoadOp::UToF:
                     return OpConvertUToF(F32[1], value);
+                case InputGenericLoadOp::SNormPacked10:
+                    // The element is a runtime index here; normals only use R/G/B, so the
+                    // signed 10-bit decode is applied to every component.
+                    return DecodeSNormPacked10(value, false);
                 default:
                     return value;
                 };
