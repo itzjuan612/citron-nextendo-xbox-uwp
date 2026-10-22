@@ -767,8 +767,24 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // the draw that disappeared without depending on the composite/exposure state.
     if (g_s18_guest_frames >= 20000 &&
         static_cast<u64>(maxwell3d->regs.rt[0].Address()) == 0x5103e0000ull) {
-        static constexpr std::array<u32, 8> kS21SkipTargets{0, 6750, 4566, 9600, 6798, 17550,
-                                                            6789, 264};
+        static constexpr std::array<u32, 8> kS21SkipTargets{0, 3234, 3810, 2016, 3462, 1446,
+                                                            1200, 186};
+        // S21 cycle 19: the settled phase draws 3234/3810 verts most often (278/246 times per
+        // ~700 s) - the earlier list (6750/4566/9600/6798/17550/6789/264) never touched them.
+        {
+            static std::array<u32, 48> s21_seen_verts{};
+            static u32 s21_seen_count = 0;
+            bool known = false;
+            for (u32 i = 0; i < s21_seen_count; ++i) {
+                known |= s21_seen_verts[i] == params.num_vertices;
+            }
+            if (!known && s21_seen_count < s21_seen_verts.size()) {
+                s21_seen_verts[s21_seen_count++] = params.num_vertices;
+                LOG_WARNING(Render_D3D12,
+                            "S21 scene draw verts sighting #{}: verts={}", s21_seen_count,
+                            params.num_vertices);
+            }
+        }
         const u32 s21_skip_index =
             static_cast<u32>(((g_s18_guest_frames - 20000) / 1200) % kS21SkipTargets.size());
         static u32 s21_skip_logged = ~u32{0};
@@ -5871,6 +5887,30 @@ void RasterizerD3D12::Clear(u32 layer_count) {
                                 "S19 input clear: img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
                                 "color=({},{},{},{}) scissor={} rect=({},{},{},{})",
                                 view->image_id.index, s19_clear_gpu,
+                                reinterpret_cast<u64>(resource), view->size.width,
+                                view->size.height, static_cast<u32>(view->format),
+                                regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
+                                regs.clear_color[3], regs.clear_control.use_scissor ? 1 : 0,
+                                clear_rect.left, clear_rect.top, clear_rect.right,
+                                clear_rect.bottom);
+                }
+            }
+        }
+        {
+            // S22 cycle 20: who wipes the LUT bank? Its 256x256 sub-view reads rmax=1.95 right
+            // after the fill (t=762) and rmax=0 from t=822 on, with no upload and no write
+            // notification, then comes back as uniform white. The heap is a scratch pool mapped
+            // at three VAs, so a guest clear binding ANY view in the bank window is the prime
+            // silent writer. Own budget (24) so the probe-window tracer above cannot eat it.
+            static u32 s22_bank_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr && s22_bank_clear_logs < 24) {
+                const u64 s22_clear_gpu = static_cast<u64>(view->GpuAddr());
+                if (s22_clear_gpu >= 0x5e9000000ull && s22_clear_gpu < 0x5ee7b4000ull) {
+                    ++s22_bank_clear_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S22 bank clear: img={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
+                                "color=({},{},{},{}) scissor={} rect=({},{},{},{})",
+                                view->image_id.index, s22_clear_gpu,
                                 reinterpret_cast<u64>(resource), view->size.width,
                                 view->size.height, static_cast<u32>(view->format),
                                 regs.clear_color[0], regs.clear_color[1], regs.clear_color[2],
