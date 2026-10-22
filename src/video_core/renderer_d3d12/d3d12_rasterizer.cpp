@@ -880,6 +880,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
         const bool unbound = !view || !view->RenderTarget().ptr;
+        // S22 cycle 23: bank RT binds with their own budget. The LUT reads finite at t=771 and
+        // 100% NaN at t=834 with NO clear, NO alias copy and NO upload in between (all three
+        // tracers are armed and silent), so the writer is a DRAW into the bank. The shared S15
+        // bank tracer was exhausted by the boot LUTs, hence this independent budget.
+        if (view != nullptr) {
+            static u32 s22_bank_bind_logs = 0;
+            const u64 s22_bank_gpu = static_cast<u64>(view->GpuAddr());
+            if (s22_bank_bind_logs < 48 && s22_bank_gpu >= 0x5e9000000ull &&
+                s22_bank_gpu < 0x5ee7b4000ull) {
+                ++s22_bank_bind_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S22 bank draw #{}: slot={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
+                            "att={:#x} verts={} depth={}",
+                            s22_bank_bind_logs, i, s22_bank_gpu,
+                            reinterpret_cast<u64>(view->Resource()), view->size.width,
+                            view->size.height, static_cast<u32>(view->format),
+                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                            depth_view != nullptr ? 1 : 0);
+            }
+        }
         // TEMP DIAGNOSTIC (S15): wiper-window RT tracer, evaluated before the skip returns
         // below so a producer draw this loop rejects (unrepresentable format or unbound
         // slot) is still logged - the previous after-loop tracer never saw skipped draws.

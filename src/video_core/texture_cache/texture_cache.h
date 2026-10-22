@@ -2095,6 +2095,30 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
 
     for (const auto& copy_object : join_copies_to_do) {
         Image& overlap = slot_images[copy_object.id];
+        // S22 cycle 22: the bank's own copy log. The shared S19 budget is exhausted long
+        // before the bank join (t~790), so the one datum that explains the zero LUT - whether
+        // the filled members were GpuModified when the copy was queued - has never been seen.
+        // The zero RefreshContents upload happens BEFORE this loop (line ~1998), so the final
+        // content is whatever these copies produce.
+        {
+            const u64 s22_new_gpu = static_cast<u64>(new_image.gpu_addr);
+            const u64 s22_ov_gpu = static_cast<u64>(overlap.gpu_addr);
+            const bool s22_bank =
+                (s22_ov_gpu >= 0x5e9000000ull && s22_ov_gpu < 0x5ee7b4000ull) ||
+                (s22_new_gpu >= 0x5e9000000ull && s22_new_gpu < 0x5ee7b4000ull);
+            static u32 s22_bank_copy_logs = 0;
+            if (s22_bank && s22_bank_copy_logs < 24) {
+                ++s22_bank_copy_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S22 bank join copy #{}: new={} gpu={:#x} overlap={} gpu={:#x} {}x{} "
+                            "alias={} gpu_modified={} flags={:#x}",
+                            s22_bank_copy_logs, new_image_id.index, s22_new_gpu,
+                            copy_object.id.index, s22_ov_gpu, overlap.info.size.width,
+                            overlap.info.size.height, copy_object.is_alias ? 1 : 0,
+                            True(overlap.flags & ImageFlagBits::GpuModified) ? 1 : 0,
+                            static_cast<u32>(overlap.flags));
+            }
+        }
         if (s19_join_window(static_cast<u64>(overlap.gpu_addr)) ||
             s19_join_window(static_cast<u64>(new_image.gpu_addr))) {
             static u32 s19_copy_logs = 0;
