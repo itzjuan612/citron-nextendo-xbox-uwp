@@ -3210,13 +3210,20 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
     // logged, so a copy is the remaining writer class.
     {
         static u32 s22_bank_copy_logs = 0;
+        static std::chrono::steady_clock::time_point s22_bank_copy_last{};
         const u64 s22_dst_gpu = static_cast<u64>(dst.gpu_addr);
         const u64 s22_src_gpu = static_cast<u64>(src.gpu_addr);
         const bool s22_dst_bank =
             s22_dst_gpu >= 0x5e9000000ull && s22_dst_gpu < 0x5ee7b4000ull;
         const bool s22_src_bank =
             s22_src_gpu >= 0x5e9000000ull && s22_src_gpu < 0x5ee7b4000ull;
-        if (s22_bank_copy_logs < 48 && (s22_dst_bank || s22_src_bank)) {
+        // Burst mode: the join emits a storm of tile copies in one millisecond, so a plain cap
+        // hides every later copy. Log the first copy of each new burst (>=1 s gap) instead.
+        const auto s22_copy_now = std::chrono::steady_clock::now();
+        const bool s22_copy_new_burst =
+            s22_copy_now - s22_bank_copy_last > std::chrono::seconds(1);
+        if (s22_bank_copy_logs < 64 && s22_copy_new_burst && (s22_dst_bank || s22_src_bank)) {
+            s22_bank_copy_last = s22_copy_now;
             ++s22_bank_copy_logs;
             // The box matters: SynchronizeAliases copies FROM the 16x8 alias tile INTO this
             // 256x256 image, so a full-extent box here overwrites the whole LUT with one tile.
