@@ -760,6 +760,30 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (params.num_vertices == 0 || params.num_instances == 0) {
         return;
     }
+    // S21 cycle 16/17: draw-skip probe. The witness never latched the real character/fish draws
+    // (its "character" turned out to be the terrain - see the session-22 memory), so name them
+    // directly: skip ONE vertex-count class per 1200-guest-frame window on draws into the scene
+    // RT (0x5103e0000) and arm a scene-RT dump at each window change. Diffing those dumps names
+    // the draw that disappeared without depending on the composite/exposure state.
+    if (g_s18_guest_frames >= 20000 &&
+        static_cast<u64>(maxwell3d->regs.rt[0].Address()) == 0x5103e0000ull) {
+        static constexpr std::array<u32, 8> kS21SkipTargets{0, 6750, 4566, 9600, 6798, 17550,
+                                                            6789, 264};
+        const u32 s21_skip_index =
+            static_cast<u32>(((g_s18_guest_frames - 20000) / 1200) % kS21SkipTargets.size());
+        static u32 s21_skip_logged = ~u32{0};
+        if (s21_skip_logged != s21_skip_index) {
+            s21_skip_logged = s21_skip_index;
+            LOG_WARNING(Render_D3D12,
+                        "S21 skip window: gf={} index={} target={} (scene RT)",
+                        g_s18_guest_frames, s21_skip_index, kS21SkipTargets[s21_skip_index]);
+            D3D12::RequestSceneAlignDump();
+        }
+        const u32 s21_skip_target = kS21SkipTargets[s21_skip_index];
+        if (s21_skip_target != 0 && params.num_vertices == s21_skip_target) {
+            return;
+        }
+    }
     // TEMP DIAGNOSTIC (S15): depth-side half of the wiper-window RT tracer; a depth view
     // can land in [0x517000000, 0x517200000) too, and this runs before the skip guards so
     // draws rejected below still log. One shared static cap with the color-slot tracer in
@@ -2932,7 +2956,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                      (s21_present >= 600 &&
                       (s21_present % 900 == 0 || s21_present % 900 == 1 ||
                        s21_present % 900 == 899))) &&
-                    s15_comp_src_dumps < 40;
+                    s15_comp_src_dumps < 80;
                 // S21 cycle 9: the capture cadence is the PRESENT counter, not the guest frame;
                 // the one-shot flag from WriteFrameCapture gives a capture + scene pair <=1 frame
                 // apart, so "scene RT saturated vs frame black" can be settled without aliasing.

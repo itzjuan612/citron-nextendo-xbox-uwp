@@ -6,8 +6,10 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -1094,6 +1096,52 @@ void WriteTextureContentDumps() {
                     "nonzero={} min={} max={}",
                     i, entry.image_index, entry.guest_format, entry.dxgi_format, width, height,
                     total_bytes, nonzero, min_value, max_value);
+        // S21 cycle 17: byte min/max cannot tell a lighting-table ramp from a NaN/Inf texel.
+        // For R11G11B10 dumps (the 256x256 LUT and the 960x540 scene RT) decode the actual
+        // 11/11/10 floats and log the non-finite count plus the finite per-channel maxima.
+        if (entry.dxgi_format == 26 /* DXGI_FORMAT_R11G11B10_FLOAT */ && row_pitch >= width * 4) {
+            u32 s21_bad = 0;
+            u32 s21_finite = 0;
+            f32 s21_rmax = 0.0f;
+            f32 s21_gmax = 0.0f;
+            f32 s21_bmax = 0.0f;
+            const auto s21_dec = [](u32 bits, u32 mant_bits) -> f32 {
+                const u32 exp = bits >> mant_bits;
+                const u32 mant = bits & ((1u << mant_bits) - 1);
+                if (exp == 31) {
+                    return mant == 0 ? std::numeric_limits<f32>::infinity()
+                                     : std::numeric_limits<f32>::quiet_NaN();
+                }
+                const f32 frac = static_cast<f32>(mant) / static_cast<f32>(1u << mant_bits);
+                if (exp == 0) {
+                    return frac * 6.103515625e-05f;
+                }
+                return (1.0f + frac) * std::exp2(static_cast<f32>(exp) - 15.0f);
+            };
+            for (u32 y = 0; y < height; ++y) {
+                const u8* const row = base + static_cast<size_t>(y) * row_pitch;
+                for (u32 x = 0; x < width; ++x) {
+                    u32 word = 0;
+                    std::memcpy(&word, row + static_cast<size_t>(x) * 4, sizeof(word));
+                    const f32 r = s21_dec(word & 0x7FF, 6);
+                    const f32 g = s21_dec((word >> 11) & 0x7FF, 6);
+                    const f32 b = s21_dec((word >> 22) & 0x3FF, 5);
+                    if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) {
+                        ++s21_bad;
+                        continue;
+                    }
+                    ++s21_finite;
+                    s21_rmax = std::max(s21_rmax, r);
+                    s21_gmax = std::max(s21_gmax, g);
+                    s21_bmax = std::max(s21_bmax, b);
+                }
+            }
+            LOG_WARNING(Render_D3D12,
+                        "S21 float dump #{} img={}: {}x{} nonfinite={} finite={} rmax={} gmax={} "
+                        "bmax={}",
+                        i, entry.image_index, width, height, s21_bad, s21_finite, s21_rmax,
+                        s21_gmax, s21_bmax);
+        }
         // S21: remember which witness-dumped textures came back empty on the GPU (and forget
         // them once they hold content again) so the witness can force a guest re-upload.
         if (entry.image_index >= 995000u && entry.image_index < 997000u) {
@@ -1198,6 +1246,10 @@ u32 GetCapturePresentIndex() {
 
 bool ConsumeCaptureAlignDumpRequest() {
     return g_capture_align_dump.exchange(false, std::memory_order_relaxed);
+}
+
+void RequestSceneAlignDump() {
+    g_capture_align_dump.store(true, std::memory_order_relaxed);
 }
 
 void SetCaptureDirectory(std::string directory) {

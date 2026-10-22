@@ -60,4 +60,9 @@ extern std::string g_s18_last_exposure;
 /// apart regardless of cadence ordering.
 [[nodiscard]] bool ConsumeCaptureAlignDumpRequest();
 
+/// TEMP DIAGNOSTIC (S22 cycle 17): arm the same one-shot scene-RT dump from another site. The
+/// draw-skip probe calls this when its target changes, so each skip window gets a scene-RT dump
+/// whose diff names the draw that was skipped (RT content is immune to exposure variance).
+void RequestSceneAlignDump();
+
 } // namespace D3D12
