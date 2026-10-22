@@ -760,6 +760,27 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (params.num_vertices == 0 || params.num_instances == 0) {
         return;
     }
+    // S22 cycle 27 (causal probe): the LUT is baked correctly at t=762 and the game's SECOND bake
+    // 14 s later writes zeros into exactly the resource the sampler reads (1.0.326 timeline:
+    // rmax=1.953 at t=773 -> rmax=0 at t=833 after the t=776.55 bake). Skip a bank bake that
+    // follows another within 60 s, so the first (good) table survives. Diagnostic only.
+    if (params.num_vertices == 3 &&
+        static_cast<u64>(maxwell3d->regs.rt[0].Address()) == 0x5eb340000ull) {
+        static std::chrono::steady_clock::time_point s22_last_bake{};
+        static u32 s22_bake_skips = 0;
+        const auto s22_bake_now = std::chrono::steady_clock::now();
+        if (s22_last_bake.time_since_epoch().count() != 0 &&
+            s22_bake_now - s22_last_bake < std::chrono::seconds(60)) {
+            if (s22_bake_skips < 8) {
+                ++s22_bake_skips;
+                LOG_WARNING(Render_D3D12,
+                            "S22 bake skip #{}: second bank bake within 60 s skipped (gf={})",
+                            s22_bake_skips, g_s18_guest_frames);
+            }
+            return;
+        }
+        s22_last_bake = s22_bake_now;
+    }
     // S21 cycle 16/17: draw-skip probe. The witness never latched the real character/fish draws
     // (its "character" turned out to be the terrain - see the session-22 memory), so name them
     // directly: skip ONE vertex-count class per 1200-guest-frame window on draws into the scene

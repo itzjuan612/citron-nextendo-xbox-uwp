@@ -6,7 +6,7 @@
   IgnorableNamespaces="uap rescap">
   <Identity Name="CitronUwp"
             Publisher="CN=CitronUwpSpike"
-            Version="1.0.326.0"
+            Version="1.0.327.0"
             ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Citron UWP</DisplayName>
