@@ -532,6 +532,13 @@ void RasterizerD3D12::S19DumpDrawState(const char* tag, u64 aux,
                 tag, aux, g_s18_guest_frames, s19_key.unique_hashes[0], s19_key.unique_hashes[1],
                 s19_key.unique_hashes[2], s19_key.unique_hashes[3], s19_key.unique_hashes[4],
                 s19_key.unique_hashes[5]);
+    // S21 cycle 10: NaN/Inf test on the raw f32 bits.
+    const auto s21_nonfinite = [](f32 v) {
+        u32 bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7F800000u) == 0x7F800000u;
+    };
+    static u32 s21_window_dumps = 0;
     for (size_t stage = 0; stage < VideoCommon::NUM_STAGES; ++stage) {
         const Shader::Info* s19_info = stored.infos[stage];
         if (s19_info == nullptr) {
@@ -573,6 +580,68 @@ void RasterizerD3D12::S19DumpDrawState(const char* tag, u64 aux,
                         "S19 cbuf {} s{} i{}: gpu={:#x} dev={:#x} size={} used={} nz={} f32=[{}]",
                         tag, stage, ci, static_cast<u64>(cb.address), dev_addr, cb.size,
                         s19_info->constant_buffer_used_sizes[ci], read_bytes, flts);
+            // S21 cycle 10: the settled character PS (ps_133) indexes its c9 table with a
+            // per-fragment value and reads bytes ~3200..5240, far past the 512-byte head window
+            // above. The settled scene RT holds QR-NaN over the character/fish, and the final
+            // colour depends on c9[dyn], so dump the window the shader actually reads and
+            // count non-finite floats over the whole buffer.
+            if (std::string_view{tag} == "scene" && stage == 4 && ci == 9 && cb.size >= 2048 &&
+                s21_window_dumps < 32) {
+                const u32 s21_len =
+                    std::min<u32>(static_cast<u32>(cb.size), 16384u);
+                const u32 s21_read_len = std::max<u32>(s21_len, 24576u);
+                std::vector<u8> s21_all(s21_read_len);
+                if (gpu_memory != nullptr && dev_addr != 0) {
+                    const auto s21_rd = m_device_memory.ReadBlockUnsafe(
+                        static_cast<DAddr>(dev_addr), s21_all.data(), s21_read_len, "S21.C9",
+                        false);
+                    if (s21_rd.fully_mapped) {
+                        ++s21_window_dumps;
+                        u32 s21_nan = 0;
+                        u32 s21_inf = 0;
+                        u32 s21_finite = 0;
+                        f32 s21_min = 3.402823466e38f;
+                        f32 s21_max = -3.402823466e38f;
+                        for (u32 i = 0; i + 3 < s21_read_len; i += 4) {
+                            f32 v = 0.0f;
+                            std::memcpy(&v, s21_all.data() + i, sizeof(v));
+                            if (s21_nonfinite(v)) {
+                                if (v != v) {
+                                    ++s21_nan;
+                                } else {
+                                    ++s21_inf;
+                                }
+                                continue;
+                            }
+                            ++s21_finite;
+                            s21_min = std::min(s21_min, v);
+                            s21_max = std::max(s21_max, v);
+                        }
+                        // The windows the character PS reads: index*8 bytes (u32x2 stride 8),
+                        // incl. 0x89C = 17632 which lies OUTSIDE the guest-declared 9216 bytes.
+                        for (const u32 s21_off : {3200u, 6112u, 17600u}) {
+                            if (s21_off + 256 > s21_read_len) {
+                                continue;
+                            }
+                            std::string s21_f;
+                            u32 s21_w_nan = 0;
+                            for (u32 i = 0; i < 256; i += 4) {
+                                f32 v = 0.0f;
+                                std::memcpy(&v, s21_all.data() + s21_off + i, sizeof(v));
+                                s21_w_nan += s21_nonfinite(v) ? 1 : 0;
+                                s21_f += fmt::format("{} ", v);
+                            }
+                            LOG_WARNING(Render_D3D12,
+                                        "S21 c9 window off={} nan={} f32=[{}]", s21_off,
+                                        s21_w_nan, s21_f);
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S21 c9 table: bytes={} nan={} inf={} finite={} min={} "
+                                    "max={}",
+                                    s21_read_len, s21_nan, s21_inf, s21_finite, s21_min, s21_max);
+                    }
+                }
+            }
         }
     }
 }
@@ -730,6 +799,21 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     if (num_rtvs == 0 && (!depth_view || !depth_view->RenderTarget().ptr)) {
         return;
     }
+    // S21 cycle 11: dedicated producer tracer for the character PS's c9 table window. The
+    // generic S17 tracer above burned its 32-line budget on the 0x5161xxxxx probe at t=221-243,
+    // i.e. before this heap exists (t=285), so it has been blind to the window ever since.
+    static u32 s21_c9_bind_logs = 0;
+    if (depth_view != nullptr && s21_c9_bind_logs < 24 && depth_view->GpuAddr() >= 0x5e9700000ull &&
+        depth_view->GpuAddr() < 0x5e9800000ull) {
+        ++s21_c9_bind_logs;
+        LOG_WARNING(Render_D3D12,
+                    "S21 c9 producer: draw depth gpu={:#x} res={:#x} {}x{} fmt={:#x} att={:#x} "
+                    "verts={}",
+                    static_cast<u64>(depth_view->GpuAddr()),
+                    reinterpret_cast<u64>(depth_view->Resource()), depth_view->size.width,
+                    depth_view->size.height, static_cast<u32>(depth_view->format),
+                    stored.pipeline->State().attachments[0].raw, params.num_vertices);
+    }
     for (size_t i = 0; i < num_rtvs; ++i) {
         const auto format =
             static_cast<Tegra::RenderTargetFormat>(stored.pipeline->State().color_formats[i]);
@@ -775,6 +859,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             unbound ? 1 : 0, stored.pipeline->State().attachments[0].raw,
                             params.num_vertices);
             }
+        }
+        // TEMP DIAGNOSTIC (S21 cycle 11): c9 table writer, own budget (see the depth half).
+        if (view != nullptr && s21_c9_bind_logs < 24 &&
+            view->GpuAddr() >= 0x5e9700000ull && view->GpuAddr() < 0x5e9800000ull) {
+            ++s21_c9_bind_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S21 c9 producer: draw rt slot={} gpu={:#x} res={:#x} {}x{} raw_fmt={:#x} "
+                        "unrepresentable={} unbound={} att={:#x} verts={}",
+                        i, static_cast<u64>(view->GpuAddr()),
+                        reinterpret_cast<u64>(view->Resource()), view->size.width,
+                        view->size.height, raw_format, skip_reason != nullptr ? 1 : 0,
+                        unbound ? 1 : 0, stored.pipeline->State().attachments[0].raw,
+                        params.num_vertices);
         }
         // TEMP DIAGNOSTIC (S17): color-slot half of the pre-guard producer tracer (see the
         // depth-side block above); runs before the skip returns below so a rejected producer
@@ -2078,6 +2175,20 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         const auto& record = bindings[cbv_records[slot]];
         D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
         u64 cbv_size = record.size != 0 ? record.size : u64{256};
+        // S21 cycle 12: D3D12 enforces ConstantBufferView.SizeInBytes and zero-fills reads
+        // beyond it, but the guest's declared size is only a hint - the hardware (and the
+        // Vulkan backend's whole-buffer descriptors) serve reads past it from the mapped
+        // buffer. ps_133 reads its c9 table at byte 17632 through a 9216-byte CBV; with the
+        // declared size those reads returned 0 and fed a wrong index into the object shading.
+        // Extend the view to the whole committed resource (D3D12 caps a CBV at 64 KB).
+        const bool cbv_aligned =
+            (address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) == 0;
+        if (record.resource != nullptr && record.size != 0 && cbv_aligned &&
+            record.offset < record.resource->GetDesc().Width) {
+            const u64 cbv_available =
+                std::min<u64>(record.resource->GetDesc().Width - record.offset, 64 * 1024);
+            cbv_size = std::max(cbv_size, cbv_available);
+        }
         if (m_runtime.IsNullResource(record.resource) || record.size == 0) {
             // Unbound/disabled uniform: read zeros.
             address = m_zero_address;
@@ -2116,6 +2227,46 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         d3d->CreateConstantBufferView(&cbv, m_res_heap.CpuHandle(cbv_slot_base + slot));
     }
 
+    // S21 cycle 13: input-isolation probe. The settled character draw writes QR-NaN over its
+    // whole silhouette, and static analysis of ps_133 cannot pin the source because every
+    // texture reads back with content. Substitute ONE sampled input per gf window with the
+    // draw's own albedo (a known-good 2D SRV): if the NaN disappears, that input is the
+    // source. Slot 0 = baseline (no substitution). Bounded: one log line per slot change.
+    const u32 s21_probe_slot =
+        g_s18_guest_frames >= 20000
+            ? static_cast<u32>(((g_s18_guest_frames - 20000) / 400) % 8)
+            : 0;
+    D3D12_CPU_DESCRIPTOR_HANDLE s21_probe_srv{};
+    if (s21_probe_slot != 0 && params.num_vertices >= 6790) {
+        u32 s21_ord = 0;
+        for (const DrawSlot& s21_slot : res_slots) {
+            if (s21_slot.kind != SlotKind::Sampled ||
+                s21_slot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                continue;
+            }
+            ImageView& s21_av = m_texture_cache.GetImageView(s21_slot.view);
+            ++s21_ord;
+            if (s21_av.format == VideoCore::Surface::PixelFormat::BC1_RGBA_SRGB &&
+                s21_av.Sampled().ptr != 0) {
+                s21_probe_srv = s21_av.Sampled();
+            }
+            if (s21_ord == s21_probe_slot && s21_probe_srv.ptr != 0) {
+                static u32 s21_probe_logged = ~u32{0};
+                if (s21_probe_logged != s21_probe_slot) {
+                    s21_probe_logged = s21_probe_slot;
+                    LOG_WARNING(Render_D3D12,
+                                "S21 slot probe: gf={} verts={} slot{} img={} gpu={:#x} {}x{} "
+                                "fmt={:#x} -> albedo SRV",
+                                g_s18_guest_frames, params.num_vertices, s21_probe_slot,
+                                s21_av.image_id.index, static_cast<u64>(s21_av.GpuAddr()),
+                                s21_av.size.width, s21_av.size.height,
+                                static_cast<u32>(s21_av.format));
+                }
+                break;
+            }
+        }
+    }
+    u32 s21_sampled_ordinal = 0;
     for (u32 k = 0; k < num_res; ++k) {
         const DrawSlot& slot = res_slots[k];
         ID3D12Resource* resource = nullptr;
@@ -2152,9 +2303,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             break;
         case SlotKind::Sampled: {
             if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
+                ++s21_sampled_ordinal;
                 ImageView& image_view = m_texture_cache.GetImageView(slot.view);
                 prebuilt = image_view.Sampled();
                 have_prebuilt = prebuilt.ptr != 0;
+                if (s21_probe_srv.ptr != 0 && s21_sampled_ordinal == s21_probe_slot) {
+                    prebuilt = s21_probe_srv;
+                    have_prebuilt = true;
+                }
                 // Feedback loop: sample a snapshot copy of the target instead of the live
                 // resource (undefined read on D3D12; written back as zeros on Xbox).
                 if (is_feedback_source(image_view)) {
@@ -3566,7 +3722,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // S21 cycle 6: gate on the BIG scene draws (>= 4000 verts) - the character
                 // (6798/17550) and the copy warps. The small card-panel draws were fully
                 // characterised in cycle 5; the remaining darkness is on the character draw.
-                if (s21_windows < 16 && g_s18_guest_frames >= 11700 && params.num_vertices >= 4000 &&
+                if (s21_windows < 40 && g_s18_guest_frames >= 11700 && params.num_vertices >= 4000 &&
                     s15_sampled >= 5 &&
                     std::chrono::steady_clock::now() - s21_last > std::chrono::seconds(60)) {
                     s21_last = std::chrono::steady_clock::now();
@@ -3742,9 +3898,118 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         s21_slot, static_cast<u64>(s21_vb_addr),
                                         s21_vb.SizeInBytes, s21_vb.StrideInBytes, s21_vb_hex,
                                         s21_vb_floats);
+                            // S21 cycle 10: a zero-length packed normal (R=G=B=0) or tangent
+                            // normalises to rsqrt(0)=Inf in the VS and poisons every interpolated
+                            // value on the triangles that touch it - one candidate for the
+                            // character/fish QR-NaN. Count them over the whole stream.
+                            if (d < 3 && s21_vb_addr != 0 && s21_vb.StrideInBytes >= 4) {
+                                const u64 s21_span = std::min<u64>(
+                                    s21_vb.SizeInBytes,
+                                    static_cast<u64>(s21_vb.StrideInBytes) * params.num_vertices);
+                                if (s21_span >= 4 && s21_span <= (1ull << 20)) {
+                                    std::vector<u8> s21_stream(s21_span);
+                                    const auto s21_srd = m_device_memory.ReadBlockUnsafe(
+                                        s21_vb_addr, s21_stream.data(), s21_span, "S21.VBScan",
+                                        false);
+                                    if (s21_srd.fully_mapped) {
+                                        u32 s21_zero_xyz = 0;
+                                        u32 s21_all_zero = 0;
+                                        const u32 s21_stride = s21_vb.StrideInBytes;
+                                        for (u64 off = 0; off + s21_stride <= s21_span;
+                                             off += s21_stride) {
+                                            const u8* const p = s21_stream.data() + off;
+                                            bool xyz_zero = true;
+                                            for (u32 b = 0; b < std::min<u32>(3, s21_stride);
+                                                 ++b) {
+                                                xyz_zero &= p[b] == 0;
+                                            }
+                                            bool all = true;
+                                            for (u32 b = 0; b < s21_stride; ++b) {
+                                                all &= p[b] == 0;
+                                            }
+                                            s21_zero_xyz += xyz_zero ? 1 : 0;
+                                            s21_all_zero += all ? 1 : 0;
+                                        }
+                                        LOG_WARNING(Render_D3D12,
+                                                    "S21 vb scan #{} draw{} slot{}: stride={} "
+                                                    "vertices={} zero_xyz={} all_zero={} span={}",
+                                                    s21_windows, s21_in_window, s21_slot,
+                                                    s21_stride, s21_span / s21_stride,
+                                                    s21_zero_xyz, s21_all_zero, s21_span);
+                                    }
+                                }
+                            }
+                        }
+                    // S21 cycle 10 causal probe: the settled scene RT holds QR-NaN over the
+                    // character and fish, and the character PS's final colour depends on the c9
+                    // table (taint: c9[dyn] -> frag_color). If that table really carries NaN,
+                    // replacing every non-finite float with 0 must change the object shading in
+                    // the following frames. One-shot, settled phase only; guest memory is
+                    // mutated deliberately for this diagnostic.
+                    {
+                        // S21 cycle 12: DISARMED. Cycle 11 replaced the table's 400 NaNs with
+                        // 0 and the frame blew out (mean 55 -> 120, white/black dither), so
+                        // those NaNs are load-bearing sentinels, not garbage. The real defect
+                        // was the CBV size clamp (see the CBV loop above).
+                        static bool s21_c9_sanitised = true;
+                        if (!s21_c9_sanitised && g_s18_guest_frames >= 13500 &&
+                            params.num_vertices >= 6000) {
+                            s21_c9_sanitised = true;
+                            const auto& s21_cb =
+                                maxwell3d->state.shader_stages[4].const_buffers[9];
+                            if (s21_cb.size >= 2048 && gpu_memory != nullptr) {
+                                const auto s21_dev = gpu_memory->GpuToCpuAddress(s21_cb.address);
+                                if (s21_dev) {
+                                    std::vector<u8> s21_buf(s21_cb.size);
+                                    const auto s21_rd = m_device_memory.ReadBlockUnsafe(
+                                        *s21_dev, s21_buf.data(), s21_buf.size(), "S21.C9Fix",
+                                        false);
+                                    u32 s21_fixed = 0;
+                                    if (s21_rd.fully_mapped) {
+                                        for (size_t i = 0; i + 3 < s21_buf.size(); i += 4) {
+                                            f32 v = 0.0f;
+                                            std::memcpy(&v, s21_buf.data() + i, sizeof(v));
+                                            u32 bits = 0;
+                                            std::memcpy(&bits, &v, sizeof(bits));
+                                            if ((bits & 0x7F800000u) == 0x7F800000u) {
+                                                const f32 zero = 0.0f;
+                                                std::memcpy(s21_buf.data() + i, &zero,
+                                                            sizeof(zero));
+                                                ++s21_fixed;
+                                            }
+                                        }
+                                        if (s21_fixed != 0) {
+                                            m_device_memory.WriteBlockUnsafe(
+                                                *s21_dev, s21_buf.data(), s21_buf.size());
+                                            // The bound CBV is served from the buffer cache's own
+                                            // resource, so the guest-memory write alone would
+                                            // never reach the GPU: mark the range CPU-modified
+                                            // so the next bind re-uploads it.
+                                            {
+                                                std::scoped_lock s21_lock{m_buffer_cache.mutex};
+                                                m_buffer_cache.WriteMemory(
+                                                    static_cast<DAddr>(*s21_dev),
+                                                    s21_buf.size());
+                                            }
+                                            {
+                                                std::scoped_lock s21_lock{m_texture_cache.mutex};
+                                                m_texture_cache.WriteMemory(
+                                                    static_cast<DAddr>(*s21_dev),
+                                                    s21_buf.size());
+                                            }
+                                        }
+                                    }
+                                    LOG_WARNING(Render_D3D12,
+                                                "S21 c9 sanitise: gpu={:#x} size={} fixed={} "
+                                                "mapped={}",
+                                                static_cast<u64>(s21_cb.address), s21_cb.size,
+                                                s21_fixed, s21_rd.fully_mapped ? 1 : 0);
+                                }
+                            }
                         }
                     }
                 }
+            }
             }
             // TEMP DIAGNOSTIC (session 15): the scene's lighting LUTs are small B10G11R11 /
             // R16G16_FLOAT textures; dump the first draw that samples them and probe their
@@ -5505,6 +5770,22 @@ void RasterizerD3D12::Clear(u32 layer_count) {
             }
         }
         {
+            // TEMP DIAGNOSTIC (S21 cycle 11): clears of the character PS's c9 table window.
+            static u32 s21_c9_clear_logs = 0;
+            if (use_color && view != nullptr && resource != nullptr && s21_c9_clear_logs < 24) {
+                const u64 s21_clear_gpu = static_cast<u64>(view->GpuAddr());
+                if (s21_clear_gpu >= 0x5e9700000ull && s21_clear_gpu < 0x5e9800000ull) {
+                    ++s21_c9_clear_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S21 c9 producer: clear gpu={:#x} img={} color=({},{},{},{}) "
+                                "scissor={}",
+                                s21_clear_gpu, view->image_id.index, regs.clear_color[0],
+                                regs.clear_color[1], regs.clear_color[2], regs.clear_color[3],
+                                regs.clear_control.use_scissor ? 1 : 0);
+                }
+            }
+        }
+        {
             // TEMP DIAGNOSTIC (S15, producer tracer): bounded trace of a clear landing
             // inside the wiper-input window [0x517000000, 0x517200000) - a clear is a
             // candidate zero-producer for the 480x270 R16G16 input no draw renders into.
@@ -5900,8 +6181,11 @@ void RasterizerD3D12::DispatchCompute() {
                     qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind, static_cast<u64>(gpu),
                     size);
             };
+            // S21 cycle 11: own budget so the S15/S17 early-break cannot hide a c9 writer.
+            static u32 s21_c9_compute_logs = 0;
             for (const auto& desc : info.storage_buffers_descriptors) {
-                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16 &&
+                    s21_c9_compute_logs >= 24) {
                     break;
                 }
                 if (desc.cbuf_index >= cbufs.size()) [[unlikely]] {
@@ -5917,10 +6201,26 @@ void RasterizerD3D12::DispatchCompute() {
                 if (s17_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
                     s17_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
                 }
+                // S21 cycle 11: does any dispatch write the character PS's c9 table?
+                {
+                    const u64 s21_end =
+                        s15_ssbo_gpu + (s15_ssbo_size != 0 ? s15_ssbo_size : 1);
+                    if (s21_c9_compute_logs < 24 && s15_ssbo_gpu < 0x5e9800000ull &&
+                        s21_end > 0x5e9700000ull) {
+                        ++s21_c9_compute_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S21 c9 producer: compute program={:#x} grid=({},{},{}) "
+                                    "ssbo gpu={:#x} size={}",
+                                    static_cast<u64>(qmd.program_start), qmd.grid_dim_x.Value(),
+                                    qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
+                                    static_cast<u64>(s15_ssbo_gpu), s15_ssbo_size);
+                    }
+                }
             }
             for (size_t i = texbuf_total; i < texbuf_total + imgbuf_total && i < views.size();
                  ++i) {
-                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16 &&
+                    s21_c9_compute_logs >= 24) {
                     break;
                 }
                 if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
@@ -5936,7 +6236,8 @@ void RasterizerD3D12::DispatchCompute() {
                 }
             }
             for (size_t i = sampled_views_end; i < views.size(); ++i) {
-                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16) {
+                if (s15_compute_wiper_logs >= 16 && s17_compute_producer_logs >= 16 &&
+                    s21_c9_compute_logs >= 24) {
                     break;
                 }
                 if (views[i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
@@ -6170,6 +6471,20 @@ void RasterizerD3D12::DispatchCompute() {
         const auto& record = bindings[cbv_records[slot]];
         D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
         u64 cbv_size = record.size != 0 ? record.size : u64{256};
+        // S21 cycle 12: D3D12 enforces ConstantBufferView.SizeInBytes and zero-fills reads
+        // beyond it, but the guest's declared size is only a hint - the hardware (and the
+        // Vulkan backend's whole-buffer descriptors) serve reads past it from the mapped
+        // buffer. ps_133 reads its c9 table at byte 17632 through a 9216-byte CBV; with the
+        // declared size those reads returned 0 and fed a wrong index into the object shading.
+        // Extend the view to the whole committed resource (D3D12 caps a CBV at 64 KB).
+        const bool cbv_aligned =
+            (address & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1)) == 0;
+        if (record.resource != nullptr && record.size != 0 && cbv_aligned &&
+            record.offset < record.resource->GetDesc().Width) {
+            const u64 cbv_available =
+                std::min<u64>(record.resource->GetDesc().Width - record.offset, 64 * 1024);
+            cbv_size = std::max(cbv_size, cbv_available);
+        }
         if (m_runtime.IsNullResource(record.resource) || record.size == 0) {
             // Unbound/disabled uniform: read zeros.
             address = m_zero_address;
@@ -6469,6 +6784,28 @@ bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
         return static_cast<DAddr>(0x29426000);
     }();
     const bool s17_bank_write = addr < s17_bank_dev + 0x1a34000 && addr + size > s17_bank_dev;
+    // S21 cycle 11: name every writer of the character PS's c9 table (gpu 0x5e9700000, the
+    // 64 KB MapBufferEx heap that holds 0xFFC00000 = QR-NaN in the settled phase). The shader's
+    // final colour depends on c9[dyn], so "who writes it, and when" decides between guest data
+    // we mis-read and a writer we never execute.
+    static const DAddr s21_c9_dev = [this]() -> DAddr {
+        if (gpu_memory != nullptr) {
+            if (const auto cpu = gpu_memory->GpuToCpuAddress(0x5e9700000ull)) {
+                return static_cast<DAddr>(*cpu);
+            }
+        }
+        return static_cast<DAddr>(0xaa6d1000);
+    }();
+    {
+        static u32 s21_c9_cpuwrite_logs = 0;
+        if (s21_c9_cpuwrite_logs < 24 && addr < s21_c9_dev + 0x10000 &&
+            addr + size > s21_c9_dev) {
+            ++s21_c9_cpuwrite_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S21 c9 cpuwrite #{}: dev={:#x} size={} (character PS table)",
+                        s21_c9_cpuwrite_logs, static_cast<u64>(addr), size);
+        }
+    }
     // S19: a guest CPU store into either of the LUT fills' two zero inputs would name the writer
     // immediately (the sample table is constant data - a CPU upload is the most likely source).
     // Dev windows: the 256x4 table's 64 KB heap (dev 0xbaec8000) and the probe heap region
@@ -6649,6 +6986,27 @@ void RasterizerD3D12::AccelerateInlineToMemory(GPUVAddr address, size_t copy_siz
     // Mirror RasterizerVulkan: the uploaded bytes must land in guest memory; the
     // buffer/texture cache hooks below only refresh host-side cached copies.
     gpu_memory->WriteBlockUnsafe(address, memory.data(), copy_size);
+    // S21 cycle 11: does the guest upload the character PS's c9 table inline? If it does, the
+    // content is guest-authored and any poison came from the guest, not from a missed pass.
+    {
+        static u32 s21_c9_inline_logs = 0;
+        if (s21_c9_inline_logs < 24 && address < 0x5e9800000ull &&
+            address + copy_size > 0x5e9700000ull) {
+            ++s21_c9_inline_logs;
+            u32 nz = 0;
+            for (size_t i = 0; i < memory.size(); ++i) {
+                nz += memory[i] != 0 ? 1 : 0;
+            }
+            LOG_WARNING(Render_D3D12,
+                        "S21 c9 inline upload #{}: gpu={:#x} size={} nonzero={} first={:08x}",
+                        s21_c9_inline_logs, static_cast<u64>(address), copy_size, nz,
+                        memory.size() >= 4
+                            ? (static_cast<u32>(memory[0]) | (static_cast<u32>(memory[1]) << 8) |
+                               (static_cast<u32>(memory[2]) << 16) |
+                               (static_cast<u32>(memory[3]) << 24))
+                            : 0u);
+        }
+    }
     const std::optional<DAddr> cpu_addr = gpu_memory->GpuToCpuAddress(address);
     if (!cpu_addr) {
         return;
