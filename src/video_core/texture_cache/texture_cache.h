@@ -3218,13 +3218,25 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
             s22_src_gpu >= 0x5e9000000ull && s22_src_gpu < 0x5ee7b4000ull;
         if (s22_bank_copy_logs < 48 && (s22_dst_bank || s22_src_bank)) {
             ++s22_bank_copy_logs;
+            // The box matters: SynchronizeAliases copies FROM the 16x8 alias tile INTO this
+            // 256x256 image, so a full-extent box here overwrites the whole LUT with one tile.
+            const ImageCopy* s22_first = copies.empty() ? nullptr : &copies.front();
             LOG_WARNING(Render_D3D12,
                         "S22 bank copy #{}: dst={} gpu={:#x} {}x{} fmt={:#x} src={} gpu={:#x} "
-                        "{}x{} fmt={:#x} copies={}",
+                        "{}x{} fmt={:#x} copies={} ext=({},{},{}) dst=({},{},{}) src=({},{},{})",
                         s22_bank_copy_logs, dst_id.index, s22_dst_gpu, dst.info.size.width,
                         dst.info.size.height, static_cast<u32>(dst.info.format), src_id.index,
                         s22_src_gpu, src.info.size.width, src.info.size.height,
-                        static_cast<u32>(src.info.format), copies.size());
+                        static_cast<u32>(src.info.format), copies.size(),
+                        s22_first ? s22_first->extent.width : 0,
+                        s22_first ? s22_first->extent.height : 0,
+                        s22_first ? s22_first->extent.depth : 0,
+                        s22_first ? s22_first->dst_offset.x : 0,
+                        s22_first ? s22_first->dst_offset.y : 0,
+                        s22_first ? s22_first->dst_offset.z : 0,
+                        s22_first ? s22_first->src_offset.x : 0,
+                        s22_first ? s22_first->src_offset.y : 0,
+                        s22_first ? s22_first->src_offset.z : 0);
         }
     }
     // TEMP DIAGNOSTIC (S18, Phase 0.2.1): a copy with a 1x1 side is a candidate writer (alias
