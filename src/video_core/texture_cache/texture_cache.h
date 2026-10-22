@@ -1892,11 +1892,16 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // dropped on the bad-overlap floor. Bounded 24.
     const auto s19_join_window = [](u64 gpu) {
         return (gpu >= 0x516170000ull && gpu < 0x516170000ull + 0x408000ull) ||
-               (gpu >= 0x5d0630000ull && gpu < 0x5d0631000ull);
+               (gpu >= 0x5d0630000ull && gpu < 0x5d0631000ull) ||
+               // S22 cycle 21: the lighting-LUT bank. Its join creates the 27 MB image right
+               // after the six 256x256 fills, then RefreshContents uploads ZERO guest bytes
+               // over it (t=761.302 in 1.0.320). The branch counts say whether the filled
+               // members were queued for copying, aliased, or dropped on the bad-overlap floor.
+               (gpu >= 0x5e9000000ull && gpu < 0x5ee7b4000ull);
     };
     if (s19_join_window(static_cast<u64>(gpu_addr))) {
         static u32 s19_join_logs = 0;
-        if (s19_join_logs < 24) {
+        if (s19_join_logs < 48) {
             ++s19_join_logs;
             LOG_WARNING(Render_D3D12,
                         "S19 join branch: gpu={:#x} {}x{} fmt={:#x} overlaps={} leftalias={} "
