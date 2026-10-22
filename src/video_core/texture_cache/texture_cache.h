@@ -3205,6 +3205,28 @@ template <class P>
 void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
     Image& dst = slot_images[dst_id];
     Image& src = slot_images[src_id];
+    // S22 cycle 24: any cache-level copy touching the lighting-LUT bank. The LUT is finite at
+    // t=771 and all-NaN at t=834 with no clear, no alias propagation and no later draw burst
+    // logged, so a copy is the remaining writer class.
+    {
+        static u32 s22_bank_copy_logs = 0;
+        const u64 s22_dst_gpu = static_cast<u64>(dst.gpu_addr);
+        const u64 s22_src_gpu = static_cast<u64>(src.gpu_addr);
+        const bool s22_dst_bank =
+            s22_dst_gpu >= 0x5e9000000ull && s22_dst_gpu < 0x5ee7b4000ull;
+        const bool s22_src_bank =
+            s22_src_gpu >= 0x5e9000000ull && s22_src_gpu < 0x5ee7b4000ull;
+        if (s22_bank_copy_logs < 48 && (s22_dst_bank || s22_src_bank)) {
+            ++s22_bank_copy_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S22 bank copy #{}: dst={} gpu={:#x} {}x{} fmt={:#x} src={} gpu={:#x} "
+                        "{}x{} fmt={:#x} copies={}",
+                        s22_bank_copy_logs, dst_id.index, s22_dst_gpu, dst.info.size.width,
+                        dst.info.size.height, static_cast<u32>(dst.info.format), src_id.index,
+                        s22_src_gpu, src.info.size.width, src.info.size.height,
+                        static_cast<u32>(src.info.format), copies.size());
+        }
+    }
     // TEMP DIAGNOSTIC (S18, Phase 0.2.1): a copy with a 1x1 side is a candidate writer (alias
     // propagation) of the exposure texel. The bank filter below requires both sides > 4 KiB, so
     // a 16-byte 1x1 copy would slip past it - this check is size-independent. Cap 12.

@@ -886,9 +886,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         // bank tracer was exhausted by the boot LUTs, hence this independent budget.
         if (view != nullptr) {
             static u32 s22_bank_bind_logs = 0;
+            static std::chrono::steady_clock::time_point s22_bank_last{};
             const u64 s22_bank_gpu = static_cast<u64>(view->GpuAddr());
-            if (s22_bank_bind_logs < 48 && s22_bank_gpu >= 0x5e9000000ull &&
+            const auto s22_bank_now = std::chrono::steady_clock::now();
+            // Burst mode: the whole fill + mip chain is 100 ms of draws, so a plain cap hides
+            // every later burst. Log the FIRST draw of each new burst (>=1 s gap) instead.
+            const bool s22_bank_new_burst =
+                s22_bank_now - s22_bank_last > std::chrono::seconds(1);
+            if (s22_bank_bind_logs < 64 && s22_bank_new_burst && s22_bank_gpu >= 0x5e9000000ull &&
                 s22_bank_gpu < 0x5ee7b4000ull) {
+                s22_bank_last = s22_bank_now;
                 ++s22_bank_bind_logs;
                 LOG_WARNING(Render_D3D12,
                             "S22 bank draw #{}: slot={} gpu={:#x} res=0x{:x} {}x{} fmt={:#x} "
