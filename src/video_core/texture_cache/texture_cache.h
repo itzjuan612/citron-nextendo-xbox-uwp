@@ -3374,6 +3374,27 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                         static_cast<u32>(src.flags), copies.size());
         }
     }
+    // S23 cycle 4: dedicated copy tracer for the lit/black 1024x1024 BC5 at 0x5e9430000 (and its
+    // 0x510f30000 mask sibling). Own budget; logs dst and src side by side, any size.
+    {
+        static u32 s23_bc5_copy_logs = 0;
+        const auto s23_bc5_hits = [](const ImageBase& i) {
+            const u64 g = static_cast<u64>(i.gpu_addr);
+            return (g >= 0x5e9430000ull && g < 0x5e9580000ull) ||
+                   (g >= 0x510f30000ull && g < 0x510f40000ull);
+        };
+        if (s23_bc5_copy_logs < 24 && (s23_bc5_hits(dst) || s23_bc5_hits(src))) {
+            ++s23_bc5_copy_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S23 BC5 copyimg: dst=({} gpu={:#x} {}x{} size={} flags={:#x}) src=({} "
+                        "gpu={:#x} {}x{} size={} flags={:#x}) copies={} tick={}/{}",
+                        dst_id.index, static_cast<u64>(dst.gpu_addr), dst.info.size.width,
+                        dst.info.size.height, dst.guest_size_bytes, static_cast<u32>(dst.flags),
+                        src_id.index, static_cast<u64>(src.gpu_addr), src.info.size.width,
+                        src.info.size.height, src.guest_size_bytes, static_cast<u32>(src.flags),
+                        copies.size(), dst.modification_tick, src.modification_tick);
+        }
+    }
     const bool is_rescaled = True(src.flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
         ASSERT(True(dst.flags & ImageFlagBits::Rescaled));

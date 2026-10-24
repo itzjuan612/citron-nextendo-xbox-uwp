@@ -921,6 +921,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         unbound ? 1 : 0, stored.pipeline->State().attachments[0].raw,
                         params.num_vertices);
         }
+        // S23 cycle 4: dedicated producer budget for the 1024x1024 BC5 at 0x5e9430000 - the image
+        // whose content decides whether the 3D scene renders lit or black. The shared S17 budget
+        // below is consumed at boot by the environment-probe VA (every logged line is
+        // 0x516170000), so this window never appeared in any run. 24 lines, this window only.
+        {
+            static u32 s23_bc5_draw_logs = 0;
+            if (view != nullptr && s23_bc5_draw_logs < 24) {
+                const u64 s23_bc5_gpu = static_cast<u64>(view->GpuAddr());
+                if (s23_bc5_gpu >= 0x5e9430000ull && s23_bc5_gpu < 0x5e9580000ull) {
+                    ++s23_bc5_draw_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S23 BC5 producer: draw rt slot={} gpu={:#x} res={:#x} {}x{} "
+                                "raw_fmt={:#x} att={:#x} verts={}",
+                                i, s23_bc5_gpu, reinterpret_cast<u64>(view->Resource()),
+                                view->size.width, view->size.height, raw_format,
+                                stored.pipeline->State().attachments[0].raw,
+                                params.num_vertices);
+                }
+            }
+        }
         // TEMP DIAGNOSTIC (S17): color-slot half of the pre-guard producer tracer (see the
         // depth-side block above); runs before the skip returns below so a rejected producer
         // bind still logs. 32-draw budget shared with the depth half.
@@ -4654,29 +4674,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                               s23_rt_gpu < 0x510600000ull &&
                                               s15_post_desc.Width >= 900 &&
                                               s15_post_desc.Width <= 1400;
+                    // S23 cycle 4: the trace never armed in the 1.0.329/330 runs although colour
+                    // draws into the scene RT are equally frequent there, so the gate itself was
+                    // wrong: start on ANY draw into the scene window and log the mask/depth flags,
+                    // instead of requiring a colour mask + a depth view up front.
                     if (!s23_trace_started && !s23_trace_done && s23_rt_scene &&
-                        s15_post_color && depth_view != nullptr &&
                         g_s18_guest_frames > 15000) {
                         s23_trace_started = true;
                         s23_trace_rt = s23_rt_gpu;
+                        LOG_WARNING(Render_D3D12,
+                                    "S23 trace armed: rt={:#x} {}x{} verts={} mask={}{}{}{} "
+                                    "depth={} att={:#x}",
+                                    s23_rt_gpu, s15_post_desc.Width, s15_post_desc.Height,
+                                    params.num_vertices,
+                                    s15_post_mask[0] ? 1 : 0, s15_post_mask[1] ? 1 : 0,
+                                    s15_post_mask[2] ? 1 : 0, s15_post_mask[3] ? 1 : 0,
+                                    depth_view != nullptr ? 1 : 0,
+                                    stored.pipeline->State().attachments[0].raw);
                     }
                     if (s23_trace_started && !s23_trace_done) {
                         ++s23_trace_index;
+                        // S23 cycle 5: the 1.0.331 trace spent its 24 draws on the depth prepass
+                        // (21 draws with mask=0) and stopped before the four big colour writers,
+                        // so the frame's colour pass was never captured. Count every draw but log
+                        // and dump only COLOUR writers, and allow 64 draws / 8 dumps.
                         u32 s23_sampled = 0;
                         for (const DrawSlot& s23_slot : res_slots) {
                             if (s23_slot.kind == SlotKind::Sampled) {
                                 ++s23_sampled;
                             }
                         }
-                        LOG_WARNING(Render_D3D12,
-                                    "S23 trace #{}: rt={:#x} {}x{} verts={} att={:#x} blend={} "
-                                    "sampled={}",
-                                    s23_trace_index, s23_rt_gpu, s15_post_desc.Width,
-                                    s15_post_desc.Height, params.num_vertices,
-                                    stored.pipeline->State().attachments[0].raw,
-                                    stored.pipeline->State().attachments[0].enable.Value(),
-                                    s23_sampled);
-                        if (s23_trace_dumps < 6 && s23_rt_gpu == s23_trace_rt && s15_post_color) {
+                        if (s15_post_color) {
+                            LOG_WARNING(Render_D3D12,
+                                        "S23 trace #{}: rt={:#x} {}x{} verts={} att={:#x} blend={} "
+                                        "sampled={} depth={}",
+                                        s23_trace_index, s23_rt_gpu, s15_post_desc.Width,
+                                        s15_post_desc.Height, params.num_vertices,
+                                        stored.pipeline->State().attachments[0].raw,
+                                        stored.pipeline->State().attachments[0].enable.Value(),
+                                        s23_sampled, depth_view != nullptr ? 1 : 0);
+                        }
+                        if (s23_trace_dumps < 8 && s23_rt_gpu == s23_trace_rt && s15_post_color) {
                             ++s23_trace_dumps;
                             const u32 s23_id = 941000u + s23_trace_dumps;
                             (void)D3D12::RecordTextureContentDump(
@@ -4686,7 +4724,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             LOG_WARNING(Render_D3D12, "S23 trace dump id={} after draw #{}",
                                         s23_id, s23_trace_index);
                         }
-                        if (s23_trace_index >= 24) {
+                        if (s23_trace_index >= 64) {
                             s23_trace_done = true;
                             LOG_WARNING(Render_D3D12, "S23 trace done after {} draws",
                                         s23_trace_index);
@@ -6119,9 +6157,25 @@ void RasterizerD3D12::DispatchCompute() {
                        s17_overlap(0x5eb340000ull, 0x1a34000ull) ||
                        s17_overlap(0x5ecd80000ull, 0x1a34000ull) ||
                        s17_overlap(0x510fa0000ull, 0x100000ull) ||
-                       s17_overlap(0x510f30000ull, 0x100000ull);
+                       s17_overlap(0x510f30000ull, 0x100000ull) ||
+                       s17_overlap(0x5e9430000ull, 0x150000ull);  // S23: the lit/black BC5
             };
             const auto s17_compute_log = [&](const char* kind, u64 gpu, u64 size) {
+                // S23 cycle 4: own budget for the BC5 window (the shared one below dies at boot).
+                {
+                    static u32 s23_bc5_compute_logs = 0;
+                    const u64 s23_end = gpu + (size != 0 ? size : 1);
+                    if (s23_bc5_compute_logs < 24 && gpu < 0x5e9580000ull &&
+                        s23_end > 0x5e9430000ull) {
+                        ++s23_bc5_compute_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S23 BC5 producer: compute program={:#x} grid=({},{},{}) "
+                                    "kind={} gpu={:#x} size={}",
+                                    static_cast<u64>(qmd.program_start), qmd.grid_dim_x.Value(),
+                                    qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind,
+                                    static_cast<u64>(gpu), size);
+                    }
+                }
                 if (s17_compute_producer_logs >= 16) {
                     return;
                 }
@@ -6759,6 +6813,30 @@ bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
                         s21_c9_cpuwrite_logs, static_cast<u64>(addr), size);
         }
     }
+    // S23 cycle 4: the 1024x1024 BC5 that decides "lit vs black scene" lives inside a MapBufferEx
+    // heap (handle 0x360, gpu 0x5e9430000, dev 0x29076000, 0x2cf000 bytes), so the guest fills it
+    // through the mapped buffer, not through guest RAM - a path 'WriteMemory' never sees (its
+    // probe logged 0 notifications). Log every CPU store that lands in that heap, with the offset
+    // inside it, so the upload's timing can be compared with the data arrival.
+    static const DAddr s23_bc5_dev = [this]() -> DAddr {
+        if (gpu_memory != nullptr) {
+            if (const auto cpu = gpu_memory->GpuToCpuAddress(0x5e9430000ull)) {
+                return static_cast<DAddr>(*cpu);
+            }
+        }
+        return static_cast<DAddr>(0x29076000);
+    }();
+    const bool s23_bc5_write = addr < s23_bc5_dev + 0x2cf000 && addr + size > s23_bc5_dev;
+    {
+        static u32 s23_bc5_cpuwrite_logs = 0;
+        if (s23_bc5_cpuwrite_logs < 24 && s23_bc5_write) {
+            ++s23_bc5_cpuwrite_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S23 BC5 cpuwrite #{}: dev={:#x} size={} off={:#x} (mapped texture heap)",
+                        s23_bc5_cpuwrite_logs, static_cast<u64>(addr), size,
+                        static_cast<u64>(addr - s23_bc5_dev));
+        }
+    }
     // S19: a guest CPU store into either of the LUT fills' two zero inputs would name the writer
     // immediately (the sample table is constant data - a CPU upload is the most likely source).
     // Dev windows: the 256x4 table's 64 KB heap (dev 0xbaec8000) and the probe heap region
@@ -6785,6 +6863,17 @@ bool RasterizerD3D12::OnCPUWrite(DAddr addr, u64 size) {
                 LOG_WARNING(Render_D3D12,
                             "S17 LUT producer: cpuwrite dev={:#x} size={} swallowed by buffer "
                             "cache (texture cache never notified)",
+                            static_cast<u64>(addr), size);
+            }
+            // S23 cycle 4: the same swallow would explain why the BC5 inside the mapped texture
+            // heap never refreshes - "buffer cache claimed the write" means the texture cache was
+            // never told, so the image keeps whatever the first upload captured.
+            static u32 s23_bc5_swallow_logs = 0;
+            if (s23_bc5_write && s23_bc5_swallow_logs < 16) {
+                ++s23_bc5_swallow_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S23 BC5 cpuwrite SWALLOWED by buffer cache: dev={:#x} size={} "
+                            "(texture cache never notified)",
                             static_cast<u64>(addr), size);
             }
             return true;
