@@ -4667,6 +4667,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     static bool s23_trace_done = false;
                     static u32 s23_trace_index = 0;
                     static u32 s23_trace_dumps = 0;
+                    static u32 s23_trace_round = 0;
                     static u64 s23_trace_rt = 0;
                     const u64 s23_rt_gpu =
                         static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr());
@@ -4674,18 +4675,33 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                               s23_rt_gpu < 0x510600000ull &&
                                               s15_post_desc.Width >= 900 &&
                                               s15_post_desc.Width <= 1400;
+                    // S23 cycle 7: the screen is PHASED (the camera/animation sits in very
+                    // different framings for ~10 wall-clock minutes each), so a single traced
+                    // frame can land in a dark phase where nothing is visible. Re-arm every 3000
+                    // guest frames, five rounds per run, so one run samples several phases.
+                    if (s23_trace_done && s23_trace_round < 4 &&
+                        g_s18_guest_frames >=
+                            15000ull + static_cast<u64>(s23_trace_round + 1) * 3000ull) {
+                        ++s23_trace_round;
+                        s23_trace_done = false;
+                        s23_trace_started = false;
+                        s23_trace_index = 0;
+                        s23_trace_dumps = 0;
+                    }
                     // S23 cycle 4: the trace never armed in the 1.0.329/330 runs although colour
                     // draws into the scene RT are equally frequent there, so the gate itself was
                     // wrong: start on ANY draw into the scene window and log the mask/depth flags,
                     // instead of requiring a colour mask + a depth view up front.
                     if (!s23_trace_started && !s23_trace_done && s23_rt_scene &&
-                        g_s18_guest_frames > 15000) {
+                        g_s18_guest_frames >=
+                            15000ull + static_cast<u64>(s23_trace_round) * 3000ull) {
                         s23_trace_started = true;
                         s23_trace_rt = s23_rt_gpu;
                         LOG_WARNING(Render_D3D12,
-                                    "S23 trace armed: rt={:#x} {}x{} verts={} mask={}{}{}{} "
-                                    "depth={} att={:#x}",
-                                    s23_rt_gpu, s15_post_desc.Width, s15_post_desc.Height,
+                                    "S23 trace armed: round={} gf={} rt={:#x} {}x{} verts={} "
+                                    "mask={}{}{}{} depth={} att={:#x}",
+                                    s23_trace_round, g_s18_guest_frames, s23_rt_gpu,
+                                    s15_post_desc.Width, s15_post_desc.Height,
                                     params.num_vertices,
                                     s15_post_mask[0] ? 1 : 0, s15_post_mask[1] ? 1 : 0,
                                     s15_post_mask[2] ? 1 : 0, s15_post_mask[3] ? 1 : 0,
@@ -4714,15 +4730,27 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         stored.pipeline->State().attachments[0].enable.Value(),
                                         s23_sampled, depth_view != nullptr ? 1 : 0);
                         }
-                        if (s23_trace_dumps < 8 && s23_rt_gpu == s23_trace_rt && s15_post_color) {
+                        // S23 cycle 6: the 1.0.334 dumps of #22..#29 were all identical (the
+                        // frame's early colour draws add almost nothing to a dark scene), so
+                        // dump only the draws that carry real content, keyed by vertex count:
+                        // 1722/3426 (main scene), 6750 (main material), 9600 (black-textured),
+                        // 6798 (the ground), 17550 (largest).
+                        const auto s23_dump_verts = [](u32 v) {
+                            return v == 1722 || v == 3426 || v == 6750 || v == 9600 || v == 6798 ||
+                                   v == 17550;
+                        };
+                        if (s23_trace_dumps < 8 && s23_rt_gpu == s23_trace_rt && s15_post_color &&
+                            s23_dump_verts(params.num_vertices)) {
                             ++s23_trace_dumps;
-                            const u32 s23_id = 941000u + s23_trace_dumps;
+                            const u32 s23_id =
+                                941000u + s23_trace_round * 10u + s23_trace_dumps;
                             (void)D3D12::RecordTextureContentDump(
                                 m_device.GetDevice(), m_command_list, s15_post_res,
                                 static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
                                 s23_rt_gpu, s23_id, /*force=*/true);
-                            LOG_WARNING(Render_D3D12, "S23 trace dump id={} after draw #{}",
-                                        s23_id, s23_trace_index);
+                            LOG_WARNING(Render_D3D12,
+                                        "S23 trace dump id={} after draw #{} verts={}", s23_id,
+                                        s23_trace_index, params.num_vertices);
                         }
                         if (s23_trace_index >= 64) {
                             s23_trace_done = true;
