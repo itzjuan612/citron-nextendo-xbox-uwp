@@ -781,46 +781,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         s22_last_bake = s22_bake_now;
     }
-    // S21 cycle 16/17: draw-skip probe. The witness never latched the real character/fish draws
-    // (its "character" turned out to be the terrain - see the session-22 memory), so name them
-    // directly: skip ONE vertex-count class per 1200-guest-frame window on draws into the scene
-    // RT (0x5103e0000) and arm a scene-RT dump at each window change. Diffing those dumps names
-    // the draw that disappeared without depending on the composite/exposure state.
-    if (g_s18_guest_frames >= 20000 &&
-        static_cast<u64>(maxwell3d->regs.rt[0].Address()) == 0x5103e0000ull) {
-        static constexpr std::array<u32, 8> kS21SkipTargets{0, 3234, 3810, 2016, 3462, 1446,
-                                                            1200, 186};
-        // S21 cycle 19: the settled phase draws 3234/3810 verts most often (278/246 times per
-        // ~700 s) - the earlier list (6750/4566/9600/6798/17550/6789/264) never touched them.
-        {
-            static std::array<u32, 48> s21_seen_verts{};
-            static u32 s21_seen_count = 0;
-            bool known = false;
-            for (u32 i = 0; i < s21_seen_count; ++i) {
-                known |= s21_seen_verts[i] == params.num_vertices;
-            }
-            if (!known && s21_seen_count < s21_seen_verts.size()) {
-                s21_seen_verts[s21_seen_count++] = params.num_vertices;
-                LOG_WARNING(Render_D3D12,
-                            "S21 scene draw verts sighting #{}: verts={}", s21_seen_count,
-                            params.num_vertices);
-            }
-        }
-        const u32 s21_skip_index =
-            static_cast<u32>(((g_s18_guest_frames - 20000) / 1200) % kS21SkipTargets.size());
-        static u32 s21_skip_logged = ~u32{0};
-        if (s21_skip_logged != s21_skip_index) {
-            s21_skip_logged = s21_skip_index;
-            LOG_WARNING(Render_D3D12,
-                        "S21 skip window: gf={} index={} target={} (scene RT)",
-                        g_s18_guest_frames, s21_skip_index, kS21SkipTargets[s21_skip_index]);
-            D3D12::RequestSceneAlignDump();
-        }
-        const u32 s21_skip_target = kS21SkipTargets[s21_skip_index];
-        if (s21_skip_target != 0 && params.num_vertices == s21_skip_target) {
-            return;
-        }
-    }
     // TEMP DIAGNOSTIC (S15): depth-side half of the wiper-window RT tracer; a depth view
     // can land in [0x517000000, 0x517200000) too, and this runs before the skip guards so
     // draws rejected below still log. One shared static cap with the color-slot tracer in
@@ -2315,46 +2275,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         d3d->CreateConstantBufferView(&cbv, m_res_heap.CpuHandle(cbv_slot_base + slot));
     }
 
-    // S21 cycle 13: input-isolation probe. The settled character draw writes QR-NaN over its
-    // whole silhouette, and static analysis of ps_133 cannot pin the source because every
-    // texture reads back with content. Substitute ONE sampled input per gf window with the
-    // draw's own albedo (a known-good 2D SRV): if the NaN disappears, that input is the
-    // source. Slot 0 = baseline (no substitution). Bounded: one log line per slot change.
-    const u32 s21_probe_slot =
-        g_s18_guest_frames >= 20000
-            ? static_cast<u32>(((g_s18_guest_frames - 20000) / 400) % 8)
-            : 0;
-    D3D12_CPU_DESCRIPTOR_HANDLE s21_probe_srv{};
-    if (s21_probe_slot != 0 && params.num_vertices >= 6790) {
-        u32 s21_ord = 0;
-        for (const DrawSlot& s21_slot : res_slots) {
-            if (s21_slot.kind != SlotKind::Sampled ||
-                s21_slot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
-                continue;
-            }
-            ImageView& s21_av = m_texture_cache.GetImageView(s21_slot.view);
-            ++s21_ord;
-            if (s21_av.format == VideoCore::Surface::PixelFormat::BC1_RGBA_SRGB &&
-                s21_av.Sampled().ptr != 0) {
-                s21_probe_srv = s21_av.Sampled();
-            }
-            if (s21_ord == s21_probe_slot && s21_probe_srv.ptr != 0) {
-                static u32 s21_probe_logged = ~u32{0};
-                if (s21_probe_logged != s21_probe_slot) {
-                    s21_probe_logged = s21_probe_slot;
-                    LOG_WARNING(Render_D3D12,
-                                "S21 slot probe: gf={} verts={} slot{} img={} gpu={:#x} {}x{} "
-                                "fmt={:#x} -> albedo SRV",
-                                g_s18_guest_frames, params.num_vertices, s21_probe_slot,
-                                s21_av.image_id.index, static_cast<u64>(s21_av.GpuAddr()),
-                                s21_av.size.width, s21_av.size.height,
-                                static_cast<u32>(s21_av.format));
-                }
-                break;
-            }
-        }
-    }
-    u32 s21_sampled_ordinal = 0;
     for (u32 k = 0; k < num_res; ++k) {
         const DrawSlot& slot = res_slots[k];
         ID3D12Resource* resource = nullptr;
@@ -2391,14 +2311,9 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             break;
         case SlotKind::Sampled: {
             if (slot.view != VideoCommon::NULL_IMAGE_VIEW_ID) {
-                ++s21_sampled_ordinal;
                 ImageView& image_view = m_texture_cache.GetImageView(slot.view);
                 prebuilt = image_view.Sampled();
                 have_prebuilt = prebuilt.ptr != 0;
-                if (s21_probe_srv.ptr != 0 && s21_sampled_ordinal == s21_probe_slot) {
-                    prebuilt = s21_probe_srv;
-                    have_prebuilt = true;
-                }
                 // Feedback loop: sample a snapshot copy of the target instead of the live
                 // resource (undefined read on D3D12; written back as zeros on Xbox).
                 if (is_feedback_source(image_view)) {
@@ -3234,7 +3149,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
                                 continue;
                             }
-                            if (sv.size.width == 960 && sv.size.height == 540 &&
+                            if (sv.size.width * sv.size.height >= 400000 &&
                                 s18d_scene_dumps < 30) {
                                 ++s18d_scene_dumps;
                                 const u32 s18d_id = 990800u + s18d_scene_dumps;
@@ -3247,7 +3162,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                             s18d_id, sv.image_id.index,
                                             static_cast<u64>(sv.GpuAddr()), sv.size.width,
                                             sv.size.height);
-                            } else if (sv.size.width == 240 && sv.size.height == 136 &&
+                            } else if (sv.size.width * sv.size.height <= 60000 &&
                                        s18d_blur_dumps < 30) {
                                 ++s18d_blur_dumps;
                                 const u32 s18d_id = 990900u + s18d_blur_dumps;
@@ -3261,93 +3176,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                             static_cast<u64>(sv.GpuAddr()), sv.size.width,
                                             sv.size.height);
                             }
-                        }
-                    }
-                }
-                // S18 cycle 9 (Phase 0.2.9): CAUSAL PROBE - blank the composite's BLUR input.
-                // The settled frame (1.0.277 end-of-sweep) is a stable washed blur: crisp UI + a
-                // heavily blurred scene backdrop, with the SHARP 3D scene invisible because the
-                // composite scales it by the small exposure (~1/64) while the 240x136 blur term
-                // is mixed in unscaled (session 16: "the composite mixes the 240x136 buffer
-                // heavily; the reference only blurs the far background"). If clearing that blur
-                // input to black for 120 s (once, after guest frame 12500) makes the sharp 3D
-                // scene appear, the blur-mix hypothesis is proven and the fix target is the blur
-                // weight/scale rather than the exposure. One window, clears logged 1-in-64.
-                {
-                    // S18 cycle 7 (Phase 0.2.7): the sweep is 5 log steps of 150 s each (0.03125 ->
-                    // 2.53), preserving the game's alpha (3.0). The 1.0.275 A/B forced alpha=1.0,
-                    // which is a real confound (the game's texel alpha drifts 2.60 -> 3.0), and it
-                    // used only two points (1.0, 8.0) which is too coarse to read a transfer curve.
-                    static bool s18ab_started = false;
-                    static bool s18ab_done = false;
-                    static std::chrono::steady_clock::time_point s18ab_t0{};
-                    static u32 s18ab_clears = 0;
-                    if (!s18ab_started && g_s18_guest_frames > 12500) {
-                        s18ab_started = true;
-                        s18ab_t0 = std::chrono::steady_clock::now();
-                        LOG_WARNING(Render_D3D12,
-                                    "S18 BLUR probe: forcing the composite's 240x136 blur input to "
-                                    "black for 120 s (guest_frame={})",
-                                    g_s18_guest_frames);
-                    }
-                    if (s18ab_started && !s18ab_done &&
-                        std::chrono::steady_clock::now() - s18ab_t0 > std::chrono::seconds(120)) {
-                        s18ab_done = true;
-                        LOG_WARNING(Render_D3D12, "S18 BLUR probe: window closed after {} clears",
-                                    s18ab_clears);
-                    }
-                    const bool s18ab_armed = s18ab_started && !s18ab_done;
-                    if (s18ab_armed) {
-                        for (const DrawSlot& slot : res_slots) {
-                            if (slot.kind != SlotKind::Sampled) {
-                                continue;
-                            }
-                            ImageView& xv = m_texture_cache.GetImageView(slot.view);
-                            // S18 cycle 9: the composite's BLUR input (240x136 B10G11R11), not
-                            // the 1x1 exposure texel the cycle-5/7 A/B used.
-                            if (xv.size.width != 240 || xv.size.height != 136 ||
-                                xv.format !=
-                                    VideoCore::Surface::PixelFormat::B10G11R11_FLOAT ||
-                                xv.Resource() == nullptr) {
-                                continue;
-                            }
-                            ID3D12Resource* const s18ab_res = xv.Resource();
-                            // Own 1-descriptor RTV heap (the runtime's is private).
-                            static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s18ab_heap;
-                            if (!s18ab_heap) {
-                                D3D12_DESCRIPTOR_HEAP_DESC s18ab_hd{};
-                                s18ab_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-                                s18ab_hd.NumDescriptors = 1;
-                                s18ab_hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-                                (void)m_device.GetDevice()->CreateDescriptorHeap(
-                                    &s18ab_hd, IID_PPV_ARGS(&s18ab_heap));
-                            }
-                            if (s18ab_heap) {
-                                const D3D12_CPU_DESCRIPTOR_HANDLE s18ab_rtv =
-                                    s18ab_heap->GetCPUDescriptorHandleForHeapStart();
-                                D3D12_RENDER_TARGET_VIEW_DESC s18ab_rd{};
-                                s18ab_rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-                                s18ab_rd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-                                m_device.GetDevice()->CreateRenderTargetView(
-                                    s18ab_res, &s18ab_rd, s18ab_rtv);
-                                m_command_list.Transition(s18ab_res,
-                                                          D3D12_RESOURCE_STATE_COMMON,
-                                                          D3D12_RESOURCE_STATE_RENDER_TARGET);
-                                const f32 s18ab_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-                                m_command_list.ClearRenderTargetView(s18ab_rtv, s18ab_color);
-                                m_command_list.Transition(s18ab_res,
-                                                          D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                          D3D12_RESOURCE_STATE_COMMON);
-                                ++s18ab_clears;
-                                if (s18ab_clears <= 4 || (s18ab_clears % 64) == 0) {
-                                    LOG_WARNING(Render_D3D12,
-                                                "S18 BLUR probe: forced black on img={} gpu={:#x} "
-                                                "(n={})",
-                                                xv.image_id.index,
-                                                static_cast<u64>(xv.GpuAddr()), s18ab_clears);
-                                }
-                            }
-                            break;
                         }
                     }
                 }
@@ -4191,57 +4019,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 sv.size.height, static_cast<u32>(sv.format),
                                 reinterpret_cast<u64>(sv.Resource()), lut_nonzero, lut_read,
                                 lut_hex, params.num_vertices);
-                    // TEMP DIAGNOSTIC (session 17) - CAUSAL PROBE: is the all-zero lighting LUT
-                    // what keeps the 3D scene dark? One-shot, in-stream, before the draw that
-                    // samples it: clear the bank sub-view to white so every lookup returns 1.0.
-                    // If the character lights up, the LUT is causally responsible and the next
-                    // step is finding its (currently unlogged) producer; if nothing changes, the
-                    // LUT is irrelevant and the darkness is elsewhere. Diagnostic only - remove
-                    // once the producer is found. Bounded: exactly one clear per process.
-                    static bool s17_lut_white_done = false;
-                    // S19 (Phase 0.2.11): re-armed as the causal A/B for the LUT-content fix.
-                    // It fires ONCE at the settled style phase (guest_frame > 13500, after the
-                    // 12600/13500 captures document the post-fix state): if the character then
-                    // lights up, the LUT content is proven to be the lever; if the frames are
-                    // already bright before the clear, the S19 join-inherit fix worked.
-                    static constexpr bool s17_enable_white_probe = true;
-                    const bool s19_white_gate = g_s18_guest_frames > 13500;
-                    if (s17_enable_white_probe && s19_white_gate && !s17_lut_white_done &&
-                        static_cast<u64>(sv.GpuAddr()) == 0x5eb340000ull &&
-                        sv.Resource() != nullptr) {
-                        s17_lut_white_done = true;
-                        ID3D12Resource* const s17_lut_res = sv.Resource();
-                        // Own 1-descriptor RTV heap: TextureCacheRuntime::rtv_heap is private and
-                        // this probe must not consume the runtime's descriptor budget.
-                        static Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> s17_rtv_heap;
-                        if (!s17_rtv_heap) {
-                            D3D12_DESCRIPTOR_HEAP_DESC s17_heap_desc{};
-                            s17_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-                            s17_heap_desc.NumDescriptors = 1;
-                            s17_heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
-                            (void)m_device.GetDevice()->CreateDescriptorHeap(
-                                &s17_heap_desc, IID_PPV_ARGS(&s17_rtv_heap));
-                        }
-                        if (s17_rtv_heap) {
-                            const D3D12_CPU_DESCRIPTOR_HANDLE s17_rtv =
-                                s17_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-                            D3D12_RENDER_TARGET_VIEW_DESC s17_rtv_desc{};
-                            s17_rtv_desc.Format = DXGI_FORMAT_R11G11B10_FLOAT;
-                            s17_rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-                            m_device.GetDevice()->CreateRenderTargetView(s17_lut_res, &s17_rtv_desc,
-                                                                         s17_rtv);
-                            m_command_list.Transition(s17_lut_res, D3D12_RESOURCE_STATE_COMMON,
-                                                      D3D12_RESOURCE_STATE_RENDER_TARGET);
-                            const f32 s17_white[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-                            m_command_list.ClearRenderTargetView(s17_rtv, s17_white);
-                            m_command_list.Transition(s17_lut_res,
-                                                      D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                                      D3D12_RESOURCE_STATE_COMMON);
-                            LOG_WARNING(Render_D3D12,
-                                        "S17 LUT white probe: cleared gpu=0x5eb340000 res=0x{:x}",
-                                        reinterpret_cast<u64>(s17_lut_res));
-                        }
-                    }
                     // ONE-SHOT: enumerate every cached image registered over the 27 MB LUT
                     // bank (cpu 0x29426000) once the 256x256 LUT sub-view itself is the
                     // probed image, so aliasing/sibling coverage of that region is visible

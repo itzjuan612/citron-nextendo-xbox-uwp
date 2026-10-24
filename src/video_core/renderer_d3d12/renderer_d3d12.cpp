@@ -1102,9 +1102,14 @@ void WriteTextureContentDumps() {
         if (entry.dxgi_format == 26 /* DXGI_FORMAT_R11G11B10_FLOAT */ && row_pitch >= width * 4) {
             u32 s21_bad = 0;
             u32 s21_finite = 0;
+            u32 s21_over1 = 0;
             f32 s21_rmax = 0.0f;
             f32 s21_gmax = 0.0f;
             f32 s21_bmax = 0.0f;
+            // S23: the maxima alone cannot tell an over-gained scene from a well-exposed one;
+            // the composite's auto-exposure loop keys on the frame's AVERAGE luminance, so log
+            // the Rec601 mean and how much of the surface is above the tonemap's knee.
+            double s21_lsum = 0.0;
             const auto s21_dec = [](u32 bits, u32 mant_bits) -> f32 {
                 const u32 exp = bits >> mant_bits;
                 const u32 mant = bits & ((1u << mant_bits) - 1);
@@ -1131,6 +1136,11 @@ void WriteTextureContentDumps() {
                         continue;
                     }
                     ++s21_finite;
+                    const f32 s21_lum = 0.2989f * r + 0.587f * g + 0.114f * b;
+                    s21_lsum += s21_lum;
+                    if (s21_lum > 1.0f) {
+                        ++s21_over1;
+                    }
                     s21_rmax = std::max(s21_rmax, r);
                     s21_gmax = std::max(s21_gmax, g);
                     s21_bmax = std::max(s21_bmax, b);
@@ -1138,9 +1148,13 @@ void WriteTextureContentDumps() {
             }
             LOG_WARNING(Render_D3D12,
                         "S21 float dump #{} img={}: {}x{} nonfinite={} finite={} rmax={} gmax={} "
-                        "bmax={}",
+                        "bmax={} lmean={:.5f} over1={:.3f}",
                         i, entry.image_index, width, height, s21_bad, s21_finite, s21_rmax,
-                        s21_gmax, s21_bmax);
+                        s21_gmax, s21_bmax,
+                        s21_finite != 0 ? s21_lsum / static_cast<double>(s21_finite) : 0.0,
+                        s21_finite != 0 ? static_cast<double>(s21_over1) /
+                                              static_cast<double>(s21_finite)
+                                        : 0.0);
         }
         // S21: remember which witness-dumped textures came back empty on the GPU (and forget
         // them once they hold content again) so the witness can force a guest re-upload.
