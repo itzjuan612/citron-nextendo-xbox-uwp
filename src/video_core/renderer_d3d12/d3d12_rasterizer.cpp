@@ -3184,21 +3184,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // One unique id per resource so the missing dark panel's source can be
                 // inspected; the loading-phase draws are excluded by the late gate and the
                 // per-resource memory so repeated icons cannot consume the budget.
-                static ID3D12Resource* s15_stage_ui_res[4] = {};
+                static ID3D12Resource* s15_stage_ui_res[24] = {};
                 static u32 s15_stage_ui_dumps = 0;
-                if (!s15_stage_scene_composite && s15_stage_ui_dumps < 4 &&
+                if (!s15_stage_scene_composite && s15_stage_ui_dumps < 24 &&
                     std::chrono::steady_clock::now() - s15_stage_start >
                         std::chrono::minutes(20)) {
                     for (const DrawSlot& slot : res_slots) {
-                        if (slot.kind != SlotKind::Sampled || s15_stage_ui_dumps >= 4) {
+                        if (slot.kind != SlotKind::Sampled || s15_stage_ui_dumps >= 24) {
                             continue;
                         }
                         ImageView& sv = m_texture_cache.GetImageView(slot.view);
-                        if (sv.Resource() == nullptr || sv.size.width > 256) {
+                        // S23: raise the ceiling (the panel's own background can be >256) but keep
+                        // the scene/blur/exposure families out: they are B10G11R11 or 1x1
+                        // R32G32B32A32 and are dumped by their own probes.
+                        if (sv.Resource() == nullptr || sv.size.width > 512 ||
+                            sv.format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT ||
+                            sv.format == VideoCore::Surface::PixelFormat::R32G32B32A32_FLOAT) {
                             continue;
                         }
                         bool s15_stage_ui_seen = false;
-                        for (u32 s15_stage_ui_i = 0; s15_stage_ui_i < 4; ++s15_stage_ui_i) {
+                        for (u32 s15_stage_ui_i = 0; s15_stage_ui_i < 24; ++s15_stage_ui_i) {
                             if (s15_stage_ui_res[s15_stage_ui_i] == sv.Resource()) {
                                 s15_stage_ui_seen = true;
                                 break;
@@ -4629,6 +4634,65 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     depth_view == nullptr && s15_post_desc.Width <= 512 &&
                     s15_post_desc.Height <= 512 &&
                     s15_post_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT;
+                // S23 cycle 2: one-frame scene-composition trace. In the settled frame the ground
+                // is a flat cream field while the character keeps its texture detail, so the
+                // question is WHICH pass paints those pixels and in what order. For ONE frame at
+                // the settled phase, log every draw's RT / vertex count / blend, and dump the
+                // scene RT right after its first six colour writers (ids 941xxx) with the dump id
+                // on the SAME line as the draw that produced it - the S22-era 930xxx dumps could
+                // not be mapped back to a draw (the 4th one decoded to a completely different
+                // image, apparently the environment-probe render).
+                {
+                    static bool s23_trace_started = false;
+                    static bool s23_trace_done = false;
+                    static u32 s23_trace_index = 0;
+                    static u32 s23_trace_dumps = 0;
+                    static u64 s23_trace_rt = 0;
+                    const u64 s23_rt_gpu =
+                        static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr());
+                    const bool s23_rt_scene = s23_rt_gpu >= 0x5103e0000ull &&
+                                              s23_rt_gpu < 0x510600000ull &&
+                                              s15_post_desc.Width >= 900 &&
+                                              s15_post_desc.Width <= 1400;
+                    if (!s23_trace_started && !s23_trace_done && s23_rt_scene &&
+                        s15_post_color && depth_view != nullptr &&
+                        g_s18_guest_frames > 15000) {
+                        s23_trace_started = true;
+                        s23_trace_rt = s23_rt_gpu;
+                    }
+                    if (s23_trace_started && !s23_trace_done) {
+                        ++s23_trace_index;
+                        u32 s23_sampled = 0;
+                        for (const DrawSlot& s23_slot : res_slots) {
+                            if (s23_slot.kind == SlotKind::Sampled) {
+                                ++s23_sampled;
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S23 trace #{}: rt={:#x} {}x{} verts={} att={:#x} blend={} "
+                                    "sampled={}",
+                                    s23_trace_index, s23_rt_gpu, s15_post_desc.Width,
+                                    s15_post_desc.Height, params.num_vertices,
+                                    stored.pipeline->State().attachments[0].raw,
+                                    stored.pipeline->State().attachments[0].enable.Value(),
+                                    s23_sampled);
+                        if (s23_trace_dumps < 6 && s23_rt_gpu == s23_trace_rt && s15_post_color) {
+                            ++s23_trace_dumps;
+                            const u32 s23_id = 941000u + s23_trace_dumps;
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, s15_post_res,
+                                static_cast<u32>(VideoCore::Surface::PixelFormat::B10G11R11_FLOAT),
+                                s23_rt_gpu, s23_id, /*force=*/true);
+                            LOG_WARNING(Render_D3D12, "S23 trace dump id={} after draw #{}",
+                                        s23_id, s23_trace_index);
+                        }
+                        if (s23_trace_index >= 24) {
+                            s23_trace_done = true;
+                            LOG_WARNING(Render_D3D12, "S23 trace done after {} draws",
+                                        s23_trace_index);
+                        }
+                    }
+                }
                 // TEMP DIAGNOSTIC (session 15): feedback-loop detector. A draw that both
                 // samples and renders the SAME resource (rt == tex) is invalid on D3D12
                 // (sampling a live RTV returns undefined data, often zeros) and a prime

@@ -660,6 +660,27 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
                             image.guest_size_bytes, s17_action, static_cast<u64>(cpu_addr), size);
             }
         }
+        // S23 cycle 3: dedicated notify probe for the 1024x1024 BC5 at 0x5e9430000 and the
+        // 960x540 mask at 0x510f30000 - the two images whose GPU content separates the lit run
+        // from the black one. Own budget so the boot-time S17/S18 caps cannot swallow it.
+        {
+            static u32 s23_notify_logs = 0;
+            const u64 s23_gpu = static_cast<u64>(image.gpu_addr);
+            const bool s23_track = (s23_gpu >= 0x5e9430000ull && s23_gpu < 0x5e9580000ull) ||
+                                   (s23_gpu >= 0x510f30000ull && s23_gpu < 0x510f40000ull);
+            if (s23_notify_logs < 48 && s23_track) {
+                ++s23_notify_logs;
+                const char* const s23_action =
+                    True(image.flags & ImageFlagBits::CpuModified)  ? "pending"
+                    : True(image.flags & ImageFlagBits::GpuModified) ? "swallow-gpu"
+                                                                     : "mark";
+                LOG_WARNING(Render_D3D12,
+                            "S23 target notify: img={} gpu={:#x} flags={:#x} size={} action={} "
+                            "write_cpu={:#x} write_size={}",
+                            image_id.index, s23_gpu, static_cast<u32>(image.flags),
+                            image.guest_size_bytes, s23_action, static_cast<u64>(cpu_addr), size);
+            }
+        }
         // TEMP DIAGNOSTIC (S18, Phase 0.2.1): 1x1 images (the exposure candidates) fall outside
         // the bank/mask filter above; log a write notification touching one with the action the
         // guards below take (mark => the next sample re-uploads it; swallow-gpu => the GPU-owned
@@ -1435,6 +1456,33 @@ void TextureCache<P>::UploadImageContents(Image& image, StagingBuffer& staging) 
     } else {
         const auto copies =
             UnswizzleImage(*gpu_memory, gpu_addr, image.info, swizzle_data, mapped_span);
+        // S23 cycle 3: WHICH upload decides whether the 3D scene is lit. The 1024x1024 BC5 at
+        // 0x5e9430000 reads 37.8 % nonzero with a lit scene (1.0.328) and 0 % with a black scene
+        // (1.0.329), while the image's flags are identical (0xf0, clean) in both runs - so the
+        // difference is this upload. Log every upload of that window (and of the 960x540 mask at
+        // 0x510f30000) with the source's nonzero fraction: a zero source means the image was
+        // created/uploaded BEFORE the guest wrote the texture, and nothing re-uploaded it after.
+        {
+            static u32 s23_upload_logs = 0;
+            const u64 s23_ug = static_cast<u64>(gpu_addr);
+            const bool s23_target = (s23_ug >= 0x5e9430000ull && s23_ug < 0x5e9580000ull) ||
+                                    (s23_ug >= 0x510f30000ull && s23_ug < 0x510f40000ull);
+            if (s23_upload_logs < 48 && s23_target) {
+                ++s23_upload_logs;
+                const size_t s23_n =
+                    mapped_span.size_bytes() < 4096 ? mapped_span.size_bytes() : 4096;
+                u32 s23_nz = 0;
+                for (size_t s23_i = 0; s23_i < s23_n; ++s23_i) {
+                    s23_nz += mapped_span[s23_i] != 0 ? 1u : 0u;
+                }
+                LOG_WARNING(Render_D3D12,
+                            "S23 target upload: gpu={:#x} {}x{} fmt={:#x} size={} src_nz={}/{} "
+                            "flags={:#x}",
+                            s23_ug, image.info.size.width, image.info.size.height,
+                            static_cast<u32>(image.info.format), image.guest_size_bytes, s23_nz,
+                            static_cast<u32>(s23_n), static_cast<u32>(image.flags));
+            }
+        }
         // TEMP DIAGNOSTIC (S18, Phase 0.2.1): an upload INTO a 1x1 R32G32B32A32 image is a
         // candidate writer of the exposure texel. Log the exact floats being pushed into the
         // resource (read after the unswizzle, so the bytes are what the upload uses); all-zero
