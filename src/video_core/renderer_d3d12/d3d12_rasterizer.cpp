@@ -2243,6 +2243,61 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         const auto& record = bindings[cbv_records[slot]];
         D3D12_GPU_VIRTUAL_ADDRESS address = record.address;
         u64 cbv_size = record.size != 0 ? record.size : u64{256};
+        // S23 cycle 8 causal A/B for the ground's flat colour. The ground PS
+        // (ps_131 / 0xef8c20b7d541985d) ends in three
+        //   SmoothStep(edge0 = %1174 - %1131, edge1 = FClamp(...) * c5[0], x = %1131)
+        // stores, and the dumped material CBV of the 6798-vertex ground draw (stage 4, index 5,
+        // gpu 0x5e8982600) has f32[0] == 0.0 with the rest looking like degenerate 4x4 rows -
+        // with edge1 == 0 the blend saturates and every ground fragment collapses to one colour,
+        // which is what the frame shows (ground rgb 0.557/0.532/0.453, std 0.004, no dependence
+        // on distance). For two windows in the settled phase, bind a copy of that CBV with
+        // element 0 forced to 0.5 and then 1.0 (an UPLOAD-heap mirror, the game's memory is
+        // untouched) and see whether the sand gains texture and contrast.
+        if (slot == 5 && params.num_vertices == 6798 && record.size != 0 &&
+            record.address != 0 && gpu_memory != nullptr && g_s18_guest_frames > 15000 &&
+            g_s18_guest_frames < 21000) {
+            static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
+            static void* s23_c5_mapped = nullptr;
+            const f32 s23_c5_new = g_s18_guest_frames < 18000 ? 0.5f : 1.0f;
+            const u64 s23_c5_size = std::min<u64>(record.size, 4096);
+            if (s23_c5_upload == nullptr) {
+                D3D12_HEAP_PROPERTIES s23_heap{};
+                s23_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+                D3D12_RESOURCE_DESC s23_desc{};
+                s23_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                s23_desc.Width = 4096;
+                s23_desc.Height = 1;
+                s23_desc.DepthOrArraySize = 1;
+                s23_desc.MipLevels = 1;
+                s23_desc.Format = DXGI_FORMAT_UNKNOWN;
+                s23_desc.SampleDesc.Count = 1;
+                s23_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (SUCCEEDED(m_device.GetDevice()->CreateCommittedResource(
+                        &s23_heap, D3D12_HEAP_FLAG_NONE, &s23_desc,
+                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                        IID_PPV_ARGS(&s23_c5_upload)))) {
+                    (void)s23_c5_upload->Map(0, nullptr, &s23_c5_mapped);
+                }
+            }
+            if (s23_c5_mapped != nullptr && s23_c5_size >= 4) {
+                gpu_memory->ReadBlock(static_cast<GPUVAddr>(record.address), s23_c5_mapped,
+                                      static_cast<size_t>(s23_c5_size),
+                                      VideoCommon::CacheType::NoTextureCache);
+                const f32 s23_c5_old = static_cast<f32*>(s23_c5_mapped)[0];
+                static_cast<f32*>(s23_c5_mapped)[0] = s23_c5_new;
+                address = s23_c5_upload->GetGPUVirtualAddress();
+                cbv_size = s23_c5_size;
+                static f32 s23_c5_reported = -1.0f;
+                if (s23_c5_reported != s23_c5_new) {
+                    s23_c5_reported = s23_c5_new;
+                    LOG_WARNING(Render_D3D12,
+                                "S23 c5 probe: c5[0] {:.4f} -> {:.4f} on the ground draw "
+                                "(gf={}, gpu={:#x} size={})",
+                                s23_c5_old, s23_c5_new, g_s18_guest_frames,
+                                static_cast<u64>(record.address), record.size);
+                }
+            }
+        }
         // S21 cycle 12: D3D12 enforces ConstantBufferView.SizeInBytes and zero-fills reads
         // beyond it, but the guest's declared size is only a hint - the hardware (and the
         // Vulkan backend's whole-buffer descriptors) serve reads past it from the mapped
@@ -3178,10 +3233,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     static_cast<u32>(sv.format),
                                     static_cast<u64>(sv.GpuAddr()), s18d_id, /*force=*/true);
                                 LOG_WARNING(Render_D3D12,
-                                            "S18D scene input: id={} img={} gpu={:#x} {}x{}",
+                                            "S18D scene input: id={} img={} gpu={:#x} {}x{} "
+                                            "res=0x{:x} tick={}",
                                             s18d_id, sv.image_id.index,
                                             static_cast<u64>(sv.GpuAddr()), sv.size.width,
-                                            sv.size.height);
+                                            sv.size.height,
+                                            reinterpret_cast<u64>(sv.Resource()),
+                                            sv.modification_tick);
                             } else if (sv.size.width * sv.size.height <= 60000 &&
                                        s18d_blur_dumps < 30) {
                                 ++s18d_blur_dumps;
@@ -4756,6 +4814,36 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             s23_trace_done = true;
                             LOG_WARNING(Render_D3D12, "S23 trace done after {} draws",
                                         s23_trace_index);
+                        }
+                    }
+                }
+                // S23 cycle 9: pair the RENDER side of the scene RT with the SAMPLED side.
+                // The composite's scene input varies (960x540, 977x550, 1007x566, 1003x569, ...)
+                // while every traced frame rendered into a 960x540 view, and the non-960x540
+                // members read back as garbage (rmax 43..3456) or all-zero - so the question is
+                // whether the draws and the composite resolve the same image incarnation at
+                // 0x5103e0000. Once per 60 s, log the colour-pass RT's image id / resource / size
+                // next to the composite's sampled scene image (see "S18D scene input").
+                {
+                    static std::chrono::steady_clock::time_point s23_rt_last =
+                        std::chrono::steady_clock::now();
+                    static u32 s23_rt_logs = 0;
+                    if (depth_view != nullptr && s15_post_color && s23_rt_logs < 80 &&
+                        std::chrono::steady_clock::now() - s23_rt_last >
+                            std::chrono::seconds(60)) {
+                        ImageView* const s23_rt_view = framebuffer->ColorBuffers()[0];
+                        const u64 s23_rt_va = static_cast<u64>(s23_rt_view->GpuAddr());
+                        if (s23_rt_va >= 0x5103e0000ull && s23_rt_va < 0x510600000ull) {
+                            s23_rt_last = std::chrono::steady_clock::now();
+                            ++s23_rt_logs;
+                            LOG_WARNING(Render_D3D12,
+                                        "S23 render rt: img={} res=0x{:x} {}x{} tick={} "
+                                        "verts={} gf={}",
+                                        s23_rt_view->image_id.index,
+                                        reinterpret_cast<u64>(s23_rt_view->Resource()),
+                                        s23_rt_view->size.width, s23_rt_view->size.height,
+                                        s23_rt_view->modification_tick, params.num_vertices,
+                                        g_s18_guest_frames);
                         }
                     }
                 }
