@@ -1543,7 +1543,14 @@ ImageViewId TextureCache<P>::CreateImageView(const TICEntry& config) {
     }
     const u32 layer_offset = config.BaseLayer() * info.layer_stride;
     const GPUVAddr image_gpu_addr = config.Address() - layer_offset;
-    const ImageId image_id = FindOrInsertImage(info, image_gpu_addr);
+    // S23 FIX: a sampled view may be a few texels narrower/shorter than the surface it lives on
+    // (the game declares its dynamic-resolution render target at 992x556 and samples it through a
+    // 990x556 view). With the default strict size comparison that created a SECOND image at the
+    // same guest address, and the composite then sampled an image nothing had rendered
+    // (measured: `same_res=0`, the resized scene dumps read all-zero while the 960x540 member had
+    // content). Relaxing the size check lets FindImage match the existing surface through the
+    // block-linear (GOB) alignment, which is what the hardware does.
+    const ImageId image_id = FindOrInsertImage(info, image_gpu_addr, RelaxedOptions::Size);
     if (!image_id) {
         return NULL_IMAGE_VIEW_ID;
     }
@@ -2477,7 +2484,10 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
-        image_id = FindOrInsertImage(info, gpu_addr);
+        // S23 FIX: same reasoning as CreateImageView - the render target and the sampled view of
+        // one dynamic-resolution surface can differ by a few texels; both paths must resolve to
+        // the same image (block-linear/GOB alignment) instead of creating two.
+        image_id = FindOrInsertImage(info, gpu_addr, RelaxedOptions::Size);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
