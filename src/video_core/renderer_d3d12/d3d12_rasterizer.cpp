@@ -96,12 +96,15 @@ constexpr bool kSkipConfigureDrawState = false;
 // and of the R8 mask family (0x510fa0000 sampled member / 0x510f30000 written member). Used
 // by the pre-guard draw producer tracers; the wide window matches the existing S15 LUT RT
 // tracer and the per-VA extent covers the third mapping's tail (0x5ecd80000 + 0x1a34000).
-// S23 cycle 12: scene-family resources written as colour RTs in the CURRENT guest frame. The
-// composite probe checks whether the scene image it samples is one of them (see the S18D block).
-constexpr u32 S23_FRAME_RENDERED_MAX = 8;
-ID3D12Resource* g_s23_frame_rendered[S23_FRAME_RENDERED_MAX]{};
-u32 g_s23_frame_rendered_count = 0;
-u64 g_s23_frame_rendered_tag = ~u64{0};
+// S23 cycle 13: scene-family render targets and the guest frame each was last written. The
+// composite probe reports how long ago the image it samples was rendered, which separates
+// "rendered this frame" from "a previous frame's buffer" from "never rendered at all".
+constexpr u32 S23_SCENE_TRACK_MAX = 16;
+ID3D12Resource* g_s23_scene_track_res[S23_SCENE_TRACK_MAX]{};
+u64 g_s23_scene_track_gf[S23_SCENE_TRACK_MAX]{};
+u64 g_s23_scene_track_va[S23_SCENE_TRACK_MAX]{};
+u32 g_s23_scene_track_count = 0;
+u32 g_s23_scene_track_next = 0;
 
 constexpr bool S17ProducerRange(u64 gpu) {
     // Bank window CORRECTED after the 1.0.266 harvest: the previous bound 0x5ed00000 is a
@@ -3239,26 +3242,61 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     m_device.GetDevice(), m_command_list, sv.Resource(),
                                     static_cast<u32>(sv.format),
                                     static_cast<u64>(sv.GpuAddr()), s18d_id, /*force=*/true);
-                                // S23 cycle 12: is the image the composite samples one that was
-                                // actually RENDERED this frame? ConfigureDraw records every colour
-                                // write into the scene family; if the sampled resource is not in
-                                // that set, the sampler is reading a different incarnation (which
-                                // then holds garbage/zeros - rmax up to 3456) and that is the
-                                // dynamic-resolution bug in one bit.
-                                bool s23_rendered = false;
-                                for (u32 s23_i = 0; s23_i < g_s23_frame_rendered_count; ++s23_i) {
-                                    s23_rendered |= g_s23_frame_rendered[s23_i] == sv.Resource();
+                                // S23 cycle 13: how long ago was the image the composite samples
+                                // actually rendered? 0 = this frame, small = a previous frame's
+                                // buffer, absent/huge = never rendered (empty allocation).
+                                u32 s23_age = ~u32{0};
+                                u64 s23_rendered_va = 0;
+                                for (u32 s23_i = 0; s23_i < g_s23_scene_track_count; ++s23_i) {
+                                    if (g_s23_scene_track_res[s23_i] == sv.Resource()) {
+                                        s23_age = static_cast<u32>(g_s18_guest_frames -
+                                                                   g_s23_scene_track_gf[s23_i]);
+                                        s23_rendered_va = g_s23_scene_track_va[s23_i];
+                                    }
+                                }
+                                u32 s23_frame_targets = 0;
+                                ID3D12Resource* s23_frame_target_res = nullptr;
+                                for (u32 s23_i = 0; s23_i < g_s23_scene_track_count; ++s23_i) {
+                                    if (g_s23_scene_track_gf[s23_i] == g_s18_guest_frames) {
+                                        ++s23_frame_targets;
+                                        s23_frame_target_res = g_s23_scene_track_res[s23_i];
+                                    }
+                                }
+                                // S23 cycle 14: when the sampled image is not this frame's render
+                                // target, dump the one that IS (ids 942xxx) side by side with the
+                                // sampled one - "rendered has content / sampled is empty" is then
+                                // visible in two lines instead of inferred.
+                                if (s23_frame_target_res != nullptr &&
+                                    s23_frame_target_res != sv.Resource()) {
+                                    static u32 s23_other_dumps = 0;
+                                    if (s23_other_dumps < 12) {
+                                        ++s23_other_dumps;
+                                        const u32 s23_other_id = 942000u + s23_other_dumps;
+                                        (void)D3D12::RecordTextureContentDump(
+                                            m_device.GetDevice(), m_command_list,
+                                            s23_frame_target_res,
+                                            static_cast<u32>(sv.format),
+                                            static_cast<u64>(sv.GpuAddr()), s23_other_id,
+                                            /*force=*/true);
+                                        LOG_WARNING(Render_D3D12,
+                                                    "S23 rendered-vs-sampled: dump id={} of the "
+                                                    "frame's REAL render target res=0x{:x}",
+                                                    s23_other_id,
+                                                    reinterpret_cast<u64>(s23_frame_target_res));
+                                    }
                                 }
                                 LOG_WARNING(Render_D3D12,
                                             "S18D scene input: id={} img={} gpu={:#x} {}x{} "
-                                            "res=0x{:x} tick={} rendered_this_frame={} "
-                                            "rendered_count={}",
+                                            "res=0x{:x} tick={} last_rendered_ago={} "
+                                            "rendered_va={:#x} frame_targets={} track={}",
                                             s18d_id, sv.image_id.index,
                                             static_cast<u64>(sv.GpuAddr()), sv.size.width,
                                             sv.size.height,
                                             reinterpret_cast<u64>(sv.Resource()),
-                                            sv.modification_tick, s23_rendered ? 1 : 0,
-                                            g_s23_frame_rendered_count);
+                                            sv.modification_tick,
+                                            s23_age == ~u32{0} ? -1 : static_cast<s32>(s23_age),
+                                            s23_rendered_va, s23_frame_targets,
+                                            g_s23_scene_track_count);
                             } else if (sv.size.width * sv.size.height <= 60000 &&
                                        s18d_blur_dumps < 30) {
                                 ++s18d_blur_dumps;
@@ -4866,25 +4904,32 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         }
                     }
                 }
-                // S23 cycle 12: remember every resource written as a colour RT inside the scene
-                // family this guest frame (consumed by the composite probe below).
+                // S23 cycle 13: remember (resource, gpu VA, guest frame) for every colour write into
+                // the scene family, so the composite probe can report the age of the image it
+                // samples (0 = written this frame, small = a previous frame's buffer, absent/very
+                // old = never rendered).
                 if (s15_post_color) {
                     ImageView* const s23_w_view = framebuffer->ColorBuffers()[0];
                     const u64 s23_w_va = static_cast<u64>(s23_w_view->GpuAddr());
                     if (s23_w_va >= 0x5103e0000ull && s23_w_va < 0x510600000ull &&
                         s23_w_view->Resource() != nullptr) {
-                        if (g_s23_frame_rendered_tag != g_s18_guest_frames) {
-                            g_s23_frame_rendered_tag = g_s18_guest_frames;
-                            g_s23_frame_rendered_count = 0;
-                        }
                         bool s23_w_known = false;
-                        for (u32 s23_i = 0; s23_i < g_s23_frame_rendered_count; ++s23_i) {
-                            s23_w_known |= g_s23_frame_rendered[s23_i] == s23_w_view->Resource();
+                        for (u32 s23_i = 0; s23_i < g_s23_scene_track_count; ++s23_i) {
+                            if (g_s23_scene_track_res[s23_i] == s23_w_view->Resource()) {
+                                g_s23_scene_track_gf[s23_i] = g_s18_guest_frames;
+                                s23_w_known = true;
+                                break;
+                            }
                         }
-                        if (!s23_w_known &&
-                            g_s23_frame_rendered_count < S23_FRAME_RENDERED_MAX) {
-                            g_s23_frame_rendered[g_s23_frame_rendered_count++] =
-                                s23_w_view->Resource();
+                        if (!s23_w_known) {
+                            const u32 s23_slot =
+                                g_s23_scene_track_count < S23_SCENE_TRACK_MAX
+                                    ? g_s23_scene_track_count++
+                                    : g_s23_scene_track_next;
+                            g_s23_scene_track_next = (s23_slot + 1) % S23_SCENE_TRACK_MAX;
+                            g_s23_scene_track_res[s23_slot] = s23_w_view->Resource();
+                            g_s23_scene_track_gf[s23_slot] = g_s18_guest_frames;
+                            g_s23_scene_track_va[s23_slot] = s23_w_va;
                         }
                     }
                 }
@@ -6348,9 +6393,28 @@ void RasterizerD3D12::DispatchCompute() {
                        s17_overlap(0x5ecd80000ull, 0x1a34000ull) ||
                        s17_overlap(0x510fa0000ull, 0x100000ull) ||
                        s17_overlap(0x510f30000ull, 0x100000ull) ||
-                       s17_overlap(0x5e9430000ull, 0x150000ull);  // S23: the lit/black BC5
+                       s17_overlap(0x5e9430000ull, 0x150000ull) ||      // S23: the lit/black BC5
+                       s17_overlap(0x5103e0000ull, 0x220000ull);        // S23: the scene family
             };
             const auto s17_compute_log = [&](const char* kind, u64 gpu, u64 size) {
+                // S23 cycle 14: is the dynamic-resolution scene buffer produced by a COMPUTE pass
+                // (an FSR-style upscale) rather than by a draw? No draw from the 960x540 member to
+                // the resized members exists in any chain log, no blit touches them, yet the
+                // composite samples them - so a dispatch is the remaining candidate.
+                {
+                    static u32 s23_scene_compute_logs = 0;
+                    const u64 s23_end = gpu + (size != 0 ? size : 1);
+                    if (s23_scene_compute_logs < 24 && gpu < 0x510600000ull &&
+                        s23_end > 0x5103e0000ull) {
+                        ++s23_scene_compute_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S23 scene compute #{}: program={:#x} grid=({},{},{}) "
+                                    "kind={} gpu={:#x} size={}",
+                                    s23_scene_compute_logs, static_cast<u64>(qmd.program_start),
+                                    qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                                    qmd.grid_dim_z.Value(), kind, static_cast<u64>(gpu), size);
+                    }
+                }
                 // S23 cycle 4: own budget for the BC5 window (the shared one below dies at boot).
                 {
                     static u32 s23_bc5_compute_logs = 0;
