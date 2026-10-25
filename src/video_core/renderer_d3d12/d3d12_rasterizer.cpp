@@ -96,6 +96,13 @@ constexpr bool kSkipConfigureDrawState = false;
 // and of the R8 mask family (0x510fa0000 sampled member / 0x510f30000 written member). Used
 // by the pre-guard draw producer tracers; the wide window matches the existing S15 LUT RT
 // tracer and the per-VA extent covers the third mapping's tail (0x5ecd80000 + 0x1a34000).
+// S23 cycle 12: scene-family resources written as colour RTs in the CURRENT guest frame. The
+// composite probe checks whether the scene image it samples is one of them (see the S18D block).
+constexpr u32 S23_FRAME_RENDERED_MAX = 8;
+ID3D12Resource* g_s23_frame_rendered[S23_FRAME_RENDERED_MAX]{};
+u32 g_s23_frame_rendered_count = 0;
+u64 g_s23_frame_rendered_tag = ~u64{0};
+
 constexpr bool S17ProducerRange(u64 gpu) {
     // Bank window CORRECTED after the 1.0.266 harvest: the previous bound 0x5ed00000 is a
     // 1.6 GB address (a typo for 0x5ed000000) and made every bank test in the S15/S17 draw
@@ -3232,14 +3239,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     m_device.GetDevice(), m_command_list, sv.Resource(),
                                     static_cast<u32>(sv.format),
                                     static_cast<u64>(sv.GpuAddr()), s18d_id, /*force=*/true);
+                                // S23 cycle 12: is the image the composite samples one that was
+                                // actually RENDERED this frame? ConfigureDraw records every colour
+                                // write into the scene family; if the sampled resource is not in
+                                // that set, the sampler is reading a different incarnation (which
+                                // then holds garbage/zeros - rmax up to 3456) and that is the
+                                // dynamic-resolution bug in one bit.
+                                bool s23_rendered = false;
+                                for (u32 s23_i = 0; s23_i < g_s23_frame_rendered_count; ++s23_i) {
+                                    s23_rendered |= g_s23_frame_rendered[s23_i] == sv.Resource();
+                                }
                                 LOG_WARNING(Render_D3D12,
                                             "S18D scene input: id={} img={} gpu={:#x} {}x{} "
-                                            "res=0x{:x} tick={}",
+                                            "res=0x{:x} tick={} rendered_this_frame={} "
+                                            "rendered_count={}",
                                             s18d_id, sv.image_id.index,
                                             static_cast<u64>(sv.GpuAddr()), sv.size.width,
                                             sv.size.height,
                                             reinterpret_cast<u64>(sv.Resource()),
-                                            sv.modification_tick);
+                                            sv.modification_tick, s23_rendered ? 1 : 0,
+                                            g_s23_frame_rendered_count);
                             } else if (sv.size.width * sv.size.height <= 60000 &&
                                        s18d_blur_dumps < 30) {
                                 ++s18d_blur_dumps;
@@ -4844,6 +4863,61 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         s23_rt_view->size.width, s23_rt_view->size.height,
                                         s23_rt_view->modification_tick, params.num_vertices,
                                         g_s18_guest_frames);
+                        }
+                    }
+                }
+                // S23 cycle 12: remember every resource written as a colour RT inside the scene
+                // family this guest frame (consumed by the composite probe below).
+                if (s15_post_color) {
+                    ImageView* const s23_w_view = framebuffer->ColorBuffers()[0];
+                    const u64 s23_w_va = static_cast<u64>(s23_w_view->GpuAddr());
+                    if (s23_w_va >= 0x5103e0000ull && s23_w_va < 0x510600000ull &&
+                        s23_w_view->Resource() != nullptr) {
+                        if (g_s23_frame_rendered_tag != g_s18_guest_frames) {
+                            g_s23_frame_rendered_tag = g_s18_guest_frames;
+                            g_s23_frame_rendered_count = 0;
+                        }
+                        bool s23_w_known = false;
+                        for (u32 s23_i = 0; s23_i < g_s23_frame_rendered_count; ++s23_i) {
+                            s23_w_known |= g_s23_frame_rendered[s23_i] == s23_w_view->Resource();
+                        }
+                        if (!s23_w_known &&
+                            g_s23_frame_rendered_count < S23_FRAME_RENDERED_MAX) {
+                            g_s23_frame_rendered[g_s23_frame_rendered_count++] =
+                                s23_w_view->Resource();
+                        }
+                    }
+                }
+                // S23 cycle 11: does the RT view we render resolve to the image the guest asked
+                // for? The guest declares rt[0].width/height per draw; if our resolved colour
+                // buffer at the same VA is a different size, the draws land in a stale incarnation
+                // while the composite samples the resized one - which then holds garbage
+                // (rmax up to 3456) or zeros. Log every mismatch, 5 s apart, 60 lines.
+                {
+                    static std::chrono::steady_clock::time_point s23_mm_last =
+                        std::chrono::steady_clock::now();
+                    static u32 s23_mm_logs = 0;
+                    if (maxwell3d != nullptr && depth_view != nullptr && s15_post_color &&
+                        s23_mm_logs < 60 &&
+                        std::chrono::steady_clock::now() - s23_mm_last >
+                            std::chrono::seconds(5)) {
+                        ImageView* const s23_mm_view = framebuffer->ColorBuffers()[0];
+                        const u32 s23_mm_gw = maxwell3d->regs.rt[0].width;
+                        const u32 s23_mm_gh = maxwell3d->regs.rt[0].height;
+                        if (s23_mm_gw != 0 && s23_mm_gh != 0 &&
+                            (s23_mm_gw != s23_mm_view->size.width ||
+                             s23_mm_gh != s23_mm_view->size.height)) {
+                            s23_mm_last = std::chrono::steady_clock::now();
+                            ++s23_mm_logs;
+                            LOG_WARNING(Render_D3D12,
+                                        "S23 rt size mismatch: guest {}x{} vs image {}x{} "
+                                        "(va={:#x} img={} res=0x{:x} verts={} gf={})",
+                                        s23_mm_gw, s23_mm_gh, s23_mm_view->size.width,
+                                        s23_mm_view->size.height,
+                                        static_cast<u64>(s23_mm_view->GpuAddr()),
+                                        s23_mm_view->image_id.index,
+                                        reinterpret_cast<u64>(s23_mm_view->Resource()),
+                                        params.num_vertices, g_s18_guest_frames);
                         }
                     }
                 }
