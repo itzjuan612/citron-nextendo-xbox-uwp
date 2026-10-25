@@ -2272,9 +2272,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         //   frag = SmoothStep(%1752-%1705, %1726, %1705) per channel.
         // With c5[0] == 0 the edge collapses and every fragment lands on one value - which is
         // exactly the flat ground. Aim the sweep at 1722 instead.
-        if (slot == 5 && params.num_vertices == 1722 && record.size != 0 &&
-            record.address != 0 && gpu_memory != nullptr && g_s18_guest_frames > 15000 &&
-            g_s18_guest_frames < 27600) {
+        // S23 cycle 18: bind the override on the MATERIAL buffer, not on loop slot 5. The loop
+        // indexes the draw's declared CBV list, and its slot 5 is a 256-byte buffer (logged
+        // `declared=256`), while the shader's c5 is the guest's 4608-byte material buffer
+        // (S19 cbuf scene s4 i5, gpu 0x5e8982600). Keying on that size is the only way to hit the
+        // buffer the shader actually reads.
+        if (params.num_vertices == 1722 && record.size == 4608 && record.address != 0 &&
+            gpu_memory != nullptr && g_s18_guest_frames > 15000) {
             static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
             static void* s23_c5_mapped = nullptr;
             // S23 cycle 16b: 300-frame windows cycling through the five values, so a run that
