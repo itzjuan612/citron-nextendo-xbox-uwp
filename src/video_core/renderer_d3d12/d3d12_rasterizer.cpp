@@ -2265,7 +2265,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         // on distance). For two windows in the settled phase, bind a copy of that CBV with
         // element 0 forced to 0.5 and then 1.0 (an UPLOAD-heap mirror, the game's memory is
         // untouched) and see whether the sand gains texture and contrast.
-        if (slot == 5 && params.num_vertices == 6798 && record.size != 0 &&
+        // S23 cycle 17: the sweep above was aimed at the 6798-vertex draw, which is NOT the one
+        // that paints the ground (its RT delta is 0.6/255; the pixels were already there). The
+        // painter is the 1722-vertex main scene draw (PS 0x509bf0872ef585b3 = ps_296.spv), and
+        // its disassembly ends in the SAME blend: %1726 = %1713*c5[0], then
+        //   frag = SmoothStep(%1752-%1705, %1726, %1705) per channel.
+        // With c5[0] == 0 the edge collapses and every fragment lands on one value - which is
+        // exactly the flat ground. Aim the sweep at 1722 instead.
+        if (slot == 5 && params.num_vertices == 1722 && record.size != 0 &&
             record.address != 0 && gpu_memory != nullptr && g_s18_guest_frames > 15000 &&
             g_s18_guest_frames < 27600) {
             static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
