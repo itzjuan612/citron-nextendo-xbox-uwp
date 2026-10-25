@@ -2267,17 +2267,32 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         // untouched) and see whether the sand gains texture and contrast.
         if (slot == 5 && params.num_vertices == 6798 && record.size != 0 &&
             record.address != 0 && gpu_memory != nullptr && g_s18_guest_frames > 15000 &&
-            g_s18_guest_frames < 21000) {
+            g_s18_guest_frames < 27600) {
             static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
             static void* s23_c5_mapped = nullptr;
-            const f32 s23_c5_new = g_s18_guest_frames < 18000 ? 0.5f : 1.0f;
+            // S23 cycle 16: sweep instead of two points, and rely on the 60 s scene-RT dumps
+            // (lmean/rmax) as the readout - the frame is now stable enough that a real change in
+            // the ground blend would show there without needing captures inside the window.
+            // Windows of 600 guest frames: 0.0 (baseline) -> 0.25 -> 0.5 -> 1.0 -> 2.0.
+            static constexpr std::array<f32, 5> kS23C5Values{0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
+            const u32 s23_c5_window = std::min<u32>(
+                static_cast<u32>((g_s18_guest_frames - 15000) / 600),
+                static_cast<u32>(kS23C5Values.size()) - 1);
+            const f32 s23_c5_new = kS23C5Values[s23_c5_window];
             const u64 s23_c5_size = std::min<u64>(record.size, 4096);
+            // S22 parity: the shader reads past the guest-declared CBV size, so mirror the same
+            // range the real CBV covers (resource width, capped at 64 KB) or the probe would
+            // truncate data the shader actually uses.
+            const u64 s23_c5_full =
+                (record.resource != nullptr && record.offset < record.resource->GetDesc().Width)
+                    ? std::min<u64>(record.resource->GetDesc().Width - record.offset, 64 * 1024)
+                    : std::max<u64>(record.size, 256);
             if (s23_c5_upload == nullptr) {
                 D3D12_HEAP_PROPERTIES s23_heap{};
                 s23_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
                 D3D12_RESOURCE_DESC s23_desc{};
                 s23_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                s23_desc.Width = 4096;
+                s23_desc.Width = 64 * 1024;
                 s23_desc.Height = 1;
                 s23_desc.DepthOrArraySize = 1;
                 s23_desc.MipLevels = 1;
@@ -2293,20 +2308,20 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
             if (s23_c5_mapped != nullptr && s23_c5_size >= 4) {
                 gpu_memory->ReadBlock(static_cast<GPUVAddr>(record.address), s23_c5_mapped,
-                                      static_cast<size_t>(s23_c5_size),
+                                      static_cast<size_t>(s23_c5_full),
                                       VideoCommon::CacheType::NoTextureCache);
                 const f32 s23_c5_old = static_cast<f32*>(s23_c5_mapped)[0];
                 static_cast<f32*>(s23_c5_mapped)[0] = s23_c5_new;
                 address = s23_c5_upload->GetGPUVirtualAddress();
-                cbv_size = s23_c5_size;
+                cbv_size = s23_c5_full;
                 static f32 s23_c5_reported = -1.0f;
                 if (s23_c5_reported != s23_c5_new) {
                     s23_c5_reported = s23_c5_new;
                     LOG_WARNING(Render_D3D12,
-                                "S23 c5 probe: c5[0] {:.4f} -> {:.4f} on the ground draw "
-                                "(gf={}, gpu={:#x} size={})",
-                                s23_c5_old, s23_c5_new, g_s18_guest_frames,
-                                static_cast<u64>(record.address), record.size);
+                                "S23 c5 probe: window={} c5[0] {:.4f} -> {:.4f} on the ground draw "
+                                "(gf={}, gpu={:#x} declared={} mirrored={})",
+                                s23_c5_window, s23_c5_old, s23_c5_new, g_s18_guest_frames,
+                                static_cast<u64>(record.address), record.size, s23_c5_full);
                 }
             }
         }
