@@ -2270,14 +2270,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             g_s18_guest_frames < 27600) {
             static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
             static void* s23_c5_mapped = nullptr;
-            // S23 cycle 16: sweep instead of two points, and rely on the 60 s scene-RT dumps
-            // (lmean/rmax) as the readout - the frame is now stable enough that a real change in
-            // the ground blend would show there without needing captures inside the window.
-            // Windows of 600 guest frames: 0.0 (baseline) -> 0.25 -> 0.5 -> 1.0 -> 2.0.
+            // S23 cycle 16b: 300-frame windows cycling through the five values, so a run that
+            // survives past gf 16500 already covers the whole sweep and every later cycle adds
+            // more samples per value (the 600-frame version needed 2600 s and the flaky
+            // loading->style device removal kept eating it).
             static constexpr std::array<f32, 5> kS23C5Values{0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
-            const u32 s23_c5_window = std::min<u32>(
-                static_cast<u32>((g_s18_guest_frames - 15000) / 600),
-                static_cast<u32>(kS23C5Values.size()) - 1);
+            const u32 s23_c5_window = static_cast<u32>(
+                ((g_s18_guest_frames - 15000) / 300) % kS23C5Values.size());
             const f32 s23_c5_new = kS23C5Values[s23_c5_window];
             const u64 s23_c5_size = std::min<u64>(record.size, 4096);
             // S22 parity: the shader reads past the guest-declared CBV size, so mirror the same
