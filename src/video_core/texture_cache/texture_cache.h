@@ -2484,10 +2484,11 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     bool delete_state = has_deleted_images;
     do {
         has_deleted_images = false;
-        // S23 FIX: same reasoning as CreateImageView - the render target and the sampled view of
-        // one dynamic-resolution surface can differ by a few texels; both paths must resolve to
-        // the same image (block-linear/GOB alignment) instead of creating two.
-        image_id = FindOrInsertImage(info, gpu_addr, RelaxedOptions::Size);
+        // S23: the render target keeps the strict size match (it defines the surface). Only the
+        // sampled view is relaxed (see CreateImageView) - letting a render target attach to a
+        // surface created at a different extent let a recycled, never-written resource reach the
+        // sampler (1.0.344 run: `rmax=65024 lmean=442` at t=2050, then the scene pass stopped).
+        image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
     } while (has_deleted_images);
     has_deleted_images = delete_state;
