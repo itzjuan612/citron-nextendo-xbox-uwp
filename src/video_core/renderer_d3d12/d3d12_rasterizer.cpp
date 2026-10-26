@@ -5418,6 +5418,55 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     s15_post_scene && s15_post_late && s15_post_scene_dumps < 4;
                 const bool s15_post_lut_budget =
                     s15_post_lut && !s19_post_bank && s15_post_lut_dumps < 8;
+                // S24 (env-probe timeline): the 13-cube reflection probe (joined at 0x5eb340000)
+                // holds content on ONE face out of 78 at the settled phase. This 10 s cadence
+                // dumps the joined image as its CONSUMERS see it, so the moment the other faces
+                // disappear is bracketed between two dumps. It must sit OUTSIDE the 30-pass
+                // budget gate below: the draw that samples the probe (the 1722-vertex colour
+                // pass) satisfies none of its conditions, so inside it the probe would never
+                // fire. Readbacks are skipped whenever the current RT is inside the bank window
+                // (that is what dropped the command batch - see the S20 note), using the
+                // unbudgeted VA check rather than the budgeted s19_post_bank flag.
+                {
+                    static u32 s24_env_tl_dumps = 0;
+                    static std::chrono::steady_clock::time_point s24_env_tl_next =
+                        std::chrono::steady_clock::now();
+                    const bool s24_env_bank_rt = s19_post_bank_gpu >= 0x5e9000000ull &&
+                                                 s19_post_bank_gpu < 0x5ee7b4000ull;
+                    if (!s24_env_bank_rt && s24_env_tl_dumps < 40 &&
+                        std::chrono::steady_clock::now() >= s24_env_tl_next) {
+                        for (const DrawSlot& s24_env_slot : res_slots) {
+                            if (s24_env_slot.kind != SlotKind::Sampled ||
+                                s24_env_slot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                                continue;
+                            }
+                            ImageView& s24_env_sv =
+                                m_texture_cache.GetImageView(s24_env_slot.view);
+                            const u64 s24_env_gpu = static_cast<u64>(s24_env_sv.GpuAddr());
+                            if (s24_env_sv.Resource() == nullptr ||
+                                s24_env_gpu != 0x5eb340000ull) {
+                                continue;
+                            }
+                            ++s24_env_tl_dumps;
+                            s24_env_tl_next =
+                                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                            (void)D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, s24_env_sv.Resource(),
+                                static_cast<u32>(s24_env_sv.format), s24_env_gpu,
+                                946000u + s24_env_tl_dumps, true);
+                            LOG_WARNING(Render_D3D12,
+                                        "S24 env timeline: id={} img={} gpu={:#x} res={:#x} "
+                                        "{}x{} fmt={:#x} verts={}",
+                                        946000u + s24_env_tl_dumps, s24_env_sv.image_id.index,
+                                        s24_env_gpu,
+                                        reinterpret_cast<u64>(s24_env_sv.Resource()),
+                                        s24_env_sv.size.width, s24_env_sv.size.height,
+                                        static_cast<u32>(s24_env_sv.format),
+                                        params.num_vertices);
+                            break;
+                        }
+                    }
+                }
                 if (s15_post_scene_budget || s15_post_lut_budget || s19_post_bank || s19_post_probe ||
                     s19_post_table) {
                     const u32 s15_post_index =

@@ -1419,13 +1419,14 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
     seen.emplace_back(guest_addr, image_index);
     // Small uncompressed array/cube images also get cube 0's remaining faces and the first face
     // of every later cube (all 13 cubes of the env probe = 18 entries including layer 0, capped
-    // so one call cannot eat the 64-entry queue). Only the S24 sky probe (id band 943xxx) asks
-    // for layers: the boot-time LUT probes also hit a 256x256 cube array and must not gain a pile
-    // of readbacks while the guest is loading. The desc cannot distinguish a cube array from a
-    // plain 2D array, so a plain array in that band gets the same every-6th-slice sample -
-    // harmless, the probe only aims this at the env probe.
-    if (image_index >= 943000u && image_index < 944000u && desc.DepthOrArraySize > 1 &&
-        desc.Width <= 512 && desc.Height <= 512 &&
+    // so one call cannot eat the 64-entry queue). Only the S24 probes (id bands 943xxx sky probe
+    // and 946xxx env timeline) ask for layers: the boot-time LUT probes also hit a 256x256 cube
+    // array and must not gain a pile of readbacks while the guest is loading. The desc cannot
+    // distinguish a cube array from a plain 2D array, so a plain array in those bands gets the
+    // same every-6th-slice sample - harmless, the probes only aim this at the env probe.
+    if (((image_index >= 943000u && image_index < 944000u) ||
+         (image_index >= 946000u && image_index < 947000u)) &&
+        desc.DepthOrArraySize > 1 && desc.Width <= 512 && desc.Height <= 512 &&
         !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
         u32 added = 0;
         for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 19; ++layer) {
