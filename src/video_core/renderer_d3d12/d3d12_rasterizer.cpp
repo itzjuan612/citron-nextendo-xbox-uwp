@@ -873,6 +873,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         }
         const ImageView* view = framebuffer ? framebuffer->ColorBuffers()[i] : nullptr;
         const bool unbound = !view || !view->RenderTarget().ptr;
+        // S24 bisect: the six env-probe face fills are followed by a `Close failed 0x80070057`
+        // that drops the whole bake batch (the probe keeps one face of 78). Set this to true to
+        // skip the fills and see whether the failure belongs to them or to the rest of the batch.
+        {
+            static constexpr bool kS24SkipFaceFills = false;
+            if (kS24SkipFaceFills && view != nullptr) {
+                const u64 s24_bisect_gpu = static_cast<u64>(view->GpuAddr());
+                if (s24_bisect_gpu >= 0x5eb340000ull &&
+                    s24_bisect_gpu < 0x5eb4ee000ull + 0x56000ull) {
+                    skip_reason = "S24 bisect";
+                }
+            }
+        }
         // S22 cycle 23: bank RT binds with their own budget. The LUT reads finite at t=771 and
         // 100% NaN at t=834 with NO clear, NO alias copy and NO upload in between (all three
         // tracers are armed and silent), so the writer is a DRAW into the bank. The shared S15
