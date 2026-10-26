@@ -3720,6 +3720,83 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     }
                 }
             }
+            // S24 (sky probe): the frame's colour is complete after the 1722-vertex colour draw
+            // into the 960x540 scene RT (S23 trace: 3426/6750/9600/17550 add nothing measurable),
+            // and the sky region of that RT reads 0.0017 linear against 0.12 on the ground - the
+            // black wedge in every capture is black SKY, not a broken mesh. The S21 witness below
+            // skips this draw (its gate is verts >= 4000), so dump its sampled set twice per
+            // process: the GPU content of every input plus the shader's declared bindings, so a
+            // slot can be matched to a sampler. Ids 943001+slot; read-only, own budget.
+            {
+                static u32 s24_sky_arms = 0;
+                static u64 s24_sky_last_gf = 0;
+                if (params.num_vertices == 1722 && s24_sky_arms < 2 &&
+                    g_s18_guest_frames >= 14000 &&
+                    (s24_sky_arms == 0 || g_s18_guest_frames - s24_sky_last_gf >= 3000) &&
+                    framebuffer != nullptr && !framebuffer->ColorBuffers().empty() &&
+                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()) >=
+                        0x5103e0000ull &&
+                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()) <
+                        0x510600000ull) {
+                    ++s24_sky_arms;
+                    s24_sky_last_gf = g_s18_guest_frames;
+                    const Shader::Info* const s24_ps_info = stored.infos[4];
+                    if (s24_ps_info != nullptr) {
+                        // NVN shaders fetch their TIC handles from constant buffers, so a
+                        // descriptor has no static binding number: the sampler order IS the
+                        // descriptor order (dense), which is also the slot order logged below.
+                        u32 s24_desc_i = 0;
+                        for (const auto& s24_desc : s24_ps_info->texture_descriptors) {
+                            LOG_WARNING(Render_D3D12,
+                                        "S24 sky probe descriptor: i={} type={} cbuf={} offset={} "
+                                        "count={} secondary={} size_shift={}",
+                                        s24_desc_i, static_cast<u32>(s24_desc.type),
+                                        s24_desc.cbuf_index, s24_desc.cbuf_offset, s24_desc.count,
+                                        s24_desc.has_secondary ? 1 : 0, s24_desc.size_shift);
+                            ++s24_desc_i;
+                        }
+                    }
+                    std::array<ID3D12Resource*, 16> s24_seen_res{};
+                    u32 s24_seen_count = 0;
+                    u32 s24_slot = 0;
+                    for (const DrawSlot& s24_dslot : res_slots) {
+                        if (s24_dslot.kind != SlotKind::Sampled || s24_slot >= 16) {
+                            continue;
+                        }
+                        ImageView& s24_sv = m_texture_cache.GetImageView(s24_dslot.view);
+                        bool s24_dup = false;
+                        for (u32 i = 0; i < s24_seen_count; ++i) {
+                            s24_dup |= s24_seen_res[i] == s24_sv.Resource();
+                        }
+                        const bool s24_usable =
+                            s24_sv.Resource() != nullptr && !s24_dup &&
+                            !s15_is_current_rt(s24_sv.Resource()) && s24_sv.size.width <= 2048 &&
+                            s24_sv.size.height <= 2048 && s24_seen_count < s24_seen_res.size();
+                        bool s24_dumped = false;
+                        if (s24_usable) {
+                            s24_dumped = D3D12::RecordTextureContentDump(
+                                m_device.GetDevice(), m_command_list, s24_sv.Resource(),
+                                static_cast<u32>(s24_sv.format),
+                                static_cast<u64>(s24_sv.GpuAddr()), 943001u + s24_slot,
+                                /*force=*/true);
+                            if (s24_dumped) {
+                                s24_seen_res[s24_seen_count++] = s24_sv.Resource();
+                            }
+                        }
+                        LOG_WARNING(Render_D3D12,
+                                    "S24 sky probe: arm={} slot={} img={} gpu={:#x} {}x{} fmt={:#x} "
+                                    "dxgi={:#x} dumped={}",
+                                    s24_sky_arms, s24_slot, s24_sv.image_id.index,
+                                    static_cast<u64>(s24_sv.GpuAddr()), s24_sv.size.width,
+                                    s24_sv.size.height, static_cast<u32>(s24_sv.format),
+                                    s24_sv.Resource()
+                                        ? static_cast<u32>(s24_sv.Resource()->GetDesc().Format)
+                                        : 0,
+                                    s24_dumped);
+                        ++s24_slot;
+                    }
+                }
+            }
             // S21 (settled-phase shading witness): the one-shot S15 probes above all latched
             // the loading->style transition (t~1492), where the bank LUT is still being
             // regenerated - so every "this input is zero" reading predates the settled frame.

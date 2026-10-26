@@ -272,6 +272,10 @@ struct TextureContentDump {
     u32 guest_format = 0;
     u64 guest_addr = 0;
     u32 image_index = 0;
+    // S24: array/cube layer this entry came from. The 13-cube env probe is 78 layers and the
+    // scene's sky renders black, so cube 0 / face 0 alone cannot tell a wrong cube index from a
+    // black face; the dumper writes the layer into the file name.
+    u32 layer = 0;
     bool armed = false;
 };
 
@@ -1092,10 +1096,10 @@ void WriteTextureContentDumps() {
             }
         }
         LOG_WARNING(Render_D3D12,
-                    "Texture dump #{} img={} guest_fmt=0x{:x} dxgi=0x{:x} {}x{} bytes={} "
+                    "Texture dump #{} img={} layer={} guest_fmt=0x{:x} dxgi=0x{:x} {}x{} bytes={} "
                     "nonzero={} min={} max={}",
-                    i, entry.image_index, entry.guest_format, entry.dxgi_format, width, height,
-                    total_bytes, nonzero, min_value, max_value);
+                    i, entry.image_index, entry.layer, entry.guest_format, entry.dxgi_format,
+                    width, height, total_bytes, nonzero, min_value, max_value);
         // S21 cycle 17: byte min/max cannot tell a lighting-table ramp from a NaN/Inf texel.
         // For R11G11B10 dumps (the 256x256 LUT and the 960x540 scene RT) decode the actual
         // 11/11/10 floats and log the non-finite count plus the finite per-channel maxima.
@@ -1173,7 +1177,8 @@ void WriteTextureContentDumps() {
         DecodeTextureToBgra(entry.dxgi_format, width, height, row_pitch, total_bytes, base,
                             pixels);
         const std::string path = g_capture_directory + "\\texdump_" + std::to_string(i) + "_img" +
-                                 std::to_string(entry.image_index) + "_gf" +
+                                 std::to_string(entry.image_index) + "_l" +
+                                 std::to_string(entry.layer) + "_gf" +
                                  std::to_string(g_s18_guest_frames) + ".bmp";
         const u32 row_bytes = width * 4;
         const u32 file_size = 54 + row_bytes * height;
@@ -1215,7 +1220,8 @@ void WriteTextureContentDumps() {
             static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_TYPELESS ||
             static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_FLOAT) {
             const std::string bin_path = g_capture_directory + "\\texdump_" + std::to_string(i) +
-                                         "_img" + std::to_string(entry.image_index) + "_gf" +
+                                         "_img" + std::to_string(entry.image_index) + "_l" +
+                                         std::to_string(entry.layer) + "_gf" +
                                          std::to_string(g_s18_guest_frames) + ".bin";
             std::ofstream bin_out{bin_path, std::ios::binary};
             if (bin_out) {
@@ -1338,47 +1344,81 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
         desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
         return false;
     }
-    TextureContentDump entry;
-    UINT64 total_bytes = 0;
-    UINT rows = 0;
-    UINT64 row_size = 0;
-    d3d->GetCopyableFootprints(&desc, 0, 1, 0, &entry.footprint, &rows, &row_size, &total_bytes);
-    D3D12_HEAP_PROPERTIES heap{};
-    heap.Type = D3D12_HEAP_TYPE_READBACK;
-    D3D12_RESOURCE_DESC buffer_desc{};
-    buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    buffer_desc.Width = total_bytes;
-    buffer_desc.Height = 1;
-    buffer_desc.DepthOrArraySize = 1;
-    buffer_desc.MipLevels = 1;
-    buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
-    buffer_desc.SampleDesc.Count = 1;
-    buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
-                                            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                            IID_PPV_ARGS(&entry.readback)))) {
+    // S24: one layer of mip 0 into a readback of its own. Extracted from the old body so a
+    // cubemap array can be dumped face by face: the 13-cube environment probe is 78 layers and
+    // the scene's sky comes out black, so layer 0 (cube 0 / face 0) alone cannot tell a wrong
+    // cube index from a black face.
+    const auto arm_layer = [&](u32 layer) -> bool {
+        if (g_texture_dumps.size() >= 64) {
+            return false;
+        }
+        TextureContentDump entry;
+        UINT64 total_bytes = 0;
+        UINT rows = 0;
+        UINT64 row_size = 0;
+        d3d->GetCopyableFootprints(&desc, 0, 1, 0, &entry.footprint, &rows, &row_size,
+                                   &total_bytes);
+        D3D12_HEAP_PROPERTIES heap{};
+        heap.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC buffer_desc{};
+        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        buffer_desc.Width = total_bytes;
+        buffer_desc.Height = 1;
+        buffer_desc.DepthOrArraySize = 1;
+        buffer_desc.MipLevels = 1;
+        buffer_desc.Format = DXGI_FORMAT_UNKNOWN;
+        buffer_desc.SampleDesc.Count = 1;
+        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(d3d->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                IID_PPV_ARGS(&entry.readback)))) {
+            return false;
+        }
+        command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION dst{};
+        dst.pResource = entry.readback.Get();
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst.PlacedFootprint = entry.footprint;
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = src;
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = layer;
+        command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
+        command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_COMMON);
+        entry.width = static_cast<u32>(desc.Width);
+        entry.height = static_cast<u32>(desc.Height);
+        entry.dxgi_format = static_cast<u32>(desc.Format);
+        entry.guest_format = guest_format;
+        entry.guest_addr = guest_addr;
+        entry.image_index = image_index;
+        entry.layer = layer;
+        entry.armed = true;
+        g_texture_dumps.push_back(std::move(entry));
+        return true;
+    };
+    if (!arm_layer(0)) {
         return false;
     }
-    command_list.Transition(src, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = entry.readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = entry.footprint;
-    D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    src_loc.pResource = src;
-    src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src_loc.SubresourceIndex = 0;
-    command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
-    command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    entry.width = static_cast<u32>(desc.Width);
-    entry.height = static_cast<u32>(desc.Height);
-    entry.dxgi_format = static_cast<u32>(desc.Format);
-    entry.guest_format = guest_format;
-    entry.guest_addr = guest_addr;
-    entry.image_index = image_index;
-    entry.armed = true;
     seen.emplace_back(guest_addr, image_index);
-    g_texture_dumps.push_back(std::move(entry));
+    // Small uncompressed array/cube images also get cube 0's remaining faces and the first face
+    // of every later cube (capped at 12 extra entries so one call cannot eat the queue). The
+    // desc cannot distinguish a cube array from a plain 2D array, so a plain array gets the same
+    // every-6th-slice sample - harmlessly, the probe only aims this at the env probe.
+    if (desc.DepthOrArraySize > 1 && desc.Width <= 512 && desc.Height <= 512 &&
+        !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
+        u32 added = 0;
+        for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 12; ++layer) {
+            if (layer >= 6 && (layer % 6) != 0) {
+                continue;
+            }
+            if (!arm_layer(layer)) {
+                break;
+            }
+            ++added;
+        }
+    }
     return true;
 }
 
