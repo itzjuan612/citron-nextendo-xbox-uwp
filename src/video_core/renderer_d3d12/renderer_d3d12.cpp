@@ -1395,7 +1395,10 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
         D3D12_TEXTURE_COPY_LOCATION src_loc{};
         src_loc.pResource = src;
         src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src_loc.SubresourceIndex = layer;
+        // Subresources are mip-major: mip 0 of array slice N is subresource N * MipLevels. Using
+        // the raw layer index would dump mips 1..MipLevels-1 of slice 0 as if they were faces
+        // (the 13-cube probe has 6 mips, so layers 1-5 are mips, not faces).
+        src_loc.SubresourceIndex = layer * static_cast<u32>(desc.MipLevels);
         command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
         command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                 D3D12_RESOURCE_STATE_COMMON);
@@ -1415,16 +1418,17 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
     }
     seen.emplace_back(guest_addr, image_index);
     // Small uncompressed array/cube images also get cube 0's remaining faces and the first face
-    // of every later cube (capped at 12 extra entries so one call cannot eat the queue). Only the
-    // S24 sky probe (id band 943xxx) asks for layers: the boot-time LUT probes also hit a 256x256
-    // cube array and must not gain 13 readbacks per dump while the guest is loading. The desc
-    // cannot distinguish a cube array from a plain 2D array, so a plain array in that band gets
-    // the same every-6th-slice sample - harmless, the probe only aims this at the env probe.
+    // of every later cube (all 13 cubes of the env probe = 18 entries including layer 0, capped
+    // so one call cannot eat the 64-entry queue). Only the S24 sky probe (id band 943xxx) asks
+    // for layers: the boot-time LUT probes also hit a 256x256 cube array and must not gain a pile
+    // of readbacks while the guest is loading. The desc cannot distinguish a cube array from a
+    // plain 2D array, so a plain array in that band gets the same every-6th-slice sample -
+    // harmless, the probe only aims this at the env probe.
     if (image_index >= 943000u && image_index < 944000u && desc.DepthOrArraySize > 1 &&
         desc.Width <= 512 && desc.Height <= 512 &&
         !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
         u32 added = 0;
-        for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 12; ++layer) {
+        for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 19; ++layer) {
             if (layer >= 6 && (layer % 6) != 0) {
                 continue;
             }

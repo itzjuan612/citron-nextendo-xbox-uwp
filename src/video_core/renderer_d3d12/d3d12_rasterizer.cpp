@@ -3783,6 +3783,16 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         if (s24_dslot.kind != SlotKind::Sampled || s24_slot >= 16) {
                             continue;
                         }
+                        if (s24_dslot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                            // A bound-but-unresolvable TIC yields view id 0; GetImageView(0) indexes
+                            // slot 0, which may be unallocated or freed (indeterminate resource ->
+                            // GetDesc() AV). Same guard the production binding loop uses.
+                            LOG_WARNING(Render_D3D12,
+                                        "S24 sky probe slot {}: unresolved view (skipped)",
+                                        s24_slot);
+                            ++s24_slot;
+                            continue;
+                        }
                         LOG_WARNING(Render_D3D12, "S24 sky probe slot {}: view={}", s24_slot,
                                     s24_dslot.view.index);
                         ImageView& s24_sv = m_texture_cache.GetImageView(s24_dslot.view);
@@ -3877,6 +3887,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             continue;
                         }
                         ++s21_seen;
+                        if (slot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                            // Unresolvable TIC: GetImageView(0) may index an unallocated or freed
+                            // slot and GetDesc() would fault. Skip, keeping the id alignment.
+                            continue;
+                        }
                         ImageView& sv = m_texture_cache.GetImageView(slot.view);
                         bool s21_dup = false;
                         for (u32 d = 0; d < s21_dumped_count; ++d) {
