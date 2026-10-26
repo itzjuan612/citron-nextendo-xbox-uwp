@@ -3730,14 +3730,22 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             {
                 static u32 s24_sky_arms = 0;
                 static u64 s24_sky_last_gf = 0;
+                // The colour-buffer view can be NULL at the loading->style transition (the same
+                // reason the S15 composite block null-checks it), and GpuAddr() sits at +0x8:
+                // reading it through the null view was an AV at exactly guest frame 14000 and
+                // killed three runs. Probe the RT only after the cheap gates pass.
+                const auto s24_is_scene_rt = [&]() -> bool {
+                    if (framebuffer == nullptr || framebuffer->ColorBuffers().empty() ||
+                        framebuffer->ColorBuffers()[0] == nullptr) {
+                        return false;
+                    }
+                    const u64 va = static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr());
+                    return va >= 0x5103e0000ull && va < 0x510600000ull;
+                };
                 if (params.num_vertices == 1722 && s24_sky_arms < 2 &&
                     g_s18_guest_frames >= 14000 &&
                     (s24_sky_arms == 0 || g_s18_guest_frames - s24_sky_last_gf >= 3000) &&
-                    framebuffer != nullptr && !framebuffer->ColorBuffers().empty() &&
-                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()) >=
-                        0x5103e0000ull &&
-                    static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()) <
-                        0x510600000ull) {
+                    s24_is_scene_rt()) {
                     ++s24_sky_arms;
                     s24_sky_last_gf = g_s18_guest_frames;
                     u32 s24_sampled_n = 0;
@@ -3784,7 +3792,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         // the blit in this same frame, and a depth-stencil copy is invalid.
                         bool s24_fb = false;
                         for (const auto& s24_cb : framebuffer->ColorBuffers()) {
-                            s24_fb |= s24_cb->Resource() == s24_res;
+                            s24_fb |= s24_cb != nullptr && s24_cb->Resource() == s24_res;
                         }
                         const bool s24_depth =
                             s24_res != nullptr && (s24_res->GetDesc().Flags &
