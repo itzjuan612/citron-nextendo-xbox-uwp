@@ -900,6 +900,28 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             depth_view != nullptr ? 1 : 0);
             }
         }
+        // S24 (bank fill census): the burst-gated S22 line above collapses the six face fills into
+        // one line, so it cannot say whether they target six different face addresses
+        // (0x5eb340000 + k*0x56000) or all the same address - the latter would mean the guest's
+        // render-target layer is being ignored and every face is painted over face 0 (the probe
+        // has content on one face out of 78 from the first dump after the bake). Log-only, no
+        // readback: readbacks in the bank window are what dropped the command batch.
+        if (view != nullptr) {
+            static u32 s24_fill_logs = 0;
+            const u64 s24_fill_gpu = static_cast<u64>(view->GpuAddr());
+            if (s24_fill_logs < 32 && s24_fill_gpu >= 0x5eb340000ull &&
+                s24_fill_gpu < 0x5eb4ee000ull + 0x56000ull) {
+                ++s24_fill_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S24 fill #{}: gpu={:#x} res=0x{:x} {}x{} fmt={:#x} att={:#x} "
+                            "verts={} depth={} slot={}",
+                            s24_fill_logs, s24_fill_gpu,
+                            reinterpret_cast<u64>(view->Resource()), view->size.width,
+                            view->size.height, static_cast<u32>(view->format),
+                            stored.pipeline->State().attachments[0].raw, params.num_vertices,
+                            depth_view != nullptr ? 1 : 0, i);
+            }
+        }
         // TEMP DIAGNOSTIC (S15): wiper-window RT tracer, evaluated before the skip returns
         // below so a producer draw this loop rejects (unrepresentable format or unbound
         // slot) is still logged - the previous after-loop tracer never saw skipped draws.
