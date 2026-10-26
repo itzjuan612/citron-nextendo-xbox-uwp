@@ -1270,6 +1270,31 @@ void RequestSceneAlignDump() {
 
 void SetCaptureDirectory(std::string directory) {
     g_capture_directory = std::move(directory);
+    // S24: the 60 s probes had accumulated 14 038 texdumps / 20.5 GB in LocalState\captures
+    // (the dump ids repeat every run, so nothing there survives a process anyway, and the
+    // unique _gf names added in 1.0.353 make a run add ~0.5 GB instead of recycling names).
+    // Two back-to-back boot deaths on 1.0.353 (0xC00000FD and a silent kill during a dump
+    // burst) make a full app-data volume the prime suspect, so wipe the previous process's
+    // dumps once, before the first capture of this run can be written.
+    std::error_code ec;
+    size_t wiped = 0;
+    for (const auto& entry : std::filesystem::directory_iterator{g_capture_directory, ec}) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_regular_file(ec)) {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        if (name.rfind("texdump_", 0) == 0 || name.rfind("scene3d_", 0) == 0) {
+            std::filesystem::remove(entry.path(), ec);
+            ec.clear();
+            ++wiped;
+        }
+    }
+    const auto space = std::filesystem::space(g_capture_directory, ec);
+    LOG_WARNING(Render_D3D12, "S24 capture dir: wiped {} previous dumps, free={} MB of {} MB",
+                wiped, space.available / (1024 * 1024), space.capacity / (1024 * 1024));
 }
 
 std::string GetCaptureDirectory() {
