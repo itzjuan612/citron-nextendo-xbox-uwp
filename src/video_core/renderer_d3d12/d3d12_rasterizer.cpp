@@ -3740,7 +3740,18 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         0x510600000ull) {
                     ++s24_sky_arms;
                     s24_sky_last_gf = g_s18_guest_frames;
+                    u32 s24_sampled_n = 0;
+                    for (const DrawSlot& s24_count : res_slots) {
+                        s24_sampled_n += s24_count.kind == SlotKind::Sampled ? 1u : 0u;
+                    }
+                    LOG_WARNING(Render_D3D12,
+                                "S24 sky probe: arm={} gf={} rt={:#x} verts={} sampled={}",
+                                s24_sky_arms, g_s18_guest_frames,
+                                static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr()),
+                                params.num_vertices, s24_sampled_n);
                     const Shader::Info* const s24_ps_info = stored.infos[4];
+                    LOG_WARNING(Render_D3D12, "S24 sky probe: ps_info={}",
+                                s24_ps_info != nullptr ? 1 : 0);
                     if (s24_ps_info != nullptr) {
                         // NVN shaders fetch their TIC handles from constant buffers, so a
                         // descriptor has no static binding number: the sampler order IS the
@@ -3763,24 +3774,40 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         if (s24_dslot.kind != SlotKind::Sampled || s24_slot >= 16) {
                             continue;
                         }
+                        LOG_WARNING(Render_D3D12, "S24 sky probe slot {}: view={}", s24_slot,
+                                    s24_dslot.view.index);
                         ImageView& s24_sv = m_texture_cache.GetImageView(s24_dslot.view);
+                        ID3D12Resource* const s24_res = s24_sv.Resource();
+                        const u32 s24_dxgi =
+                            s24_res != nullptr ? static_cast<u32>(s24_res->GetDesc().Format) : 0u;
+                        // Never touch what the frame still needs: the present buffers are read by
+                        // the blit in this same frame, and a depth-stencil copy is invalid.
+                        bool s24_fb = false;
+                        for (const auto& s24_cb : framebuffer->ColorBuffers()) {
+                            s24_fb |= s24_cb->Resource() == s24_res;
+                        }
+                        const bool s24_depth =
+                            s24_res != nullptr && (s24_res->GetDesc().Flags &
+                                                   D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
                         bool s24_dup = false;
                         for (u32 i = 0; i < s24_seen_count; ++i) {
-                            s24_dup |= s24_seen_res[i] == s24_sv.Resource();
+                            s24_dup |= s24_seen_res[i] == s24_res;
                         }
                         const bool s24_usable =
-                            s24_sv.Resource() != nullptr && !s24_dup &&
-                            !s15_is_current_rt(s24_sv.Resource()) && s24_sv.size.width <= 2048 &&
-                            s24_sv.size.height <= 2048 && s24_seen_count < s24_seen_res.size();
+                            s24_res != nullptr && !s24_dup && !s24_fb && !s24_depth &&
+                            s24_dxgi != 0 && !s15_is_current_rt(s24_res) &&
+                            s24_sv.size.width >= 4 && s24_sv.size.height >= 4 &&
+                            s24_sv.size.width <= 2048 && s24_sv.size.height <= 2048 &&
+                            s24_seen_count < s24_seen_res.size();
                         bool s24_dumped = false;
                         if (s24_usable) {
                             s24_dumped = D3D12::RecordTextureContentDump(
-                                m_device.GetDevice(), m_command_list, s24_sv.Resource(),
+                                m_device.GetDevice(), m_command_list, s24_res,
                                 static_cast<u32>(s24_sv.format),
                                 static_cast<u64>(s24_sv.GpuAddr()), 943001u + s24_slot,
                                 /*force=*/true);
                             if (s24_dumped) {
-                                s24_seen_res[s24_seen_count++] = s24_sv.Resource();
+                                s24_seen_res[s24_seen_count++] = s24_res;
                             }
                         }
                         LOG_WARNING(Render_D3D12,
@@ -3788,10 +3815,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     "dxgi={:#x} dumped={}",
                                     s24_sky_arms, s24_slot, s24_sv.image_id.index,
                                     static_cast<u64>(s24_sv.GpuAddr()), s24_sv.size.width,
-                                    s24_sv.size.height, static_cast<u32>(s24_sv.format),
-                                    s24_sv.Resource()
-                                        ? static_cast<u32>(s24_sv.Resource()->GetDesc().Format)
-                                        : 0,
+                                    s24_sv.size.height, static_cast<u32>(s24_sv.format), s24_dxgi,
                                     s24_dumped);
                         ++s24_slot;
                     }
