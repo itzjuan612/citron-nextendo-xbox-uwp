@@ -2285,12 +2285,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
             }
         }
-        // S23 cycle 18: bind the override on the MATERIAL buffer, not on loop slot 5. The loop
-        // indexes the draw's declared CBV list, and its slot 5 is a 256-byte buffer (logged
-        // `declared=256`), while the shader's c5 is the guest's 4608-byte material buffer
-        // (S19 cbuf scene s4 i5, gpu 0x5e8982600). Keying on that size is the only way to hit the
-        // buffer the shader actually reads.
-        if (params.num_vertices == 1722 && record.size == 4608 && record.address != 0 &&
+        // S23 cycle 20: c5 is **slot 9** for the 1722-vertex draw. The CBV list it declares is
+        // 65536, 1024, 256, 1024, 1792, 1280, 0, 65536, 1024, 512, 1024, 2048, 1024, 9216 and the
+        // SPIR-V block sizes of ps_296 are c3=768, c5=512, c6=1536, c7=1024, c9=65536 - only slot 9
+        // is 512 bytes. (Earlier attempts hit slot 5 = 1280 B and a nonexistent 4608 B record.)
+        if (params.num_vertices == 1722 && record.size == 512 && record.address != 0 &&
             gpu_memory != nullptr && g_s18_guest_frames > 15000) {
             static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
             static void* s23_c5_mapped = nullptr;
