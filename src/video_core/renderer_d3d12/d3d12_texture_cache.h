@@ -351,6 +351,13 @@ private:
     DescriptorHeap rtv_heap;
     DescriptorHeap dsv_heap;
 
+    // CopyImageRawRoundtrip scratch buffers. They must outlive the call because the recorded
+    // command list references them until execution, and a buffer that already has copies
+    // recorded into the current (not yet executed) list can never be released - so a larger
+    // request allocates an additional buffer instead of resetting one. Reused by size.
+    std::vector<ComPtr<ID3D12Resource>> copy_roundtrip_buffers;
+    std::vector<u64> copy_roundtrip_sizes;
+
     std::array<std::vector<DXGI_FORMAT>, VideoCore::Surface::MaxPixelFormat> view_formats;
 
     u64 tick{};
