@@ -2285,68 +2285,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 }
             }
         }
-        // S23 cycle 20: c5 is **slot 9** for the 1722-vertex draw. The CBV list it declares is
-        // 65536, 1024, 256, 1024, 1792, 1280, 0, 65536, 1024, 512, 1024, 2048, 1024, 9216 and the
-        // SPIR-V block sizes of ps_296 are c3=768, c5=512, c6=1536, c7=1024, c9=65536 - only slot 9
-        // is 512 bytes. (Earlier attempts hit slot 5 = 1280 B and a nonexistent 4608 B record.)
-        if (params.num_vertices == 1722 && record.size == 512 && record.address != 0 &&
-            gpu_memory != nullptr && g_s18_guest_frames > 15000) {
-            static Microsoft::WRL::ComPtr<ID3D12Resource> s23_c5_upload;
-            static void* s23_c5_mapped = nullptr;
-            // S23 cycle 16b: 300-frame windows cycling through the five values, so a run that
-            // survives past gf 16500 already covers the whole sweep and every later cycle adds
-            // more samples per value (the 600-frame version needed 2600 s and the flaky
-            // loading->style device removal kept eating it).
-            static constexpr std::array<f32, 5> kS23C5Values{0.0f, 0.25f, 0.5f, 1.0f, 2.0f};
-            const u32 s23_c5_window = static_cast<u32>(
-                ((g_s18_guest_frames - 15000) / 300) % kS23C5Values.size());
-            const f32 s23_c5_new = kS23C5Values[s23_c5_window];
-            const u64 s23_c5_size = std::min<u64>(record.size, 4096);
-            // S22 parity: the shader reads past the guest-declared CBV size, so mirror the same
-            // range the real CBV covers (resource width, capped at 64 KB) or the probe would
-            // truncate data the shader actually uses.
-            const u64 s23_c5_full =
-                (record.resource != nullptr && record.offset < record.resource->GetDesc().Width)
-                    ? std::min<u64>(record.resource->GetDesc().Width - record.offset, 64 * 1024)
-                    : std::max<u64>(record.size, 256);
-            if (s23_c5_upload == nullptr) {
-                D3D12_HEAP_PROPERTIES s23_heap{};
-                s23_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-                D3D12_RESOURCE_DESC s23_desc{};
-                s23_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-                s23_desc.Width = 64 * 1024;
-                s23_desc.Height = 1;
-                s23_desc.DepthOrArraySize = 1;
-                s23_desc.MipLevels = 1;
-                s23_desc.Format = DXGI_FORMAT_UNKNOWN;
-                s23_desc.SampleDesc.Count = 1;
-                s23_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-                if (SUCCEEDED(m_device.GetDevice()->CreateCommittedResource(
-                        &s23_heap, D3D12_HEAP_FLAG_NONE, &s23_desc,
-                        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-                        IID_PPV_ARGS(&s23_c5_upload)))) {
-                    (void)s23_c5_upload->Map(0, nullptr, &s23_c5_mapped);
-                }
-            }
-            if (s23_c5_mapped != nullptr && s23_c5_size >= 4) {
-                gpu_memory->ReadBlock(static_cast<GPUVAddr>(record.address), s23_c5_mapped,
-                                      static_cast<size_t>(s23_c5_full),
-                                      VideoCommon::CacheType::NoTextureCache);
-                const f32 s23_c5_old = static_cast<f32*>(s23_c5_mapped)[0];
-                static_cast<f32*>(s23_c5_mapped)[0] = s23_c5_new;
-                address = s23_c5_upload->GetGPUVirtualAddress();
-                cbv_size = s23_c5_full;
-                static f32 s23_c5_reported = -1.0f;
-                if (s23_c5_reported != s23_c5_new) {
-                    s23_c5_reported = s23_c5_new;
-                    LOG_WARNING(Render_D3D12,
-                                "S23 c5 probe: window={} c5[0] {:.4f} -> {:.4f} on the ground draw "
-                                "(gf={}, gpu={:#x} declared={} mirrored={})",
-                                s23_c5_window, s23_c5_old, s23_c5_new, g_s18_guest_frames,
-                                static_cast<u64>(record.address), record.size, s23_c5_full);
-                }
-            }
-        }
+        // S23 cycle 20 located c5 (slot 9 of the 1722-vertex draw) and 1.0.352 ran the
+        // correctly-aimed A/B: lmean 0.03338 at c5[0]=2.0 vs 0.03325 at 1.0 (old=0.0000 on all
+        // 21 window changes). The c5 blend is ruled out, so the sweep is deleted - it rewrote
+        // the material CBV of the draw that paints the ground on every settled frame.
         // S21 cycle 12: D3D12 enforces ConstantBufferView.SizeInBytes and zero-fills reads
         // beyond it, but the guest's declared size is only a hint - the hardware (and the
         // Vulkan backend's whole-buffer descriptors) serve reads past it from the mapped

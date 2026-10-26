@@ -1173,7 +1173,8 @@ void WriteTextureContentDumps() {
         DecodeTextureToBgra(entry.dxgi_format, width, height, row_pitch, total_bytes, base,
                             pixels);
         const std::string path = g_capture_directory + "\\texdump_" + std::to_string(i) + "_img" +
-                                 std::to_string(entry.image_index) + ".bmp";
+                                 std::to_string(entry.image_index) + "_gf" +
+                                 std::to_string(g_s18_guest_frames) + ".bmp";
         const u32 row_bytes = width * 4;
         const u32 file_size = 54 + row_bytes * height;
         std::array<u8, 54> header{};
@@ -1214,7 +1215,8 @@ void WriteTextureContentDumps() {
             static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_TYPELESS ||
             static_cast<DXGI_FORMAT>(entry.dxgi_format) == DXGI_FORMAT_R32G32B32A32_FLOAT) {
             const std::string bin_path = g_capture_directory + "\\texdump_" + std::to_string(i) +
-                                         "_img" + std::to_string(entry.image_index) + ".bin";
+                                         "_img" + std::to_string(entry.image_index) + "_gf" +
+                                         std::to_string(g_s18_guest_frames) + ".bin";
             std::ofstream bin_out{bin_path, std::ios::binary};
             if (bin_out) {
                 bin_out.write(reinterpret_cast<const char*>(base),
