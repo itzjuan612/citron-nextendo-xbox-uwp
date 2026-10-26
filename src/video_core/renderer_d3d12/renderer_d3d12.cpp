@@ -1054,6 +1054,18 @@ void WriteTextureContentDumps() {
     if (g_texture_dumps.empty()) {
         return;
     }
+    // S24: the wipe in SetCaptureDirectory runs before the logger exists, so report the volume
+    // here (first dump of the process) - a full app-data volume killed two runs mid-dump.
+    {
+        static bool s24_space_logged = false;
+        if (!s24_space_logged) {
+            s24_space_logged = true;
+            std::error_code space_ec;
+            const auto space = std::filesystem::space(g_capture_directory, space_ec);
+            LOG_WARNING(Render_D3D12, "S24 capture dir: free={} MB of {} MB",
+                        space.available / (1024 * 1024), space.capacity / (1024 * 1024));
+        }
+    }
     std::error_code ec;
     std::filesystem::create_directories(g_capture_directory, ec);
     for (size_t i = 0; i < g_texture_dumps.size(); ++i) {
@@ -1403,10 +1415,13 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
     }
     seen.emplace_back(guest_addr, image_index);
     // Small uncompressed array/cube images also get cube 0's remaining faces and the first face
-    // of every later cube (capped at 12 extra entries so one call cannot eat the queue). The
-    // desc cannot distinguish a cube array from a plain 2D array, so a plain array gets the same
-    // every-6th-slice sample - harmlessly, the probe only aims this at the env probe.
-    if (desc.DepthOrArraySize > 1 && desc.Width <= 512 && desc.Height <= 512 &&
+    // of every later cube (capped at 12 extra entries so one call cannot eat the queue). Only the
+    // S24 sky probe (id band 943xxx) asks for layers: the boot-time LUT probes also hit a 256x256
+    // cube array and must not gain 13 readbacks per dump while the guest is loading. The desc
+    // cannot distinguish a cube array from a plain 2D array, so a plain array in that band gets
+    // the same every-6th-slice sample - harmless, the probe only aims this at the env probe.
+    if (image_index >= 943000u && image_index < 944000u && desc.DepthOrArraySize > 1 &&
+        desc.Width <= 512 && desc.Height <= 512 &&
         !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
         u32 added = 0;
         for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 12; ++layer) {
