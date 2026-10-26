@@ -2272,6 +2272,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         //   frag = SmoothStep(%1752-%1705, %1726, %1705) per channel.
         // With c5[0] == 0 the edge collapses and every fragment lands on one value - which is
         // exactly the flat ground. Aim the sweep at 1722 instead.
+        // S23 cycle 19: one-shot list of the CBVs the 1722-vertex scene draw declares, so the
+        // shader's c5 can be identified exactly (loop slot != guest index - 1.0.349 proved that).
+        {
+            static bool s23_cbv_list_done = false;
+            if (params.num_vertices == 1722 && !s23_cbv_list_done) {
+                LOG_WARNING(Render_D3D12, "S23 cbv list 1722: slot={}/{} size={} addr={:#x}",
+                            slot, num_cbv, record.size,
+                            static_cast<u64>(record.address));
+                if (slot + 1 == num_cbv) {
+                    s23_cbv_list_done = true;
+                }
+            }
+        }
         // S23 cycle 18: bind the override on the MATERIAL buffer, not on loop slot 5. The loop
         // indexes the draw's declared CBV list, and its slot 5 is a 256-byte buffer (logged
         // `declared=256`), while the shader's c5 is the guest's 4608-byte material buffer
