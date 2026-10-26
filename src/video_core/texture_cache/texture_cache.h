@@ -2223,7 +2223,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             if (s19_join_window(static_cast<u64>(overlap.gpu_addr)) ||
                 s19_join_window(static_cast<u64>(new_image.gpu_addr))) {
                 static u32 s19_boxes_logs = 0;
-                if (s19_boxes_logs < 12 && !copies.empty()) {
+                // S24: the budget was 12 and spent by t=752, so the 78-layer bank join (t≈780)
+                // never logged its boxes. The env probe keeps content on one face only and the
+                // copy boxes are the one datum that says whether base.layer is right for members
+                // 1-5, so give the trace room (still bounded).
+                if (s19_boxes_logs < 40 && !copies.empty()) {
                     ++s19_boxes_logs;
                     const ImageCopy& c0 = copies.front();
                     LOG_WARNING(Render_D3D12,
