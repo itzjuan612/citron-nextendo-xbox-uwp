@@ -1120,6 +1120,26 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
             srv.TextureCube.MostDetailedMip = most_detailed;
             srv.TextureCube.MipLevels = num_mips;
+        } else if (type == ImageViewType::CubeArray && first_layer % 6 == 0 &&
+                   num_layers >= 6) {
+            // S24 FIX: a guest cubemap array needs a TEXTURECUBEARRAY SRV. Without this branch
+            // the view fell through to TEXTURE2DARRAY, so ps_296 - the shader that paints the
+            // ground - sampled a cube-array binding as a 2D array: wrong/black ambient light
+            // (and the black wedge in the frame). D3D12 requires the SRV dimension to match the
+            // shader's samplerCubeArray; NumCubes is counted in cubes, First2DArrayFace in faces.
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+            srv.TextureCubeArray.MostDetailedMip = most_detailed;
+            srv.TextureCubeArray.MipLevels = num_mips;
+            srv.TextureCubeArray.First2DArrayFace = first_layer;
+            srv.TextureCubeArray.NumCubes = num_layers / 6;
+            static u32 s24_cubearray_views = 0;
+            if (s24_cubearray_views < 4) {
+                ++s24_cubearray_views;
+                LOG_WARNING(Render_D3D12,
+                            "S24 cubearray SRV: {}x{} first_face={} cubes={} mips={} fmt={:#x}",
+                            desc.Width, desc.Height, first_layer, num_layers / 6, num_mips,
+                            static_cast<u32>(sampled_format));
+            }
         } else if (num_layers > 1 || desc.DepthOrArraySize > 1) {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
             srv.Texture2DArray.MostDetailedMip = most_detailed;
