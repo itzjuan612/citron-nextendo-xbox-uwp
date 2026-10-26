@@ -3743,7 +3743,8 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     return va >= 0x5103e0000ull && va < 0x510600000ull;
                 };
                 if (params.num_vertices == 1722 && s24_sky_arms < 2 &&
-                    g_s18_guest_frames >= 14000 &&
+                    g_s18_guest_frames >= 14000 && s15_sampled > 0 &&
+                    stored.pipeline->State().attachments[0].enable.Value() &&
                     (s24_sky_arms == 0 || g_s18_guest_frames - s24_sky_last_gf >= 3000) &&
                     s24_is_scene_rt()) {
                     ++s24_sky_arms;
