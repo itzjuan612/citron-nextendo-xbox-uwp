@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <unordered_map>
 
 #include "common/common_types.h"
 #include "common/logging.h"
@@ -92,6 +93,35 @@ inline void LogBatchSummary() {
                  "cpyBuf={} cpyTex={} trans={} uav={} clear={} state/mark={}",
                  window, scan, counts[7], counts[8], counts[9], counts[3], counts[4],
                  counts[1], counts[2], counts[5] + counts[6], counts[10] + counts[0]);
+    // S25 state simulator: track one implied state per resource across the failing batch
+    // (the backend's invariant is COMMON between ops) and flag any transition whose
+    // recorded StateBefore disagrees - an unbalanced enter/exit pair wedges a resource and
+    // every later op claiming COMMON on it fails Close with E_INVALIDARG.
+    {
+        std::unordered_map<u64, u32> implied;
+        implied.reserve(1024);
+        u32 flagged = 0;
+        for (u32 i = total - scan; i < total; ++i) {
+            const CmdRecord& r = g_cmd_ring[i % CMD_RING_SIZE];
+            if (r.kind != CmdKind::Transition || r.a == 0) {
+                continue;
+            }
+            const auto [it, inserted] = implied.try_emplace(r.a, 0u);
+            if (it->second != static_cast<u32>(r.b)) {
+                if (flagged < 12) {
+                    LOG_CRITICAL(Render_D3D12,
+                                 "DIAG state mismatch: res={:#x} implied={:#x} recorded "
+                                 "before={:#x} after={:#x} (record #{})",
+                                 r.a, it->second, static_cast<u32>(r.b),
+                                 static_cast<u32>(r.c), i);
+                }
+                ++flagged;
+            }
+            it->second = static_cast<u32>(r.c);
+        }
+        LOG_CRITICAL(Render_D3D12, "DIAG state sim: {} transition-state mismatches",
+                     flagged);
+    }
     const u32 destroyed_n = g_destroyed_index.load(std::memory_order_relaxed);
     if (destroyed_n == 0) {
         return;

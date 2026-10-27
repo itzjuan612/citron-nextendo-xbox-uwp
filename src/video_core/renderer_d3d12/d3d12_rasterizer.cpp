@@ -2676,10 +2676,14 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     m_command_list.SetPrimitiveTopology(topology);
     const u32 vertex_count = m_runtime.MaxVertexSlot();
     if (vertex_count > 0) {
+        // S25: also carry the first view's (VA, SizeInBytes, StrideInBytes) - a zero-size
+        // or null-VA view inside the bound range is a Close E_INVALIDARG candidate and the
+        // ring must name it.
+        const D3D12_VERTEX_BUFFER_VIEW* const s25_views = m_runtime.GetVertexBindings().data();
         Diag::Push(Diag::CmdKind::StateSignal, 11, vertex_count,
-                   reinterpret_cast<u64>(m_runtime.GetVertexBindings().data()));
+                   s25_views[0].SizeInBytes, s25_views[0].BufferLocation);
         m_command_list.Get()->IASetVertexBuffers(
-            0, vertex_count, m_runtime.GetVertexBindings().data());
+            0, vertex_count, s25_views);
     }
     if (params.is_indexed && index_binding.valid) {
         D3D12_INDEX_BUFFER_VIEW ib_view{};

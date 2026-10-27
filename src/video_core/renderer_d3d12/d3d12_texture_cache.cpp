@@ -2040,6 +2040,17 @@ void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
     if (width == 0 || height == 0) {
         return;
     }
+    // S25: the sub-4x4 skip below must run BEFORE the enter transitions - a bare return
+    // between the enter/exit pairs wedged src in COPY_SOURCE and dst in COPY_DEST for the
+    // rest of the batch (every later RT/DS excursion claims COMMON -> wrong StateBefore ->
+    // Close E_INVALIDARG).
+    if (width < 4 || height < 4) {
+        static std::atomic<u32> s25_tiny_b2b_skip{0};
+        if (s25_tiny_b2b_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12, "S25 tiny blit2 skipped: {}x{}", width, height);
+        }
+        return;
+    }
     Transition(src_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
     Transition(dst_resource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_RESOURCE_DESC src_desc = src_resource->GetDesc();
@@ -2059,14 +2070,6 @@ void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
     box.right = width;
     box.bottom = height;
     box.back = 1;
-    // S25 FIX: sub-4x4 boxes are rejected by Xbox D3D12 at Close (E_INVALIDARG).
-    if (width < 4 || height < 4) {
-        static std::atomic<u32> s25_tiny_b2b_skip{0};
-        if (s25_tiny_b2b_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
-            LOG_ERROR(Render_D3D12, "S25 tiny blit2 skipped: {}x{}", width, height);
-        }
-        return;
-    }
     for (s32 level = 0; level < src_view.range.extent.levels; ++level) {
         for (s32 layer = 0; layer < src_view.range.extent.layers; ++layer) {
             D3D12_TEXTURE_COPY_LOCATION src_loc{};
