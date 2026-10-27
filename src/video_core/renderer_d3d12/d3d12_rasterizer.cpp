@@ -320,9 +320,9 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
         if (budget > 0) {
             Diag::g_per_draw_flush_budget.store(budget - 1, std::memory_order_relaxed);
             static u32 s25_pdf_logs = 0;
-            if (s25_pdf_logs < 900) {
+            if ((s25_pdf_logs < 900) && ((40000 - budget) % 50 == 0)) {
                 ++s25_pdf_logs;
-                LOG_WARNING(Render_D3D12, "S25 pdf #{} gf={}", 900 - budget,
+                LOG_WARNING(Render_D3D12, "S25 pdf #{} gf={}", 40000 - budget,
                             g_s18_guest_frames);
             }
             m_command_list.Execute(m_device);

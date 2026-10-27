@@ -91,8 +91,11 @@ void CommandList::Execute(Device& device) {
         Recover(device.GetDevice());
         Diag::MarkBatch();
         // S25: arm per-draw flushing so the next (recurring) failure pins the exact draw.
+        // The failures recur 5-35 s apart; the budget must bridge that gap (measured:
+        // ~0.3 ms per flush, so 40000 ≈ 12 s of added stall spread over many frames -
+        // the 900 budget expired in ~3 s and the next failure landed in normal mode).
         Diag::g_arm_per_draw_flush.store(true, std::memory_order_relaxed);
-        Diag::g_per_draw_flush_budget.store(900, std::memory_order_relaxed);
+        Diag::g_per_draw_flush_budget.store(40000, std::memory_order_relaxed);
         return;
     }
     ID3D12CommandList* lists[] = {list.Get()};
