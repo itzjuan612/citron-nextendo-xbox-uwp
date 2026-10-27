@@ -1424,13 +1424,18 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
     // array and must not gain a pile of readbacks while the guest is loading. The desc cannot
     // distinguish a cube array from a plain 2D array, so a plain array in those bands gets the
     // same every-6th-slice sample - harmless, the probes only aim this at the env probe.
+    // S25: the 947xxx band (the post-join bank dump) arms ONLY layers 0-5 — the six
+    // 256x256 members — so one join answers "did the copies land" without eating the
+    // 64-entry queue.
+    const bool s25_members_only = image_index >= 947000u && image_index < 948000u;
     if (((image_index >= 943000u && image_index < 944000u) ||
-         (image_index >= 946000u && image_index < 947000u)) &&
+         (image_index >= 946000u && image_index < 947000u) || s25_members_only) &&
         desc.DepthOrArraySize > 1 && desc.Width <= 512 && desc.Height <= 512 &&
         !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
         u32 added = 0;
-        for (u32 layer = 1; layer < desc.DepthOrArraySize && added < 19; ++layer) {
-            if (layer >= 6 && (layer % 6) != 0) {
+        const u32 s25_layer_limit = s25_members_only ? 6u : desc.DepthOrArraySize;
+        for (u32 layer = 1; layer < s25_layer_limit && added < 19; ++layer) {
+            if (!s25_members_only && layer >= 6 && (layer % 6) != 0) {
                 continue;
             }
             if (!arm_layer(layer)) {

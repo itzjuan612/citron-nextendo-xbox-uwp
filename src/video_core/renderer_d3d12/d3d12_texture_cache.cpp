@@ -7,6 +7,7 @@
 
 #include "common/alignment.h"
 #include "common/logging.h"
+#include "video_core/renderer_d3d12/d3d12_capture.h"
 #include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_command_list.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
@@ -827,13 +828,20 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
     src.pResource = src_buffer;
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     StagingBufferRef repack{};
-    if (src_pitch != canonical_pitch) {
-        // Template data is not in the canonical padded layout; repack rows through a
-        // private staging buffer so the copy sees a legal 256-aligned pitch.
+    // S25: a placed footprint's Offset must be 512-byte aligned on Xbox (Close rejects
+    // otherwise) and the guest mip offsets within the staging buffer are arbitrary.
+    // Reroute through the repack path (offset 0, per-layer strides padded to 512)
+    // whenever the guest layout cannot provide that directly: pitch mismatch, unaligned
+    // base offset, or unaligned per-layer stride. This recovers uploads that 1.0.383
+    // simply skipped.
+    u64 repack_layer_stride = 0;
+    if (src_pitch != canonical_pitch || (src_offset & 511ull) ||
+        (layers > 1 && (layer_src_stride & 511ull))) {
         if (staging_span.empty()) {
             return;
         }
-        const u64 padded_size = canonical_pitch * rows * layers;
+        repack_layer_stride = Common::AlignUp(canonical_pitch * rows, 512ull);
+        const u64 padded_size = repack_layer_stride * layers;
         repack = runtime->staging_pool.Request(padded_size, StagingUsage::Upload);
         if (!repack.buffer || repack.mapped_span.size() < padded_size) {
             return;
@@ -844,7 +852,8 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
                                     static_cast<u64>(l) * layer_src_stride +
                                     static_cast<u64>(r) * src_pitch;
                 u8* dst_row = repack.mapped_span.data() +
-                              (static_cast<u64>(l) * rows + r) * canonical_pitch;
+                              static_cast<u64>(l) * repack_layer_stride +
+                              static_cast<u64>(r) * canonical_pitch;
                 std::memcpy(dst_row, src_row, tight_pitch);
             }
         }
@@ -852,19 +861,6 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         src.PlacedFootprint.Offset = repack.offset;
         copy_src_pitch = canonical_pitch;
     } else {
-        // S25: a placed footprint's Offset must be 512-byte aligned on Xbox (Close
-        // rejects otherwise); the guest mip offsets within the staging buffer are
-        // arbitrary. The repack path above always lands on offset 0.
-        if (src_offset & 511ull) {
-            static std::atomic<u32> s25_unaligned_skip{0};
-            if (s25_unaligned_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_ERROR(Render_D3D12,
-                          "S25 unaligned upload offset {:#x} (img={}x{} lvl={}): copy "
-                          "skipped",
-                          src_offset, static_cast<u64>(desc.Width), desc.Height, mip);
-            }
-            return;
-        }
         src.PlacedFootprint.Offset = src_offset;
     }
     src.PlacedFootprint.Footprint = footprint.Footprint;
@@ -936,13 +932,11 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         D3D12_TEXTURE_COPY_LOCATION layer_src = src;
         if (!repack.buffer) {
             layer_src.PlacedFootprint.Offset = src.PlacedFootprint.Offset + l * layer_src_stride;
-            // S25: per-layer offsets must stay 512-aligned (see the base-offset guard).
-            if (layer_src.PlacedFootprint.Offset & 511ull) {
-                continue;
-            }
         } else {
+            // S25: the repack buffer's per-layer stride is 512-padded (see above), so
+            // every layer offset stays legal.
             layer_src.PlacedFootprint.Offset =
-                repack.offset + static_cast<u64>(l) * canonical_pitch * rows;
+                repack.offset + static_cast<u64>(l) * repack_layer_stride;
         }
         // S25: record the copy into the Diag ring - Close failures were invisible here
         // because this call bypasses the command_list wrapper that pushes records.
@@ -1036,13 +1030,18 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
     StagingBufferRef repack{};
     D3D12_TEXTURE_COPY_LOCATION gpu_dst{};
     u64 layer_dst_stride = 0;
-    if (src_pitch != canonical_pitch) {
-        // Copy into a padded private staging buffer, then unpack tight rows into the
-        // template's staging buffer (which expects its own layout).
+    u64 repack_layer_stride = 0;
+    // S25: a placed footprint's Offset must be 512-byte aligned on Xbox (Close rejects
+    // otherwise). Reroute through the repack path (offset 0, per-layer strides padded to
+    // 512) whenever the guest layout cannot provide that directly — recovering downloads
+    // that 1.0.383 simply skipped.
+    if (src_pitch != canonical_pitch || (dst_offset & 511ull) ||
+        (layers > 1 && ((copy.buffer_size / layers) & 511ull))) {
         if (staging_span.empty()) {
             return;
         }
-        const u64 padded_size = canonical_pitch * rows * layers;
+        repack_layer_stride = Common::AlignUp(canonical_pitch * rows, 512ull);
+        const u64 padded_size = repack_layer_stride * layers;
         repack = runtime->staging_pool.Request(padded_size, StagingUsage::Download);
         if (!repack.buffer || repack.mapped_span.size() < padded_size) {
             return;
@@ -1051,21 +1050,8 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         gpu_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         gpu_dst.PlacedFootprint.Offset = repack.offset;
         gpu_dst.PlacedFootprint.Footprint = footprint.Footprint;
-        layer_dst_stride = canonical_pitch * rows;
+        layer_dst_stride = repack_layer_stride;
     } else {
-        // S25: the readback footprint's Offset must be 512-byte aligned on Xbox (Close
-        // rejects otherwise); the guest layout offsets within the readback staging are
-        // arbitrary. The repack path above always lands on offset 0.
-        if (dst_offset & 511ull) {
-            static std::atomic<u32> s25_unaligned_dl_skip{0};
-            if (s25_unaligned_dl_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_ERROR(Render_D3D12,
-                          "S25 unaligned download offset {:#x} (img={}x{} lvl={}): copy "
-                          "skipped",
-                          dst_offset, static_cast<u64>(desc.Width), desc.Height, mip);
-            }
-            return;
-        }
         gpu_dst.pResource = dst_buffer;
         gpu_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         gpu_dst.PlacedFootprint.Offset = dst_offset;
@@ -1128,9 +1114,10 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         runtime->command_list.Get()->CopyTextureRegion(&layer_dst, 0, 0, 0, &src, &box);
 
         if (repack.buffer) {
-            // Unpack the padded rows into the template's staging buffer.
-            const u8* src_base = repack.mapped_span.data() + static_cast<u64>(l) *
-                                                                       canonical_pitch * rows;
+            // Unpack the padded rows into the template's staging buffer (the repack
+            // buffer's per-layer stride is 512-padded — see above).
+            const u8* src_base = repack.mapped_span.data() +
+                                 static_cast<u64>(l) * repack_layer_stride;
             u8* dst_base = staging_span.data() + dst_offset +
                            static_cast<u64>(l) * (copy.buffer_size / (layers == 0 ? 1 : layers));
             for (u32 r = 0; r < rows; ++r) {
@@ -1546,6 +1533,27 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
                                     std::span<const ImageCopy> copies) {
     if (!command_list.IsValid()) {
         return;
+    }
+    // S25: the bank join's copies land here. Dump the joined bank right after the copies
+    // are recorded (the "did the copies land?" probe; layers 0-5 = the six 256x256
+    // members, id band 947xxx, members-only layer set).
+    {
+        static u32 s25_bank_join_dumps = 0;
+        const u64 s25_dst_gpu = static_cast<u64>(dst.gpu_addr);
+        if (s25_bank_join_dumps < 2 && s25_dst_gpu >= 0x5eb340000ull &&
+            s25_dst_gpu < 0x5eb544000ull) {
+            const D3D12_RESOURCE_DESC s25_desc = dst.Handle()->GetDesc();
+            if (s25_desc.DepthOrArraySize >= 78) {
+                ++s25_bank_join_dumps;
+                RecordTextureContentDump(device.GetDevice(), command_list, dst.Handle(),
+                                         static_cast<u32>(dst.info.format), s25_dst_gpu,
+                                         947000u + s25_bank_join_dumps, true);
+                LOG_WARNING(Render_D3D12,
+                            "S25 bank join dump #{}: gpu={:#x} layers={} copies={}",
+                            s25_bank_join_dumps, s25_dst_gpu, s25_desc.DepthOrArraySize,
+                            copies.size());
+            }
+        }
     }
     if (!CanImageBeCopied(dst, src)) {
         static std::atomic<u32> g_copy_image_skip{0};

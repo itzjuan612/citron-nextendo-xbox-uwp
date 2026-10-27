@@ -2684,6 +2684,25 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                    s25_views[0].SizeInBytes, s25_views[0].BufferLocation);
         m_command_list.Get()->IASetVertexBuffers(
             0, vertex_count, s25_views);
+        // S25: Xbox validates the per-instance vertex extent (stride x instances vs the
+        // view's SizeInBytes) at Close; a short per-instance slot on an instanced draw is
+        // the remaining E_INVALIDARG candidate. Name every bound slot (size/stride/
+        // divisor) on instanced draws.
+        if (params.num_instances > 1) {
+            static u32 s25_instanced_logs = 0;
+            if (s25_instanced_logs < 40) {
+                ++s25_instanced_logs;
+                std::string s25_vb;
+                const auto& s25_div = stored.pipeline->State().binding_divisors;
+                for (u32 v = 0; v < vertex_count && v < 32; ++v) {
+                    s25_vb += fmt::format(" [{}/{}d{}]", s25_views[v].SizeInBytes,
+                                          s25_views[v].StrideInBytes, s25_div[v]);
+                }
+                LOG_WARNING(Render_D3D12, "S25 instanced #{}: n={} idx={} vb={}",
+                            s25_instanced_logs, params.num_instances,
+                            params.is_indexed ? 1 : 0, s25_vb);
+            }
+        }
     }
     if (params.is_indexed && index_binding.valid) {
         D3D12_INDEX_BUFFER_VIEW ib_view{};
