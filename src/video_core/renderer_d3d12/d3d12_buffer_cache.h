@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/usage_tracker.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_descriptor_heap.h"
 #include "video_core/renderer_d3d12/d3d12_staging_buffer_pool.h"
 #include "video_core/surface.h"
@@ -34,6 +35,15 @@ class Buffer : public VideoCommon::BufferBase {
 public:
     explicit Buffer(BufferCacheRuntime& runtime, VideoCommon::NullBufferParams null_params);
     explicit Buffer(BufferCacheRuntime& runtime, VAddr cpu_addr_, u64 size_bytes_);
+
+    // S25: hand the dying resource to the Close-failure correlation (see
+    // Diag::NoteDestroyedResource in d3d12_cmd_ring.h).
+    ~Buffer() {
+        Diag::NoteDestroyedResource(reinterpret_cast<u64>(buffer.Get()));
+    }
+    // A user destructor suppresses the implicit moves SlotVector<Buffer> requires.
+    Buffer(Buffer&&) noexcept = default;
+    Buffer& operator=(Buffer&&) noexcept = default;
 
     [[nodiscard]] ID3D12Resource* Handle() const noexcept {
         return buffer.Get();

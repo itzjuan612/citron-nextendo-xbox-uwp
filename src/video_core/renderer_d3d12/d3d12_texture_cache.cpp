@@ -7,6 +7,7 @@
 
 #include "common/alignment.h"
 #include "common/logging.h"
+#include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_command_list.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_texture_cache.h"
@@ -36,7 +37,6 @@ using VideoCore::Surface::PixelFormat;
 constexpr u32 TXUP_RING_SIZE = 16;
 std::array<std::string, TXUP_RING_SIZE> g_txup_ring;
 std::atomic<u32> g_txup_ring_index{0};
-std::atomic<bool> g_txup_ring_dumped{false};
 
 u32 CalcSubresource(u32 mip, u32 slice, u32 plane, u32 mips, u32 array_size) {
     return mip + slice * mips + plane * mips * array_size;
@@ -488,7 +488,24 @@ Image::Image(TextureCacheRuntime& runtime_, const VideoCommon::ImageInfo& info, 
 Image::Image(const VideoCommon::NullImageParams&)
     : VideoCommon::ImageBase{VideoCommon::NullImageParams{}} {}
 
-Image::~Image() = default;
+Image::~Image() {
+    // S25: hand the dying resource to the Close-failure correlation (Xbox D3D12 fails
+    // Close with E_INVALIDARG when a recorded-but-unexecuted op references a destroyed
+    // resource). Log bounded: joins delete several images each and fire often.
+    const u64 ptr = reinterpret_cast<u64>(resource.Get());
+    if (ptr != 0) {
+        static std::atomic<u32> s25_img_dtor_logs{0};
+        if (s25_img_dtor_logs.fetch_add(1, std::memory_order_relaxed) < 512) {
+            LOG_WARNING(Render_D3D12,
+                        "S25 image destroyed: gpu={:#x} res={:#x} {}x{} fmt={:#x} mips={} "
+                        "layers={}",
+                        static_cast<u64>(gpu_addr), ptr, info.size.width, info.size.height,
+                        static_cast<u32>(info.format), info.resources.levels,
+                        info.resources.layers);
+        }
+        Diag::NoteDestroyedResource(ptr);
+    }
+}
 
 D3D12_CPU_DESCRIPTOR_HANDLE Image::StorageImageView(s32 level) {
     for (const StorageView& view : storage_views) {
@@ -682,7 +699,10 @@ void Image::DownloadMemory(const StagingBufferRef& map, std::span<const BufferIm
 }
 
 void DumpRecentTextureUploads() {
-    if (g_txup_ring_dumped.exchange(true, std::memory_order_relaxed)) {
+    // S25: repeatable (up to 4) - the Close failures hit several batches per run and each
+    // one needs the tail of the upload ring, not only the first.
+    static std::atomic<u32> s25_txup_dumps{0};
+    if (s25_txup_dumps.fetch_add(1, std::memory_order_relaxed) >= 4) {
         return;
     }
     const u32 total = g_txup_ring_index.load(std::memory_order_relaxed);
@@ -888,6 +908,10 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
             layer_src.PlacedFootprint.Offset =
                 repack.offset + static_cast<u64>(l) * canonical_pitch * rows;
         }
+        // S25: record the copy into the Diag ring - Close failures were invisible here
+        // because this call bypasses the command_list wrapper that pushes records.
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst.pResource),
+                   reinterpret_cast<u64>(layer_src.pResource), box.right, box.bottom);
         runtime->command_list.Get()->CopyTextureRegion(
             &dst, static_cast<UINT>(copy.image_offset.x), static_cast<UINT>(copy.image_offset.y),
             static_cast<UINT>(copy.image_offset.z), &layer_src, &box);

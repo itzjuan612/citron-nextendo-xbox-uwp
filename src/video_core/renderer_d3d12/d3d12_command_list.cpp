@@ -6,6 +6,7 @@
 #include "common/logging.h"
 #include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
+#include "video_core/renderer_d3d12/d3d12_texture_cache.h"
 
 namespace D3D12 {
 
@@ -79,12 +80,21 @@ void CommandList::Execute(Device& device) {
     }
     if (!Close()) {
         LOG_ERROR(Render_D3D12, "CommandList::Execute: skipping submit, list failed Close");
+        // S25: the failing batch's op counts + destroyed-resource correlation, before the
+        // raw 512-record dump, so the summary survives log truncation. The batch is every
+        // op recorded since the LAST successful submit (MarkBatch runs at the submit
+        // points below, not here - marking here would window only the ops inside
+        // Execute itself, which are none).
+        Diag::LogBatchSummary();
+        D3D12::DumpRecentTextureUploads();
         Diag::Dump();
         Recover(device.GetDevice());
+        Diag::MarkBatch();
         return;
     }
     ID3D12CommandList* lists[] = {list.Get()};
     device.GetQueue()->ExecuteCommandLists(1, lists);
+    Diag::MarkBatch();
 }
 
 void CommandList::SetRootSignature(ID3D12RootSignature* root_signature) {

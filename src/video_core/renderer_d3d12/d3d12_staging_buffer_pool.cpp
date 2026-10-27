@@ -4,6 +4,7 @@
 #include <bit>
 
 #include "common/logging.h"
+#include "video_core/renderer_d3d12/d3d12_cmd_ring.h"
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_staging_buffer_pool.h"
 
@@ -83,9 +84,13 @@ StagingBufferRef StagingBufferPool::Request(u64 size, StagingUsage usage, bool d
         }
     }
     if (!chosen) {
-        // Hard cap: evict LRU entries until the new entry fits (at least one
-        // eviction attempt is bounded by the pool being non-empty).
-        while (!entries.empty() && total_bytes + size_class > MAX_POOL_BYTES) {
+        // Hard cap: evict LRU entries until the new entry fits. Bounded: since the S25
+        // guard EvictLRU may legitimately refuse to evict (all entries used this frame),
+        // an unbounded while would spin forever when nothing is evictable.
+        for (u32 s25_evict_rounds = 0;
+             s25_evict_rounds < 8 && !entries.empty() &&
+             total_bytes + size_class > MAX_POOL_BYTES;
+             ++s25_evict_rounds) {
             EvictLRU();
         }
         chosen = &CreateEntry(size_class, usage);
@@ -208,10 +213,17 @@ void StagingBufferPool::EvictLRU() {
         return;
     }
     // Prefer an idle entry; only evict an in_use entry when every entry is busy.
+    // S25 FIX: never evict an entry used during the current guest frame (last_used_tick
+    // == tick). Its staging buffer may still be referenced by ops recorded in the
+    // un-executed command list, and Xbox D3D12 fails Close with E_INVALIDARG when a
+    // recorded-but-unexecuted command references a destroyed resource - the mechanism
+    // that dropped the env-probe bake batch (160+ uploads against the 64 MB cap evicted
+    // same-batch buffers). Entries from earlier ticks were fully executed at the last
+    // TickFrame flush, so destroying them is safe.
     u64 victim = ~u64{0};
     u64 victim_tick = ~u64{0};
     for (u64 i = 0; i < entries.size(); ++i) {
-        if (entries[i].in_use) {
+        if (entries[i].in_use || entries[i].last_used_tick == tick) {
             continue;
         }
         if (entries[i].last_used_tick < victim_tick) {
@@ -221,6 +233,9 @@ void StagingBufferPool::EvictLRU() {
     }
     if (victim == ~u64{0}) {
         for (u64 i = 0; i < entries.size(); ++i) {
+            if (entries[i].last_used_tick == tick) {
+                continue;
+            }
             if (entries[i].last_used_tick < victim_tick) {
                 victim_tick = entries[i].last_used_tick;
                 victim = i;
@@ -229,6 +244,22 @@ void StagingBufferPool::EvictLRU() {
     }
     if (victim == ~u64{0}) {
         return;
+    }
+    {
+        // S25: name the victim before it dies, and hand the pointer to the Diag ring so
+        // a later Close failure can be correlated against it.
+        ID3D12Resource* const victim_resource = entries[victim].resource.Get();
+        static u32 s25_evict_logs = 0;
+        if (s25_evict_logs < 48) {
+            ++s25_evict_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S25 staging evict #{}: ptr={:#x} size={} in_use={} last_tick={} "
+                        "now_tick={} pool={}",
+                        s25_evict_logs, reinterpret_cast<u64>(victim_resource),
+                        entries[victim].size, entries[victim].in_use ? 1 : 0, victim_tick,
+                        tick, total_bytes);
+        }
+        Diag::NoteDestroyedResource(reinterpret_cast<u64>(victim_resource));
     }
     // Only successful entries were charged to total_bytes; failed (null resource)
     // entries were emplaced without charging the pool.
