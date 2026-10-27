@@ -90,6 +90,9 @@ void CommandList::Execute(Device& device) {
         Diag::Dump();
         Recover(device.GetDevice());
         Diag::MarkBatch();
+        // S25: arm per-draw flushing so the next (recurring) failure pins the exact draw.
+        Diag::g_arm_per_draw_flush.store(true, std::memory_order_relaxed);
+        Diag::g_per_draw_flush_budget.store(900, std::memory_order_relaxed);
         return;
     }
     ID3D12CommandList* lists[] = {list.Get()};

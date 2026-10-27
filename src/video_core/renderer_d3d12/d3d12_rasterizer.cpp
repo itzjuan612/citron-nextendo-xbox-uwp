@@ -310,26 +310,26 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     if (kSkipDraws) {
         return;
     }
-    // S25 frame bisect: the Close failure sits in the ~2100-op pre-upload frame work; a
-    // flush every 12 draws inside the bake's guest-frame window segments it down to one
-    // draw group, whose DIAG summary + full-batch dump name the invalid op.
-    {
-        // Window covers the bake (the guest frame varies 4588-4756 across runs) plus the
-        // retries. 2000 flushes at ~1 ms each stall the guest ~2 s inside the window; the
-        // 1.0.376 run burned 400 in 15 frames at ~27 draws/frame.
-        static u32 s25_frame_bisect_budget = 0; // S25: served its purpose (gf=4716 window);
-                                                // disarmed - it stalls the guest ~2 s.
-        static u32 s25_frame_bisect_count = 0;
-        if (s25_frame_bisect_budget > 0 && g_s18_guest_frames >= 4400 &&
-            g_s18_guest_frames <= 5050) {
-            if ((++s25_frame_bisect_count % 10) == 0) {
-                --s25_frame_bisect_budget;
-                LOG_WARNING(Render_D3D12, "S25 frame bisect #{} gf={}",
-                            2000 - s25_frame_bisect_budget, g_s18_guest_frames);
-                m_command_list.Execute(m_device);
-                m_device.WaitForIdle();
-                m_command_list.Reset();
+    // S25: after the FIRST Close failure of a run, flush the list after every draw for a
+    // bounded budget. The Close failures recur (the guest retries the bake), so the next
+    // failure in this mode pins the exact draw that carries the invalid op: it is the
+    // first per-draw flush whose Close fails, and the DIAG summary covers only the ops
+    // since the previous draw.
+    if (Diag::g_arm_per_draw_flush.load(std::memory_order_relaxed)) {
+        const u32 budget = Diag::g_per_draw_flush_budget.load(std::memory_order_relaxed);
+        if (budget > 0) {
+            Diag::g_per_draw_flush_budget.store(budget - 1, std::memory_order_relaxed);
+            static u32 s25_pdf_logs = 0;
+            if (s25_pdf_logs < 900) {
+                ++s25_pdf_logs;
+                LOG_WARNING(Render_D3D12, "S25 pdf #{} gf={}", 900 - budget,
+                            g_s18_guest_frames);
             }
+            m_command_list.Execute(m_device);
+            m_device.WaitForIdle();
+            m_command_list.Reset();
+        } else {
+            Diag::g_arm_per_draw_flush.store(false, std::memory_order_relaxed);
         }
     }
     m_query_cache.NotifySegment(true);

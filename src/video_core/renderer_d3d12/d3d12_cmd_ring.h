@@ -65,6 +65,12 @@ inline constexpr u32 DESTROYED_RING_SIZE = 32;
 inline std::atomic<u32> g_destroyed_index{0};
 inline u64 g_destroyed_ptrs[DESTROYED_RING_SIZE]{};
 
+/// S25: set by the first Close failure in a run. While armed, RasterizerD3D12::Draw
+/// flushes the list after every draw, so the NEXT (recurring) Close failure pins the
+/// exact draw/segment that carries the invalid op.
+inline std::atomic<bool> g_arm_per_draw_flush{false};
+inline std::atomic<u32> g_per_draw_flush_budget{0};
+
 /// Records a resource pointer whose D3D12 object was just destroyed. Call from the
 /// destroy site; LogBatchSummary scans recorded ops for these pointers.
 inline void NoteDestroyedResource(u64 ptr) {
