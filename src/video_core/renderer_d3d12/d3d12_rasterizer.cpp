@@ -287,6 +287,8 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
                               D3D12_RESOURCE_STATE_COPY_SOURCE);
     m_command_list.Transition(entry->snapshot.Get(), D3D12_RESOURCE_STATE_COMMON,
                               D3D12_RESOURCE_STATE_COPY_DEST);
+    Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(entry->snapshot.Get()),
+               reinterpret_cast<u64>(src), desc.Width, desc.Height);
     m_command_list.Get()->CopyResource(entry->snapshot.Get(), src);
     m_command_list.Transition(entry->snapshot.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                               D3D12_RESOURCE_STATE_COMMON);

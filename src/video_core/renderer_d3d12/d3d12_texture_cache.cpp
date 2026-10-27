@@ -627,6 +627,24 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
         initialized = true;
         return;
     }
+    // S25 bisect: flush around each bank-member upload so the failing Close segment (and
+    // its DIAG batch summary + ring tail) names the invalid op exactly. The bake batch is
+    // ~2000 ops; without this, one E_INVALIDARG drops the fills, the uploads AND the join.
+    auto s25_bisect_flush = [this](const char* when) {
+        static u32 s25_bisect_flushes = 0;
+        const u64 s25_ug = static_cast<u64>(gpu_addr);
+        if (s25_bisect_flushes >= 48 || s25_ug < 0x5eb340000ull ||
+            s25_ug >= 0x5eb4ee000ull + 0x56000ull) {
+            return;
+        }
+        ++s25_bisect_flushes;
+        LOG_WARNING(Render_D3D12, "S25 bisect flush #{} ({}) gpu={:#x}", s25_bisect_flushes,
+                    when, s25_ug);
+        runtime->command_list.Execute(runtime->device);
+        runtime->device.WaitForIdle();
+        runtime->command_list.Reset();
+    };
+    s25_bisect_flush("before");
     runtime->Transition(resource.Get(), D3D12_RESOURCE_STATE_COMMON,
                         D3D12_RESOURCE_STATE_COPY_DEST);
     for (const BufferImageCopy& copy : copies) {
@@ -634,6 +652,7 @@ void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImag
     }
     runtime->command_list.Transition(resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
                                      D3D12_RESOURCE_STATE_COMMON);
+    s25_bisect_flush("after");
     initialized = true;
 }
 
@@ -1046,6 +1065,32 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         box.back = box.front + (copy.image_extent.depth == 0 ? 1 : copy.image_extent.depth);
         D3D12_TEXTURE_COPY_LOCATION layer_dst = gpu_dst;
         layer_dst.PlacedFootprint.Offset += static_cast<u64>(l) * layer_dst_stride;
+        // S25: download overrun guard (the upload path has the same one). A placed
+        // footprint whose rows extend past the readback buffer fails Close with
+        // E_INVALIDARG on Xbox; the readback is sized to the guest (tight) layout while
+        // the footprint uses the source's canonical 256-aligned pitch.
+        if (!repack.buffer) {
+            const u64 need = layer_dst.PlacedFootprint.Offset +
+                             static_cast<u64>(layer_dst.PlacedFootprint.Footprint.RowPitch) *
+                                 (box_height - 1) +
+                             static_cast<u64>(layer_dst.PlacedFootprint.Footprint.RowPitch);
+            const u64 dst_size = static_cast<u64>(dst_buffer->GetDesc().Width);
+            if (need > dst_size) {
+                static std::atomic<u32> s25_dl_overrun{0};
+                if (s25_dl_overrun.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_ERROR(Render_D3D12,
+                              "S25 DLOVERRUN need={:#x} dst_size={:#x} img={}x{} lvl={} "
+                              "copy={}x{} pitch={}: copy skipped",
+                              need, dst_size, static_cast<u64>(desc.Width), desc.Height, mip,
+                              copy.image_extent.width, copy.image_extent.height,
+                              layer_dst.PlacedFootprint.Footprint.RowPitch);
+                }
+                continue;
+            }
+        }
+        // S25: record the download copy (raw call, invisible in the Diag ring before this).
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(src.pResource),
+                   reinterpret_cast<u64>(layer_dst.pResource), box.right, box.bottom);
         runtime->command_list.Get()->CopyTextureRegion(&layer_dst, 0, 0, 0, &src, &box);
 
         if (repack.buffer) {
@@ -1527,6 +1572,8 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         box.right = box.left + copy.extent.width;
         box.bottom = box.top + copy.extent.height;
         box.back = box.front + (copy.extent.depth == 0 ? 1 : copy.extent.depth);
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst_loc.pResource),
+                   reinterpret_cast<u64>(src_loc.pResource), box.right, box.bottom);
         command_list.Get()->CopyTextureRegion(&dst_loc, copy.dst_offset.x, copy.dst_offset.y,
                                               copy.dst_offset.z, &src_loc, &box);
     }
@@ -1668,6 +1715,9 @@ void TextureCacheRuntime::CopyImageRawRoundtrip(Image& dst, Image& src,
         buffer_dst.pResource = buffer;
         buffer_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         buffer_dst.PlacedFootprint = src_fp;
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(buffer),
+                   reinterpret_cast<u64>(src_resource), static_cast<u64>(src_fp.Footprint.Width),
+                   static_cast<u64>(src_fp.Footprint.Height));
         command_list.Get()->CopyTextureRegion(&buffer_dst, 0, 0, 0, &src_loc, nullptr);
 
         // Buffer -> texture.
@@ -1681,6 +1731,9 @@ void TextureCacheRuntime::CopyImageRawRoundtrip(Image& dst, Image& src,
         dst_loc.pResource = dst_resource;
         dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         dst_loc.SubresourceIndex = dst_sub;
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst_resource),
+                   reinterpret_cast<u64>(buffer), static_cast<u64>(dst_fp.Footprint.Width),
+                   static_cast<u64>(dst_fp.Footprint.Height));
         command_list.Get()->CopyTextureRegion(&dst_loc, 0, 0, 0, &buffer_src, nullptr);
     }
 
@@ -1767,6 +1820,8 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
         box.bottom = box.top + copy.extent.height;
         box.back = 1;
         // 2D-only path per the template (UNIMPLEMENTED_IF on non-e2D types).
+        Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst_resource),
+                   reinterpret_cast<u64>(src_resource), box.right, box.bottom);
         command_list.Get()->CopyTextureRegion(&dst_loc, static_cast<UINT>(copy.dst_offset.x),
                                               static_cast<UINT>(copy.dst_offset.y), 0, &src_loc,
                                               &box);
@@ -1904,6 +1959,9 @@ bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
                 static_cast<u32>(dst_view.range.base.layer + layer), 0, dst_desc.MipLevels,
                 dst_array_size);
             if (is_resolve) {
+                Diag::Push(Diag::CmdKind::CopyTextureRegion,
+                           reinterpret_cast<u64>(dst_resource),
+                           reinterpret_cast<u64>(src_resource), dst_sub, src_sub);
                 command_list.Get()->ResolveSubresource(dst_resource, dst_sub, src_resource,
                                                        src_sub, dst_desc.Format);
                 continue;
@@ -1991,6 +2049,8 @@ void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
                 static_cast<u32>(dst_view.range.base.level + level),
                 static_cast<u32>(dst_view.range.base.layer + layer), 0, dst_desc.MipLevels,
                 dst_array_size);
+            Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst_resource),
+                       reinterpret_cast<u64>(src_resource), box.right, box.bottom);
             command_list.Get()->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
         }
     }
