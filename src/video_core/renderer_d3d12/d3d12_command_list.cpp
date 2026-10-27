@@ -118,12 +118,25 @@ void CommandList::SetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY topology) {
 }
 
 void CommandList::SetViewport(const D3D12_VIEWPORT& viewport) {
-    Diag::Push(Diag::CmdKind::StateSignal, 4);
+    // S25: carry the values - a NaN/negative-width viewport is a Close E_INVALIDARG
+    // candidate and the record must name it. a=(X,Y) b=(W,H) c=(MinDepth,MaxDepth), f32
+    // bit-casts packed two per u64.
+    const auto pack2 = [](f32 lo, f32 hi) {
+        u32 lo_b = 0;
+        u32 hi_b = 0;
+        std::memcpy(&lo_b, &lo, 4);
+        std::memcpy(&hi_b, &hi, 4);
+        return (static_cast<u64>(hi_b) << 32) | lo_b;
+    };
+    Diag::Push(Diag::CmdKind::StateSignal, 4, pack2(viewport.TopLeftX, viewport.TopLeftY),
+               pack2(viewport.Width, viewport.Height),
+               pack2(viewport.MinDepth, viewport.MaxDepth));
     list->RSSetViewports(1, &viewport);
 }
 
 void CommandList::SetScissorRect(const D3D12_RECT& rect) {
-    Diag::Push(Diag::CmdKind::StateSignal, 5);
+    Diag::Push(Diag::CmdKind::StateSignal, (static_cast<u64>(rect.top) << 32) | static_cast<u32>(rect.left),
+               (static_cast<u64>(rect.bottom) << 32) | static_cast<u32>(rect.right));
     list->RSSetScissorRects(1, &rect);
 }
 

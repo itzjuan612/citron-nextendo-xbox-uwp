@@ -317,7 +317,8 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
         // Window covers the bake (the guest frame varies 4588-4756 across runs) plus the
         // retries. 2000 flushes at ~1 ms each stall the guest ~2 s inside the window; the
         // 1.0.376 run burned 400 in 15 frames at ~27 draws/frame.
-        static u32 s25_frame_bisect_budget = 2000;
+        static u32 s25_frame_bisect_budget = 0; // S25: served its purpose (gf=4716 window);
+                                                // disarmed - it stalls the guest ~2 s.
         static u32 s25_frame_bisect_count = 0;
         if (s25_frame_bisect_budget > 0 && g_s18_guest_frames >= 4400 &&
             g_s18_guest_frames <= 5050) {
