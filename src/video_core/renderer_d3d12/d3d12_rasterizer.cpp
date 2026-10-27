@@ -250,10 +250,13 @@ ID3D12Resource* RasterizerD3D12::GetFeedbackSnapshot(ID3D12Resource* src) {
                             m_feedback_snapshots.size(),
                             reinterpret_cast<u64>(m_feedback_snapshots.front().source));
             }
-            // Eviction is safe: the backend executes and waits for GPU idle at command-list
-            // boundaries (TickFrame/FlushCommands), so the current command list's snapshots
-            // are the newest entries and the oldest belongs to an already-completed
-            // command list.
+            // S25 FIX: eviction is NOT safe at command-list boundaries alone. The
+            // bake's LUT pass refreshes several snapshot shapes within ONE long command
+            // list; a new shape then evicts an entry whose CopyResource/Transition ops
+            // are still recorded, and Xbox D3D12 fails Close with E_INVALIDARG - the
+            // mechanism that dropped the env-probe bake batch every run. Park the entry
+            // until the next TickFrame flush destroys it.
+            m_feedback_sentenced.push_back(std::move(m_feedback_snapshots.front()));
             m_feedback_snapshots.erase(m_feedback_snapshots.begin());
         }
         D3D12_HEAP_PROPERTIES heap{};
@@ -7416,6 +7419,14 @@ void RasterizerD3D12::TickFrame() {
     m_command_list.Execute(m_device);
     m_device.WaitForIdle();
     m_command_list.Reset();
+    // S25: now that the GPU is idle and no list is pending, evicted feedback snapshots
+    // can be destroyed safely (they were parked in m_feedback_sentenced on eviction).
+    if (!m_feedback_sentenced.empty()) {
+        for (const FeedbackSnapshot& s : m_feedback_sentenced) {
+            Diag::NoteDestroyedResource(reinterpret_cast<u64>(s.snapshot.Get()));
+        }
+        m_feedback_sentenced.clear();
+    }
     m_res_heap.Reset();
     m_sampler_heap.Reset();
     m_cbv_scratch_used = 0;

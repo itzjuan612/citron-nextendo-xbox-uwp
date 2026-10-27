@@ -143,6 +143,12 @@ private:
         ComPtr<ID3D12Resource> snapshot;
     };
     std::vector<FeedbackSnapshot> m_feedback_snapshots;
+    // S25 FIX: snapshots evicted from the ring above are parked here until the next
+    // TickFrame flush. Erasing them immediately destroyed an ID3D12Resource that ops
+    // recorded in the still-unexecuted command list could reference (Xbox D3D12 fails
+    // Close with E_INVALIDARG for that) - this was the bake-batch Close failure that
+    // dropped the env-probe face fills.
+    std::vector<FeedbackSnapshot> m_feedback_sentenced;
     ID3D12Resource* GetFeedbackSnapshot(ID3D12Resource* src);
 
     /// DEFAULT-heap ring used to realign unaligned uniform ranges for root/table CBVs
