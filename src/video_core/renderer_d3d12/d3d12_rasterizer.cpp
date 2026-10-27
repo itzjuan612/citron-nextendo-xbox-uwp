@@ -6320,7 +6320,15 @@ void RasterizerD3D12::Clear(u32 layer_count) {
             // COMMON -> RENDER_TARGET excursion, same as ConfigureDraw's transition_rt.
             m_command_list.Transition(resource, D3D12_RESOURCE_STATE_COMMON,
                                       D3D12_RESOURCE_STATE_RENDER_TARGET);
-            Diag::Push(Diag::CmdKind::ClearRtv, view->RenderTarget().ptr, rect_count);
+            // S25: carry the first rect's extents - a degenerate/out-of-bounds clear rect
+            // is a Close E_INVALIDARG candidate and the record must name it.
+            Diag::Push(Diag::CmdKind::ClearRtv, view->RenderTarget().ptr, rect_count,
+                       p_rects != nullptr && rect_count > 0
+                           ? static_cast<u64>(p_rects[0].right) - p_rects[0].left
+                           : 0,
+                       p_rects != nullptr && rect_count > 0
+                           ? static_cast<u64>(p_rects[0].bottom) - p_rects[0].top
+                           : 0);
             m_command_list.Get()->ClearRenderTargetView(view->RenderTarget(), color,
                                                         rect_count, p_rects);
             m_command_list.Transition(resource, D3D12_RESOURCE_STATE_RENDER_TARGET,

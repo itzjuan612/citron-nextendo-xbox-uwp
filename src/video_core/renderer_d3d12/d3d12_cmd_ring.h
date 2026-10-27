@@ -124,16 +124,19 @@ inline void LogBatchSummary() {
 
 inline void Dump() {
     // S20: dump on EVERY Close failure (was once per run) - the run's systematic failures hit
-    // *different* batches, and only the failing batch's tail names the invalid command. Last
-    // 512 entries per dump, up to 3 dumps per run.
+    // *different* batches, and only the failing batch's tail names the invalid command.
+    // S25: window = the WHOLE failing batch (since the last successful submit) instead of a
+    // fixed 512 tail - the invalid op sat outside the old window, and the ring holds 4096.
     static std::atomic<u32> dumps_done{0};
-    if (dumps_done.fetch_add(1, std::memory_order_relaxed) >= 3) {
+    if (dumps_done.fetch_add(1, std::memory_order_relaxed) >= 8) {
         return;
     }
     const u32 total = g_cmd_ring_index.load(std::memory_order_relaxed);
-    constexpr u32 WINDOW = 512;
-    const u32 count = total < WINDOW ? total : WINDOW;
-    LOG_CRITICAL(Render_D3D12, "DIAG cmd ring (last {} of {}):", count, total);
+    const u32 start = g_batch_start.load(std::memory_order_relaxed);
+    const u32 window = total >= start ? total - start : 0;
+    const u32 count = window > CMD_RING_SIZE ? CMD_RING_SIZE : window;
+    LOG_CRITICAL(Render_D3D12, "DIAG cmd ring (failing batch, {} of {} recorded):", count,
+                 window);
     for (u32 i = 0; i < count; ++i) {
         const u32 idx = (total - count + i) % CMD_RING_SIZE;
         const CmdRecord& r = g_cmd_ring[idx];
