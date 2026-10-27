@@ -314,14 +314,17 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     // flush every 12 draws inside the bake's guest-frame window segments it down to one
     // draw group, whose DIAG summary + full-batch dump name the invalid op.
     {
-        static u32 s25_frame_bisect_budget = 400;
+        // Window covers the bake (the guest frame varies 4588-4756 across runs) plus the
+        // retries. 2000 flushes at ~1 ms each stall the guest ~2 s inside the window; the
+        // 1.0.376 run burned 400 in 15 frames at ~27 draws/frame.
+        static u32 s25_frame_bisect_budget = 2000;
         static u32 s25_frame_bisect_count = 0;
-        if (s25_frame_bisect_budget > 0 && g_s18_guest_frames >= 4300 &&
-            g_s18_guest_frames <= 5600) {
-            if ((++s25_frame_bisect_count % 12) == 0) {
+        if (s25_frame_bisect_budget > 0 && g_s18_guest_frames >= 4400 &&
+            g_s18_guest_frames <= 5050) {
+            if ((++s25_frame_bisect_count % 10) == 0) {
                 --s25_frame_bisect_budget;
                 LOG_WARNING(Render_D3D12, "S25 frame bisect #{} gf={}",
-                            400 - s25_frame_bisect_budget, g_s18_guest_frames);
+                            2000 - s25_frame_bisect_budget, g_s18_guest_frames);
                 m_command_list.Execute(m_device);
                 m_device.WaitForIdle();
                 m_command_list.Reset();
