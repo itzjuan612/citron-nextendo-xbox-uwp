@@ -1572,6 +1572,22 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         box.right = box.left + copy.extent.width;
         box.bottom = box.top + copy.extent.height;
         box.back = box.front + (copy.extent.depth == 0 ? 1 : copy.extent.depth);
+        // S25 FIX: sub-4x4 boxes are rejected by Xbox D3D12 at Close (E_INVALIDARG) - the
+        // same rule the upload/download paths already enforce. These boxes are the mip
+        // tails (2x2/1x1) of the alias-sync copies between the LUT-bank members and their
+        // alias siblings; recording them is what wedged Close every run at the bake and
+        // dropped the whole batch (fills + join copies). Skip and log.
+        if (copy.extent.width < 4 || copy.extent.height < 4) {
+            static std::atomic<u32> s25_tiny_copy_skip{0};
+            if (s25_tiny_copy_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12,
+                          "S25 tiny copy skipped: {}x{} lvl={} dst_img={}x{} fmt={:#x}",
+                          copy.extent.width, copy.extent.height,
+                          copy.dst_subresource.base_level, static_cast<u64>(dst_desc.Width),
+                          dst_desc.Height, static_cast<u32>(dst_desc.Format));
+            }
+            continue;
+        }
         Diag::Push(Diag::CmdKind::CopyTextureRegion, reinterpret_cast<u64>(dst_loc.pResource),
                    reinterpret_cast<u64>(src_loc.pResource), box.right, box.bottom);
         command_list.Get()->CopyTextureRegion(&dst_loc, copy.dst_offset.x, copy.dst_offset.y,
@@ -1796,6 +1812,16 @@ void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
             : static_cast<u32>(dst_desc.DepthOrArraySize);
     for (const ImageCopy& copy : copies) {
         if (copy.extent.width == 0 || copy.extent.height == 0 || copy.extent.depth == 0) {
+            continue;
+        }
+        // S25 FIX: sub-4x4 boxes are rejected by Xbox D3D12 at Close (E_INVALIDARG), same
+        // as the CopyImage loop above.
+        if (copy.extent.width < 4 || copy.extent.height < 4) {
+            static std::atomic<u32> s25_tiny_blit_skip{0};
+            if (s25_tiny_blit_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12, "S25 tiny blit skipped: {}x{}", copy.extent.width,
+                          copy.extent.height);
+            }
             continue;
         }
         D3D12_TEXTURE_COPY_LOCATION src_loc{};
@@ -2033,6 +2059,14 @@ void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
     box.right = width;
     box.bottom = height;
     box.back = 1;
+    // S25 FIX: sub-4x4 boxes are rejected by Xbox D3D12 at Close (E_INVALIDARG).
+    if (width < 4 || height < 4) {
+        static std::atomic<u32> s25_tiny_b2b_skip{0};
+        if (s25_tiny_b2b_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_D3D12, "S25 tiny blit2 skipped: {}x{}", width, height);
+        }
+        return;
+    }
     for (s32 level = 0; level < src_view.range.extent.levels; ++level) {
         for (s32 layer = 0; layer < src_view.range.extent.layers; ++layer) {
             D3D12_TEXTURE_COPY_LOCATION src_loc{};
