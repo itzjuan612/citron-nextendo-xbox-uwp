@@ -310,6 +310,24 @@ void RasterizerD3D12::Draw(bool is_indexed, u32 instance_count) {
     if (kSkipDraws) {
         return;
     }
+    // S25 frame bisect: the Close failure sits in the ~2100-op pre-upload frame work; a
+    // flush every 12 draws inside the bake's guest-frame window segments it down to one
+    // draw group, whose DIAG summary + full-batch dump name the invalid op.
+    {
+        static u32 s25_frame_bisect_budget = 400;
+        static u32 s25_frame_bisect_count = 0;
+        if (s25_frame_bisect_budget > 0 && g_s18_guest_frames >= 4300 &&
+            g_s18_guest_frames <= 5600) {
+            if ((++s25_frame_bisect_count % 12) == 0) {
+                --s25_frame_bisect_budget;
+                LOG_WARNING(Render_D3D12, "S25 frame bisect #{} gf={}",
+                            400 - s25_frame_bisect_budget, g_s18_guest_frames);
+                m_command_list.Execute(m_device);
+                m_device.WaitForIdle();
+                m_command_list.Reset();
+            }
+        }
+    }
     m_query_cache.NotifySegment(true);
     PipelineCache::StoredPipeline* stored = m_pipeline_cache.CurrentStoredPipeline();
     if (!stored || !stored->pipeline || !stored->pipeline->IsValid()) {
