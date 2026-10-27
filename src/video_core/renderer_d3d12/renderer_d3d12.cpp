@@ -1427,11 +1427,12 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
     // S25: the 947xxx band (the post-join bank dump) arms ONLY layers 0-5 — the six
     // 256x256 members — so one join answers "did the copies land" without eating the
     // 64-entry queue.
-    const bool s25_members_only = image_index >= 947000u && image_index < 948000u;
-    if (((image_index >= 943000u && image_index < 944000u) ||
-         (image_index >= 946000u && image_index < 947000u) || s25_members_only) &&
+    const bool s25_members_only = image_index >= 946000u && image_index < 948000u;
+    if (((image_index >= 943000u && image_index < 944000u) || s25_members_only) &&
         desc.DepthOrArraySize > 1 && desc.Width <= 512 && desc.Height <= 512 &&
         !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
+        // S25: the 946xxx timeline rotates through layers 0-5 only (the six member faces
+        // the fills paint); 18/24 were far tiles the game never writes in this scene.
         u32 added = 0;
         const u32 s25_layer_limit = s25_members_only ? 6u : desc.DepthOrArraySize;
         for (u32 layer = 1; layer < s25_layer_limit && added < 19; ++layer) {
