@@ -2691,7 +2691,33 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     }
 
     m_command_list.SetViewport(MakeViewport(regs));
-    m_command_list.SetScissorRect(MakeScissor(regs));
+    // S25 FIX: Xbox D3D12 rejects scissor rects that extend past the bound render targets
+    // at Close (E_INVALIDARG) - the same rule the clear path already enforces ("D3D12
+    // rejects out-of-resource rects"). The LUT/probe mip-chain draws reuse the level-0
+    // scissor (e.g. 256x256) while rendering into 4x4/16x3 mip RTs, which wedged Close on
+    // the bake frame and dropped the whole batch. Clamp the scissor to the render area.
+    {
+        D3D12_RECT scissor = MakeScissor(regs);
+        if (framebuffer != nullptr) {
+            const VideoCommon::Extent2D area = framebuffer->RenderArea();
+            const LONG max_x = static_cast<LONG>(area.width);
+            const LONG max_y = static_cast<LONG>(area.height);
+            const LONG left = std::max(scissor.left, 0L);
+            const LONG top = std::max(scissor.top, 0L);
+            scissor.left = left;
+            scissor.top = top;
+            scissor.right = std::min(scissor.right, max_x);
+            scissor.bottom = std::min(scissor.bottom, max_y);
+            if (scissor.right < left || scissor.bottom < top) {
+                // Empty clip region: the draw covers no pixels inside the target.
+                scissor.left = 0;
+                scissor.top = 0;
+                scissor.right = 0;
+                scissor.bottom = 0;
+            }
+        }
+        m_command_list.SetScissorRect(scissor);
+    }
 
     m_query_cache.CounterEnable(VideoCommon::QueryType::ZPassPixelCount64,
                                 regs.zpass_pixel_count_enable != 0);
