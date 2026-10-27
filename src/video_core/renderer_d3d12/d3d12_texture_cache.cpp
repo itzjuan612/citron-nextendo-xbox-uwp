@@ -852,6 +852,19 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         src.PlacedFootprint.Offset = repack.offset;
         copy_src_pitch = canonical_pitch;
     } else {
+        // S25: a placed footprint's Offset must be 512-byte aligned on Xbox (Close
+        // rejects otherwise); the guest mip offsets within the staging buffer are
+        // arbitrary. The repack path above always lands on offset 0.
+        if (src_offset & 511ull) {
+            static std::atomic<u32> s25_unaligned_skip{0};
+            if (s25_unaligned_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12,
+                          "S25 unaligned upload offset {:#x} (img={}x{} lvl={}): copy "
+                          "skipped",
+                          src_offset, static_cast<u64>(desc.Width), desc.Height, mip);
+            }
+            return;
+        }
         src.PlacedFootprint.Offset = src_offset;
     }
     src.PlacedFootprint.Footprint = footprint.Footprint;
@@ -923,6 +936,10 @@ void Image::UploadSubresource(ID3D12Resource* src_buffer, std::span<const u8> st
         D3D12_TEXTURE_COPY_LOCATION layer_src = src;
         if (!repack.buffer) {
             layer_src.PlacedFootprint.Offset = src.PlacedFootprint.Offset + l * layer_src_stride;
+            // S25: per-layer offsets must stay 512-aligned (see the base-offset guard).
+            if (layer_src.PlacedFootprint.Offset & 511ull) {
+                continue;
+            }
         } else {
             layer_src.PlacedFootprint.Offset =
                 repack.offset + static_cast<u64>(l) * canonical_pitch * rows;
@@ -1036,6 +1053,19 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         gpu_dst.PlacedFootprint.Footprint = footprint.Footprint;
         layer_dst_stride = canonical_pitch * rows;
     } else {
+        // S25: the readback footprint's Offset must be 512-byte aligned on Xbox (Close
+        // rejects otherwise); the guest layout offsets within the readback staging are
+        // arbitrary. The repack path above always lands on offset 0.
+        if (dst_offset & 511ull) {
+            static std::atomic<u32> s25_unaligned_dl_skip{0};
+            if (s25_unaligned_dl_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_ERROR(Render_D3D12,
+                          "S25 unaligned download offset {:#x} (img={}x{} lvl={}): copy "
+                          "skipped",
+                          dst_offset, static_cast<u64>(desc.Width), desc.Height, mip);
+            }
+            return;
+        }
         gpu_dst.pResource = dst_buffer;
         gpu_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         gpu_dst.PlacedFootprint.Offset = dst_offset;
@@ -1065,6 +1095,10 @@ void Image::DownloadSubresource(ID3D12Resource* dst_buffer, std::span<u8> stagin
         box.back = box.front + (copy.image_extent.depth == 0 ? 1 : copy.image_extent.depth);
         D3D12_TEXTURE_COPY_LOCATION layer_dst = gpu_dst;
         layer_dst.PlacedFootprint.Offset += static_cast<u64>(l) * layer_dst_stride;
+        // S25: per-layer offsets must stay 512-aligned (see the base-offset guard).
+        if (layer_dst.PlacedFootprint.Offset & 511ull) {
+            continue;
+        }
         // S25: download overrun guard (the upload path has the same one). A placed
         // footprint whose rows extend past the readback buffer fails Close with
         // E_INVALIDARG on Xbox; the readback is sized to the guest (tight) layout while
