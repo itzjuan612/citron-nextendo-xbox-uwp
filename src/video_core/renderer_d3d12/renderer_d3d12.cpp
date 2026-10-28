@@ -1356,11 +1356,15 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
         desc.Height == 0 || desc.Width > 4096 || desc.Height > 4096) {
         return false;
     }
-    // S24: one layer of mip 0 into a readback of its own. Extracted from the old body so a
+    // S24: one layer/mip of the image into a readback of its own. Extracted from the old body so a
     // cubemap array can be dumped face by face: the 13-cube environment probe is 78 layers and
     // the scene's sky comes out black, so layer 0 (cube 0 / face 0) alone cannot tell a wrong
     // cube index from a black face.
-    const auto arm_layer = [&](u32 layer) -> bool {
+    // S26: `mip` selects the mip level inside the layer (0 = the surface the fills paint).
+    // The bank's coarse mips have never been observed and are structurally black (the members
+    // are 1-mip images, the join copies level 0 only, the alias tail syncs are skipped), so
+    // layer 0 mips 1-2 are armed once for the 946xxx timeline band.
+    const auto arm_layer = [&](u32 layer, u32 mip = 0, u32 id_override = 0) -> bool {
         if (g_texture_dumps.size() >= 64) {
             return false;
         }
@@ -1368,7 +1372,8 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
         UINT64 total_bytes = 0;
         UINT rows = 0;
         UINT64 row_size = 0;
-        d3d->GetCopyableFootprints(&desc, 0, 1, 0, &entry.footprint, &rows, &row_size,
+        const UINT sub = layer * static_cast<u32>(desc.MipLevels) + mip;
+        d3d->GetCopyableFootprints(&desc, sub, 1, 0, &entry.footprint, &rows, &row_size,
                                    &total_bytes);
         D3D12_HEAP_PROPERTIES heap{};
         heap.Type = D3D12_HEAP_TYPE_READBACK;
@@ -1398,16 +1403,16 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
         // Subresources are mip-major: mip 0 of array slice N is subresource N * MipLevels. Using
         // the raw layer index would dump mips 1..MipLevels-1 of slice 0 as if they were faces
         // (the 13-cube probe has 6 mips, so layers 1-5 are mips, not faces).
-        src_loc.SubresourceIndex = layer * static_cast<u32>(desc.MipLevels);
+        src_loc.SubresourceIndex = sub;
         command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, nullptr);
         command_list.Transition(src, D3D12_RESOURCE_STATE_COPY_SOURCE,
                                 D3D12_RESOURCE_STATE_COMMON);
-        entry.width = static_cast<u32>(desc.Width);
-        entry.height = static_cast<u32>(desc.Height);
+        entry.width = static_cast<u32>(desc.Width) >> mip;
+        entry.height = static_cast<u32>(desc.Height) >> mip;
         entry.dxgi_format = static_cast<u32>(desc.Format);
         entry.guest_format = guest_format;
         entry.guest_addr = guest_addr;
-        entry.image_index = image_index;
+        entry.image_index = id_override != 0 ? id_override : image_index;
         entry.layer = layer;
         entry.armed = true;
         g_texture_dumps.push_back(std::move(entry));
@@ -1443,6 +1448,16 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
                 break;
             }
             ++added;
+        }
+        // S26: layer 0's coarse mips (never observed; structurally black in our pipeline -
+        // the members are 1-mip images, the join copies level 0 only, the alias tail syncs
+        // are skipped by the sub-4x4 guard). Armed twice, ids 948xxx.
+        static u32 s26_mip_dumps = 0;
+        if (s25_members_only && s26_mip_dumps < 2) {
+            ++s26_mip_dumps;
+            const u32 s26_mip_base = 948000u + s26_mip_dumps * 10u;
+            (void)arm_layer(0, 1, s26_mip_base + 1);
+            (void)arm_layer(0, 2, s26_mip_base + 2);
         }
     }
     return true;

@@ -1219,16 +1219,23 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
             // shader's samplerCubeArray; NumCubes is counted in cubes, First2DArrayFace in faces.
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
             srv.TextureCubeArray.MostDetailedMip = most_detailed;
-            srv.TextureCubeArray.MipLevels = num_mips;
+            // S26 A/B: single-mip view - every LOD clamps to mip 0. The bank's coarse mips are
+            // structurally black (fills render mip 0, the join copies mip 0, the member<->tail
+            // syncs are skipped by the sub-4x4 guard); if the sky samples them at LOD>0 this
+            // lights the sky. Revert to num_mips after the run.
+            constexpr bool kS26CubeArrayMip1 = true;
+            srv.TextureCubeArray.MipLevels = kS26CubeArrayMip1 ? 1u : num_mips;
             srv.TextureCubeArray.First2DArrayFace = first_layer;
             srv.TextureCubeArray.NumCubes = num_layers / 6;
             static u32 s24_cubearray_views = 0;
             if (s24_cubearray_views < 4) {
                 ++s24_cubearray_views;
                 LOG_WARNING(Render_D3D12,
-                            "S24 cubearray SRV: {}x{} first_face={} cubes={} mips={} fmt={:#x}",
-                            desc.Width, desc.Height, first_layer, num_layers / 6, num_mips,
-                            static_cast<u32>(sampled_format));
+                            "S24 cubearray SRV: {}x{} first_face={} cubes={} mips={} fmt={:#x} "
+                            "s26_mip1={}",
+                            desc.Width, desc.Height, first_layer, num_layers / 6,
+                            kS26CubeArrayMip1 ? 1u : num_mips, static_cast<u32>(sampled_format),
+                            kS26CubeArrayMip1 ? 1 : 0);
             }
         } else if (num_layers > 1 || desc.DepthOrArraySize > 1) {
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
