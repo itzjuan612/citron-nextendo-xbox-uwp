@@ -5561,6 +5561,90 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             ++s24_env_tl_dumps;
                             s24_env_tl_next =
                                 std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                            // S26 FILL PROBE (one-shot, logged, revert after the run): probes
+                            // 1-12 of the bank are never populated in our pipeline (guest
+                            // memory is zero at every layer - the S26 census), so any cube
+                            // index that does not land on cube 0 face +X samples black. The
+                            // character's body (ambient-lit via this probe) renders black with
+                            // all textures proven alive. Copy layer 0 mip 0 (the baked sky)
+                            // into every other layer's mip 0 via subresource-range barriers -
+                            // if the body lights up, the unpopulated probes are the cause.
+                            static bool s26_fill_done = false;
+                            if (!s26_fill_done) {
+                                const D3D12_RESOURCE_DESC s26_desc =
+                                    s24_env_sv.Resource()->GetDesc();
+                                if (s26_desc.DepthOrArraySize == 78 &&
+                                    s26_desc.Width == 256) {
+                                    s26_fill_done = true;
+                                    ID3D12GraphicsCommandList* const s26_cl =
+                                        m_command_list.Get();
+                                    const u32 s26_mips =
+                                        static_cast<u32>(s26_desc.MipLevels);
+                                    D3D12_RESOURCE_BARRIER s26_src{};
+                                    s26_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                                    s26_src.Transition.pResource = s24_env_sv.Resource();
+                                    s26_src.Transition.Subresource = 0;
+                                    s26_src.Transition.StateBefore =
+                                        D3D12_RESOURCE_STATE_COMMON;
+                                    s26_src.Transition.StateAfter =
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE;
+                                    s26_cl->ResourceBarrier(1, &s26_src);
+                                    std::vector<D3D12_RESOURCE_BARRIER> s26_bars;
+                                    s26_bars.reserve(77);
+                                    for (u32 s26_layer = 1; s26_layer < 78; ++s26_layer) {
+                                        D3D12_RESOURCE_BARRIER s26_b{};
+                                        s26_b.Type =
+                                            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                                        s26_b.Transition.pResource =
+                                            s24_env_sv.Resource();
+                                        s26_b.Transition.Subresource =
+                                            s26_layer * s26_mips;
+                                        s26_b.Transition.StateBefore =
+                                            D3D12_RESOURCE_STATE_COMMON;
+                                        s26_b.Transition.StateAfter =
+                                            D3D12_RESOURCE_STATE_COPY_DEST;
+                                        s26_bars.push_back(s26_b);
+                                    }
+                                    s26_cl->ResourceBarrier(
+                                        static_cast<UINT>(s26_bars.size()),
+                                        s26_bars.data());
+                                    D3D12_TEXTURE_COPY_LOCATION s26_src_loc{};
+                                    s26_src_loc.pResource = s24_env_sv.Resource();
+                                    s26_src_loc.Type =
+                                        D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                                    s26_src_loc.SubresourceIndex = 0;
+                                    D3D12_TEXTURE_COPY_LOCATION s26_dst_loc{};
+                                    s26_dst_loc.pResource = s24_env_sv.Resource();
+                                    s26_dst_loc.Type =
+                                        D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                                    for (u32 s26_layer = 1; s26_layer < 78; ++s26_layer) {
+                                        s26_dst_loc.SubresourceIndex =
+                                            s26_layer * s26_mips;
+                                        s26_cl->CopyTextureRegion(&s26_dst_loc, 0, 0, 0,
+                                                                  &s26_src_loc, nullptr);
+                                    }
+                                    s26_src.Transition.StateBefore =
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE;
+                                    s26_src.Transition.StateAfter =
+                                        D3D12_RESOURCE_STATE_COMMON;
+                                    s26_cl->ResourceBarrier(1, &s26_src);
+                                    for (D3D12_RESOURCE_BARRIER& s26_b : s26_bars) {
+                                        s26_b.Transition.StateBefore =
+                                            D3D12_RESOURCE_STATE_COPY_DEST;
+                                        s26_b.Transition.StateAfter =
+                                            D3D12_RESOURCE_STATE_COMMON;
+                                    }
+                                    s26_cl->ResourceBarrier(
+                                        static_cast<UINT>(s26_bars.size()),
+                                        s26_bars.data());
+                                    LOG_WARNING(Render_D3D12,
+                                                "S26 fill probe: layer 0 mip0 -> 77 layers "
+                                                "(res=0x{:x} mips={})",
+                                                reinterpret_cast<u64>(
+                                                    s24_env_sv.Resource()),
+                                                s26_mips);
+                                }
+                            }
                             (void)D3D12::RecordTextureContentDump(
                                 m_device.GetDevice(), m_command_list, s24_env_sv.Resource(),
                                 static_cast<u32>(s24_env_sv.format), s24_env_gpu,
