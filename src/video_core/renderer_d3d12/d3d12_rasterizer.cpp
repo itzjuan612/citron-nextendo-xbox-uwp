@@ -5574,31 +5574,6 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         s24_env_sv.size.width, s24_env_sv.size.height,
                                         static_cast<u32>(s24_env_sv.format),
                                         params.num_vertices);
-                            // S26: is the bank's GUEST memory populated beyond layer 0? The join's
-                            // RefreshContents uploaded ZERO guest bytes and nothing re-uploads
-                            // afterwards (the S23 late-write race class); if the game writes probe
-                            // content into the bank window later (CPU or compute), the GPU image
-                            // never sees it. Read 4 KB at each probed layer's base (stride 0x56000).
-                            static u32 s26_gmem_logs = 0;
-                            if (s26_gmem_logs < 6 && gpu_memory != nullptr) {
-                                ++s26_gmem_logs;
-                                for (const u32 s26_layer : {0u, 1u, 6u, 12u, 72u, 77u}) {
-                                    std::array<u8, 4096> s26_g{};
-                                    gpu_memory->ReadBlock(
-                                        static_cast<GPUVAddr>(s24_env_gpu +
-                                                              s26_layer * 0x56000ull),
-                                        s26_g.data(), s26_g.size(),
-                                        VideoCommon::CacheType::NoTextureCache);
-                                    u32 s26_nz = 0;
-                                    for (const u8 b : s26_g) {
-                                        if (b != 0) {
-                                            ++s26_nz;
-                                        }
-                                    }
-                                    LOG_WARNING(Render_D3D12, "S26 bank gmem: layer={} nz={}/4096",
-                                                s26_layer, s26_nz);
-                                }
-                            }
                             break;
                         }
                     }

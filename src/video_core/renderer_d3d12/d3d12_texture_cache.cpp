@@ -1219,10 +1219,12 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
             // shader's samplerCubeArray; NumCubes is counted in cubes, First2DArrayFace in faces.
             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
             srv.TextureCubeArray.MostDetailedMip = most_detailed;
-            // S26 A/B: single-mip view - every LOD clamps to mip 0. The bank's coarse mips are
-            // structurally black (fills render mip 0, the join copies mip 0, the member<->tail
-            // syncs are skipped by the sub-4x4 guard); if the sky samples them at LOD>0 this
-            // lights the sky. Revert to num_mips after the run.
+            // S26 FIX (causal, console-verified 1.0.386): the guest's reflection-probe banks
+            // never receive coarse-mip content in our pipeline (the face fills render mip 0,
+            // the join copies level 0, the tail alias syncs are skipped), so any sample at
+            // LOD>0 read black - that WAS the black sky (scene-RT upper region 0.0017 -> 0.0596
+            // with this clamp, full-scene lmean 0.0495 -> 0.0858). Clamp every cube-array view
+            // to mip 0 until real mip generation lands for the banks.
             constexpr bool kS26CubeArrayMip1 = true;
             srv.TextureCubeArray.MipLevels = kS26CubeArrayMip1 ? 1u : num_mips;
             srv.TextureCubeArray.First2DArrayFace = first_layer;
