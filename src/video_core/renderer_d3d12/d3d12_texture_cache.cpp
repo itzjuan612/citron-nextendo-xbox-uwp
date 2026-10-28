@@ -1623,16 +1623,24 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         box.right = box.left + copy.extent.width;
         box.bottom = box.top + copy.extent.height;
         box.back = box.front + (copy.extent.depth == 0 ? 1 : copy.extent.depth);
-        // S25 FIX: sub-4x4 boxes are rejected by Xbox D3D12 at Close (E_INVALIDARG) - the
-        // same rule the upload/download paths already enforce. These boxes are the mip
-        // tails (2x2/1x1) of the alias-sync copies between the LUT-bank members and their
-        // alias siblings; recording them is what wedged Close every run at the bake and
-        // dropped the whole batch (fills + join copies). Skip and log.
-        if (copy.extent.width < 4 || copy.extent.height < 4) {
+        // S25 FIX: sub-4x4 boxes were believed to be rejected by Xbox D3D12 at Close
+        // (E_INVALIDARG). The batch-drop plague actually persisted with this guard in place
+        // (1.0.375-382) and ended only with the unaligned placed-footprint reroute (1.0.383/
+        // 384), while the 1.0.271-355 era executed a 1x1 R32G32B32A32 alias copy every frame
+        // with lit settled frames - so the <4x4 rule is a BLOCK-COMPRESSED rule (same as the
+        // upload-path comment documents: block-compressed boxes must be 4x4-aligned even for
+        // sub-block mips). S26: the blanket guard silently killed the 8x1 -> 1x1 alias copy
+        // that feeds the sampled 1x1 auto-exposure texel (extent exactly 1x1, uncompressed
+        // R32G32B32A32), leaving the exposure at zero-init forever: composite alpha 0 -> the
+        // alpha-weighted histogram reads 0 -> the frame stays black permanently. Skip only
+        // when the destination is block-compressed.
+        if ((copy.extent.width < 4 || copy.extent.height < 4) &&
+            IsCompressedFormat(dst.info.format)) {
             static std::atomic<u32> s25_tiny_copy_skip{0};
             if (s25_tiny_copy_skip.fetch_add(1, std::memory_order_relaxed) < 8) {
                 LOG_ERROR(Render_D3D12,
-                          "S25 tiny copy skipped: {}x{} lvl={} dst_img={}x{} fmt={:#x}",
+                          "S25 tiny copy skipped (compressed): {}x{} lvl={} dst_img={}x{} "
+                          "fmt={:#x}",
                           copy.extent.width, copy.extent.height,
                           copy.dst_subresource.base_level, static_cast<u64>(dst_desc.Width),
                           dst_desc.Height, static_cast<u32>(dst_desc.Format));
