@@ -1948,6 +1948,42 @@ Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene;
 Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_sampled;
 Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
 
+// S27: record a scene-family write whose VA the RT-bind oracle would otherwise never see
+// (the game blits the scene into variant buffers; the S27h run's episodes sampled exactly
+// such VAs - zero S27e near-misses, thousands of redirects, episodes untouched). Same
+// upsert contract as the rasterizer's S27c block; GPU-thread only.
+namespace {
+void S27TrackPoolWrite(const ImageView& view) {
+    if (view.Resource() == nullptr ||
+        view.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+        return;
+    }
+    const u32 px = view.size.width * view.size.height;
+    if (px < 300000 || px > 4200000) {
+        return;
+    }
+    const u64 va = static_cast<u64>(view.GpuAddr());
+    u32 slot = S23_VA_TRACK_MAX;
+    for (u32 i = 0; i < g_s23_va_track_count; ++i) {
+        if (g_s23_va_track_va[i] == va) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot == S23_VA_TRACK_MAX) {
+        slot = g_s23_va_track_count < S23_VA_TRACK_MAX ? g_s23_va_track_count++
+                                                       : g_s23_va_track_next;
+        g_s23_va_track_next = (slot + 1) % S23_VA_TRACK_MAX;
+        g_s23_va_track_va[slot] = va;
+    }
+    g_s23_va_track_gf[slot] = g_s18_guest_frames;
+    g_s23_va_track_w[slot] = view.size.width;
+    g_s23_va_track_h[slot] = view.size.height;
+    g_s23_va_track_res[slot] = view.Resource();
+    g_s23_va_track_img[slot] = view.image_id;
+}
+} // namespace
+
 bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst_view,
                                     ImageView& src_view,
                                     const VideoCommon::Region2D& dst_region,
@@ -2096,6 +2132,7 @@ bool TextureCacheRuntime::BlitImage(Framebuffer* dst_framebuffer, ImageView& dst
     Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
     g_probe_blit_src = src_resource;
     g_probe_blit_dst = dst_resource;
+    S27TrackPoolWrite(dst_view);
     return true;
 }
 
@@ -2172,6 +2209,7 @@ void TextureCacheRuntime::ConvertImage(Framebuffer*, ImageView& dst_view,
     }
     Transition(dst_resource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
     Transition(src_resource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    S27TrackPoolWrite(dst_view);
 }
 
 std::span<const DXGI_FORMAT> TextureCacheRuntime::ViewFormats(PixelFormat format) {

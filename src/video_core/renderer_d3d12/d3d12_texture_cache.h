@@ -21,6 +21,22 @@
 #include "video_core/texture_cache/types.h"
 #include "video_core/textures/texture.h"
 
+/// S27: per-VA freshness track of the dynamic-res scene-pool family (VA -> last guest frame
+/// written, size, resource, image). Updated by RT binds (d3d12_rasterizer.cpp) AND by the
+/// runtime blit/convert writes (d3d12_texture_cache.cpp) - the S27h run proved the residual
+/// flash episodes sample VAs only blit writes touch, which the RT-bind-only oracle never saw.
+/// Definitions in d3d12_rasterizer.cpp at GLOBAL scope (the S23 site predates the namespace);
+/// GPU-thread only (same contract as g_s18_guest_frames).
+inline constexpr u32 S23_VA_TRACK_MAX = 64;
+extern u64 g_s23_va_track_va[S23_VA_TRACK_MAX];
+extern u64 g_s23_va_track_gf[S23_VA_TRACK_MAX];
+extern u32 g_s23_va_track_w[S23_VA_TRACK_MAX];
+extern u32 g_s23_va_track_h[S23_VA_TRACK_MAX];
+extern ID3D12Resource* g_s23_va_track_res[S23_VA_TRACK_MAX];
+extern VideoCommon::ImageId g_s23_va_track_img[S23_VA_TRACK_MAX];
+extern u32 g_s23_va_track_count;
+extern u32 g_s23_va_track_next;
+
 namespace D3D12 {
 
 class CommandList;
@@ -210,6 +226,8 @@ extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_any_sampled;
 /// TEMP DIAGNOSTIC (session 13): the render target of the first depth-tested 3D draw (the
 /// scene behind the UI), probed by the present path to show whether it holds pixels.
 extern Microsoft::WRL::ComPtr<ID3D12Resource> g_probe_scene3d;
+
+
 
 /// TEMP DIAGNOSTIC (session 14): render target of the latest fullscreen 6-vertex 1920x1080
 /// draw (the compositor/UI target), captured mid-frame to see whether the 3D scene reaches it.

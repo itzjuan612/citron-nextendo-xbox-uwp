@@ -21,6 +21,20 @@
 #include "video_core/renderer_d3d12/d3d12_device.h"
 #include "video_core/renderer_d3d12/d3d12_rasterizer.h"
 
+// S23 cycle 15 / S27: per-VA history of the scene-family render targets (VA, guest frame,
+// size, resource, image id) - the freshness oracle behind the S27b/S27f stale-sibling
+// redirect. GLOBAL scope on purpose: d3d12_texture_cache.h externs it for the runtime's
+// blit/convert write recording (the S27h run proved flash episodes sample VAs only blit
+// writes touch). GPU-thread only (same contract as g_s18_guest_frames in d3d12_capture.h).
+u64 g_s23_va_track_va[S23_VA_TRACK_MAX]{};
+u64 g_s23_va_track_gf[S23_VA_TRACK_MAX]{};
+u32 g_s23_va_track_w[S23_VA_TRACK_MAX]{};
+u32 g_s23_va_track_h[S23_VA_TRACK_MAX]{};
+ID3D12Resource* g_s23_va_track_res[S23_VA_TRACK_MAX]{};
+VideoCommon::ImageId g_s23_va_track_img[S23_VA_TRACK_MAX]{};
+u32 g_s23_va_track_count = 0;
+u32 g_s23_va_track_next = 0;
+
 namespace D3D12 {
 
 namespace {
@@ -99,16 +113,6 @@ constexpr bool kSkipConfigureDrawState = false;
 // S23 cycle 15: per-VA history of the scene-family render targets (VA, guest frame, size). The
 // resource-keyed list proved too short (16 entries = a few frames), and the question is really
 // "when was this GUEST ADDRESS last rendered, and at what size?".
-constexpr u32 S23_VA_TRACK_MAX = 64;
-u64 g_s23_va_track_va[S23_VA_TRACK_MAX]{};
-u64 g_s23_va_track_gf[S23_VA_TRACK_MAX]{};
-u32 g_s23_va_track_w[S23_VA_TRACK_MAX]{};
-u32 g_s23_va_track_h[S23_VA_TRACK_MAX]{};
-ID3D12Resource* g_s23_va_track_res[S23_VA_TRACK_MAX]{};
-VideoCommon::ImageId g_s23_va_track_img[S23_VA_TRACK_MAX]{};
-u32 g_s23_va_track_count = 0;
-u32 g_s23_va_track_next = 0;
-
 constexpr bool S17ProducerRange(u64 gpu) {
     // Bank window CORRECTED after the 1.0.266 harvest: the previous bound 0x5ed00000 is a
     // 1.6 GB address (a typo for 0x5ed000000) and made every bank test in the S15/S17 draw
@@ -2105,28 +2109,46 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     if (s27b_age == ~u32{0}) {
                         continue;
                     }
-                    if (s27b_age <= 8) {
-                        // S27e near-miss probe: a fresh-age scene resolve on a DIFFERENT
-                        // incarnation than the one rendered - the fresh-empty-sibling candidate
-                        // behind the residual 1-frame episodes (the 1.0.397 run had all-fresh
-                        // resolves yet ~6% episode flips). Bounded; no behavior change.
-                        if (s27b_match != S23_VA_TRACK_MAX &&
-                            g_s23_va_track_res[s27b_match] != s27b_sv.Resource()) {
-                            static u32 s27e_near_miss_logs = 0;
-                            if (s27e_near_miss_logs < 16 || s27e_near_miss_logs % 128 == 0) {
-                                LOG_WARNING(
-                                    Render_D3D12,
-                                    "S27e fresh sibling resolve: img={} va={:#x} {}x{} age={} "
-                                    "res={:#x} != rendered res={:#x} gf={} (verts={})",
-                                    s27b_sv.image_id.index,
-                                    static_cast<u64>(s27b_sv.GpuAddr()), s27b_sv.size.width,
-                                    s27b_sv.size.height, s27b_age,
-                                    reinterpret_cast<u64>(s27b_sv.Resource()),
-                                    reinterpret_cast<u64>(g_s23_va_track_res[s27b_match]),
-                                    g_s18_guest_frames, params.num_vertices);
+                    if (s27b_match != S23_VA_TRACK_MAX &&
+                        g_s23_va_track_res[s27b_match] != s27b_sv.Resource() &&
+                        g_s18_guest_frames - g_s23_va_track_gf[s27b_match] <= 2) {
+                        // S27f: the read resolved a sibling that is NOT the incarnation last
+                        // WRITTEN at this VA (RT bind or runtime blit - the track now sees
+                        // both). The written incarnation holds the freshest content at this VA;
+                        // re-point the read there. The <=2-gf freshness gate doubles as a
+                        // liveness guard - the tracked image may be deleted by a later join
+                        // (the S26 deleted-sibling class), and slot_images[freed] would fault.
+                        // This was the S27e near-miss log in 1.0.398 (probe-only); the S27h run
+                        // gave it zero fires at tracked VAs, so the remaining sibling reads were
+                        // at blit-only VAs the track never saw - both are covered now.
+                        const VideoCommon::ImageViewId s27f_old = views[s27b_i].id;
+                        const VideoCommon::ImageViewId s27f_new =
+                            m_texture_cache.FindOrEmplaceImageView(
+                                g_s23_va_track_img[s27b_match],
+                                VideoCommon::ImageViewInfo{VideoCommon::ImageViewType::e2D,
+                                                           s27b_sv.format});
+                        views[s27b_i].id = s27f_new;
+                        for (DrawSlot& s27f_rs : res_slots) {
+                            if (s27f_rs.kind == SlotKind::Sampled && s27f_rs.view == s27f_old) {
+                                s27f_rs.view = s27f_new;
                             }
-                            ++s27e_near_miss_logs;
                         }
+                        static u32 s27f_logs = 0;
+                        if (s27f_logs < 16 || s27f_logs % 64 == 0) {
+                            LOG_WARNING(Render_D3D12,
+                                        "S27f sibling read redirected: img={} va={:#x} {}x{} "
+                                        "age={} -> img={} gf={} (verts={})",
+                                        s27b_sv.image_id.index,
+                                        static_cast<u64>(s27b_sv.GpuAddr()), s27b_sv.size.width,
+                                        s27b_sv.size.height,
+                                        s27b_age == ~u32{0} ? -1 : static_cast<s32>(s27b_age),
+                                        g_s23_va_track_img[s27b_match].index,
+                                        g_s18_guest_frames, params.num_vertices);
+                        }
+                        ++s27f_logs;
+                        continue;
+                    }
+                    if (s27b_age <= 8) {
                         continue;
                     }
                     const VideoCommon::ImageViewId s27b_old = views[s27b_i].id;
