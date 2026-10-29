@@ -105,6 +105,7 @@ u64 g_s23_va_track_gf[S23_VA_TRACK_MAX]{};
 u32 g_s23_va_track_w[S23_VA_TRACK_MAX]{};
 u32 g_s23_va_track_h[S23_VA_TRACK_MAX]{};
 ID3D12Resource* g_s23_va_track_res[S23_VA_TRACK_MAX]{};
+VideoCommon::ImageId g_s23_va_track_img[S23_VA_TRACK_MAX]{};
 u32 g_s23_va_track_count = 0;
 u32 g_s23_va_track_next = 0;
 
@@ -2050,6 +2051,113 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 .view = views[i].id,
                 .sampler = sampler_ids[i - sampled_views_begin],
             });
+        }
+        // S27b: the auto-exposure reduce's scene input (and any other consumer of the
+        // dynamic-res scene pool) intermittently resolves to a STALE variant image - the S27
+        // run caught the reduce reading img 3593 (1120x627, last rendered 6355 guest frames
+        // ago) while the live 960x540 render had just landed one pool slot over; the variants
+        // alias one pool and overlap. Reading the dead image zeroes the exposure RGB and the
+        // game's composite renders the 3D layer black (the visible flash). When a sampled view
+        // resolves to a tracked scene-pool VA that went stale while another pool VA was
+        // rendered this frame, re-point the sample at the freshest incarnation. Bounded log.
+        {
+            bool s27b_have_fresh = false;
+            u64 s27b_fresh_va = 0;
+            u64 s27b_fresh_gf = 0;
+            VideoCommon::ImageId s27b_fresh_img{};
+            for (u32 s27b_i = 0; s27b_i < g_s23_va_track_count; ++s27b_i) {
+                if (!s27b_have_fresh || g_s23_va_track_gf[s27b_i] > s27b_fresh_gf) {
+                    s27b_have_fresh = true;
+                    s27b_fresh_gf = g_s23_va_track_gf[s27b_i];
+                    s27b_fresh_va = g_s23_va_track_va[s27b_i];
+                    s27b_fresh_img = g_s23_va_track_img[s27b_i];
+                }
+            }
+            if (s27b_have_fresh && g_s18_guest_frames - s27b_fresh_gf <= 2) {
+                for (size_t s27b_i = sampled_views_begin; s27b_i < sampled_views_end; ++s27b_i) {
+                    if (views[s27b_i].id == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                        continue;
+                    }
+                    ImageView& s27b_sv = m_texture_cache.GetImageView(views[s27b_i].id);
+                    if (s27b_sv.Resource() == nullptr ||
+                        s27b_sv.format != VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+                        continue;
+                    }
+                    const u32 s27b_px = s27b_sv.size.width * s27b_sv.size.height;
+                    if (s27b_px < 400000 || s27b_px > 800000) {
+                        continue;
+                    }
+                    // Only tracked scene-pool VAs participate; unknown VAs are never redirected.
+                    u32 s27b_age = ~u32{0};
+                    for (u32 s27b_t = 0; s27b_t < g_s23_va_track_count; ++s27b_t) {
+                        if (g_s23_va_track_va[s27b_t] == static_cast<u64>(s27b_sv.GpuAddr())) {
+                            s27b_age = static_cast<u32>(g_s18_guest_frames -
+                                                        g_s23_va_track_gf[s27b_t]);
+                        }
+                    }
+                    if (s27b_age == ~u32{0} || s27b_age <= 8) {
+                        continue;
+                    }
+                    const VideoCommon::ImageViewId s27b_old = views[s27b_i].id;
+                    const VideoCommon::ImageViewId s27b_new =
+                        m_texture_cache.FindOrEmplaceImageView(
+                            s27b_fresh_img, VideoCommon::ImageViewInfo{
+                                                VideoCommon::ImageViewType::e2D, s27b_sv.format});
+                    views[s27b_i].id = s27b_new;
+                    for (DrawSlot& s27b_rs : res_slots) {
+                        if (s27b_rs.kind == SlotKind::Sampled && s27b_rs.view == s27b_old) {
+                            s27b_rs.view = s27b_new;
+                        }
+                    }
+                    static u32 s27b_redirect_logs = 0;
+                    if (s27b_redirect_logs < 16 || s27b_redirect_logs % 64 == 0) {
+                        LOG_WARNING(Render_D3D12,
+                                    "S27b stale scene sample redirected: img={} va={:#x} age={} "
+                                    "-> img={} va={:#x} gf={} (draw verts={})",
+                                    s27b_sv.image_id.index, static_cast<u64>(s27b_sv.GpuAddr()),
+                                    s27b_age == ~u32{0} ? -1 : static_cast<s32>(s27b_age),
+                                    s27b_fresh_img.index, s27b_fresh_va, g_s18_guest_frames,
+                                    params.num_vertices);
+                    }
+                    ++s27b_redirect_logs;
+                }
+            }
+        }
+        // S27c: the S23 freshness oracle only updated on R11G11B10 colour passes (the S15
+        // probe's format+mask gate); when the late-phase render pattern changed, the track went
+        // blind (S18D ages climbed monotonically, the S27b fresh-gate never passed and the
+        // redirects stopped - the run ended in the sustained UI-only-black state). Track EVERY
+        // scene-family render target instead: format + variant pixel-count signature, no VA
+        // range or pass gates, so the oracle follows the pool even if the game moves it.
+        if (framebuffer != nullptr && num_rtvs > 0 &&
+            framebuffer->ColorBuffers()[0] != nullptr) {
+            ImageView* const s27c_w = framebuffer->ColorBuffers()[0];
+            if (s27c_w->Resource() != nullptr &&
+                s27c_w->format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
+                const u32 s27c_px = s27c_w->size.width * s27c_w->size.height;
+                if (s27c_px >= 400000 && s27c_px <= 800000) {
+                    const u64 s27c_va = static_cast<u64>(s27c_w->GpuAddr());
+                    u32 s27c_slot = S23_VA_TRACK_MAX;
+                    for (u32 s27c_i = 0; s27c_i < g_s23_va_track_count; ++s27c_i) {
+                        if (g_s23_va_track_va[s27c_i] == s27c_va) {
+                            s27c_slot = s27c_i;
+                            break;
+                        }
+                    }
+                    if (s27c_slot == S23_VA_TRACK_MAX) {
+                        s27c_slot = g_s23_va_track_count < S23_VA_TRACK_MAX
+                                        ? g_s23_va_track_count++
+                                        : g_s23_va_track_next;
+                        g_s23_va_track_next = (s27c_slot + 1) % S23_VA_TRACK_MAX;
+                        g_s23_va_track_va[s27c_slot] = s27c_va;
+                    }
+                    g_s23_va_track_gf[s27c_slot] = g_s18_guest_frames;
+                    g_s23_va_track_w[s27c_slot] = s27c_w->size.width;
+                    g_s23_va_track_h[s27c_slot] = s27c_w->size.height;
+                    g_s23_va_track_res[s27c_slot] = s27c_w->Resource();
+                    g_s23_va_track_img[s27c_slot] = s27c_w->image_id;
+                }
+            }
         }
         for (const auto& desc : info->image_descriptors) {
             for (u32 i = 0; i < desc.count; ++i) {
@@ -5181,6 +5289,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         g_s23_va_track_w[s23_slot] = s23_w_view->size.width;
                         g_s23_va_track_h[s23_slot] = s23_w_view->size.height;
                         g_s23_va_track_res[s23_slot] = s23_w_view->Resource();
+                        g_s23_va_track_img[s23_slot] = s23_w_view->image_id;
                     }
                 }
                 // S23 cycle 11: does the RT view we render resolve to the image the guest asked
