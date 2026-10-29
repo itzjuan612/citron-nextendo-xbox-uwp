@@ -2500,6 +2500,29 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         return NULL_IMAGE_VIEW_ID;
     }
     Image& image = slot_images[image_id];
+    // S26 DIAGNOSTIC (bounded 24): the bank's bake renders its mip chain with draws at the
+    // mip-level VAs (128x128 at layer-0 mip-1's VA etc. - the fill census #7-15). The 948xxx
+    // dumps proved the bank's mips stayed black, so log what each bank-window RT resolves to:
+    // which image (the 78-layer bank or a sibling?), its extents, and the subresource base
+    // TryFindBase computes for the VA.
+    {
+        static u32 s26_rt_resolve_logs = 0;
+        const u64 s26_g = static_cast<u64>(gpu_addr);
+        if (s26_rt_resolve_logs < 24 && s26_g >= 0x5eb340000ull &&
+            s26_g < 0x5eb340000ull + 0x1a40000ull) {
+            ++s26_rt_resolve_logs;
+            const auto s26_base = image.TryFindBase(gpu_addr);
+            LOG_WARNING(Render_D3D12,
+                        "S26 RT resolve #{}: va={:#x} rt={}x{} lv={} lay={} -> img={} "
+                        "gpu={:#x} {}x{} lv={} lay={} fmt={:#x} base=({},{})",
+                        s26_rt_resolve_logs, s26_g, info.size.width, info.size.height,
+                        info.resources.levels, info.resources.layers, image_id.index,
+                        static_cast<u64>(image.gpu_addr), image.info.size.width,
+                        image.info.size.height, image.info.resources.levels,
+                        image.info.resources.layers, static_cast<u32>(image.info.format),
+                        s26_base ? s26_base->level : -1, s26_base ? s26_base->layer : -1);
+        }
+    }
     const ImageViewType view_type = RenderTargetImageViewType(info);
     SubresourceBase base;
     if (image.info.type == ImageType::Linear) {
