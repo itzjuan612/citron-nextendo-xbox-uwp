@@ -273,6 +273,7 @@ struct FrameCapture {
     const void* resource_ptr = nullptr;
     bool is_bgra = false;
     bool armed = false;
+    f32 last_mean = -1.0f; // S27j: strided RGB mean of the last written capture (0-255)
 };
 
 FrameCapture g_frame_capture;
@@ -565,12 +566,30 @@ void WriteFrameCapture() {
                 out.write(reinterpret_cast<const char*>(row.data()), row_bytes);
             }
         }
+        // S27j: the full-frame mean rides on the log line - PruneCaptures deletes the BMPs
+        // within seconds at the dense cadence, and the mean is the only durable classifier
+        // between a whole-frame-black flash frame (~4/255) and legitimate dark scene content.
+        {
+            const u8* const mean_base = static_cast<const u8*>(mapped);
+            u64 mean_sum = 0;
+            u32 mean_count = 0;
+            for (u32 my = 0; my < height; my += 8) {
+                const u8* const mean_row = mean_base + static_cast<size_t>(my) * pitch;
+                for (u32 mx = 0; mx < width; mx += 8) {
+                    const u8* const px = mean_row + static_cast<size_t>(mx) * 4;
+                    mean_sum += px[0] + px[1] + px[2];
+                    ++mean_count;
+                }
+            }
+            g_frame_capture.last_mean =
+                mean_count != 0 ? static_cast<f32>(mean_sum) / (3.0f * mean_count) : -1.0f;
+        }
         // TEMP DIAGNOSTIC (S18, Phase 0.2.1): the guest-frame counter and the newest exposure
         // readback are the phase fingerprint - two runs' captures can only be compared when
         // they sit at the same guest phase (the style-screen dolly advances on guest time).
         LOG_WARNING(Render_D3D12,
-                    "Frame capture written: {} ({}x{}) [S18 guest_frame={} expo={}]", path, width,
-                    height, g_s18_guest_frames,
+                    "Frame capture written: {} ({}x{}) mean={:.1f} [S18 guest_frame={} expo={}]",
+                    path, width, height, g_frame_capture.last_mean, g_s18_guest_frames,
                     g_s18_last_exposure.empty() ? "none" : g_s18_last_exposure);
         // S21 cycle 9: ask the next composite draw to dump the scene RT so this capture and its
         // scene source can be compared (<=1 frame apart; the cadence ordering is not knowable).
