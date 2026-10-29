@@ -1449,15 +1449,15 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
             }
             ++added;
         }
-        // S26: layer 0's coarse mips (never observed; structurally black in our pipeline -
-        // the members are 1-mip images, the join copies level 0 only, the alias tail syncs
-        // are skipped by the sub-4x4 guard). Armed twice, ids 948xxx.
+        // S26: layer 0's coarse mips - armed at six time points (ids 948xxx) so the moment
+        // the mipgen draws' content appears (or vanishes) around the bake is bracketed.
         static u32 s26_mip_dumps = 0;
-        if (s25_members_only && s26_mip_dumps < 2) {
+        if (s25_members_only && s26_mip_dumps < 6) {
             ++s26_mip_dumps;
             const u32 s26_mip_base = 948000u + s26_mip_dumps * 10u;
             (void)arm_layer(0, 1, s26_mip_base + 1);
             (void)arm_layer(0, 2, s26_mip_base + 2);
+            (void)arm_layer(0, 3, s26_mip_base + 3);
         }
     }
     return true;

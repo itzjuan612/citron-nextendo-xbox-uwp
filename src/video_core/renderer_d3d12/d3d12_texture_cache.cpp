@@ -1330,6 +1330,26 @@ void ImageView::CreateViews(Image& image, const VideoCommon::ImageViewInfo& view
                 rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
                 rtv.Texture2D.MipSlice = most_detailed;
             }
+            // S26 DIAGNOSTIC (bounded 8): the bank's bake renders its mip chain with draws
+            // whose views resolve to the right (level, layer) yet the mips read zero - log
+            // the recorded RTV descriptor for the bank-window resources to compare it with
+            // the intended subresource.
+            {
+                static u32 s26_rtv_logs = 0;
+                const u64 s26_r = reinterpret_cast<u64>(resource);
+                if (s26_rtv_logs < 8 && image.gpu_addr >= 0x5eb340000ull &&
+                    image.gpu_addr < 0x5eb340000ull + 0x1a40000ull) {
+                    ++s26_rtv_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S26 RTV #{}: img={} gpu={:#x} res=0x{:x} view=({},{}) "
+                                "MipSlice={} First={} Size={} layers={} arr={} fmt={:#x}",
+                                s26_rtv_logs, image_id.index,
+                                static_cast<u64>(image.gpu_addr), s26_r, range.base.level,
+                                range.base.layer, most_detailed, first_layer, num_layers,
+                                image.info.resources.layers, desc.DepthOrArraySize,
+                                static_cast<u32>(rtv.Format));
+                }
+            }
             image.device->GetDevice()->CreateRenderTargetView(resource, &rtv, rt_view);
         }
     }
