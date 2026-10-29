@@ -3046,6 +3046,44 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 s15_comp_res->GetDesc().Height == 1080 && params.num_vertices == 3 &&
                 !stored.pipeline->State().attachments[0].enable.Value() &&
                 s15_stage_samples_scene_rt;
+            // S26: the composite execution witness - a skipped composite draw leaves the
+            // cleared target + UI (the intermittent full-black flash, capture mean 4.0
+            // among lit ~123). Count every composite draw; every 60 s log the count and
+            // the exposure slot's image id (a stale 1x1 incarnation would read zero).
+            if (s15_stage_scene_composite) {
+                static u32 s26_comp_count = 0;
+                static u32 s26_comp_expo_img = 0;
+                static bool s26_comp_expo_seen = false;
+                static std::chrono::steady_clock::time_point s26_comp_window =
+                    std::chrono::steady_clock::now();
+                ++s26_comp_count;
+                if (!s26_comp_expo_seen) {
+                    for (const DrawSlot& s26_slot : res_slots) {
+                        if (s26_slot.kind != SlotKind::Sampled ||
+                            s26_slot.view == VideoCommon::NULL_IMAGE_VIEW_ID) {
+                            continue;
+                        }
+                        ImageView& s26_xv = m_texture_cache.GetImageView(s26_slot.view);
+                        if (s26_xv.Resource() != nullptr &&
+                            s26_xv.size.width == 1 && s26_xv.size.height == 1) {
+                            s26_comp_expo_img = s26_xv.image_id.index;
+                            s26_comp_expo_seen = true;
+                        }
+                    }
+                }
+                const auto s26_now = std::chrono::steady_clock::now();
+                if (s26_now - s26_comp_window > std::chrono::seconds(60)) {
+                    const f32 s26_secs =
+                        std::chrono::duration_cast<std::chrono::duration<f32>>(
+                            s26_now - s26_comp_window)
+                            .count();
+                    LOG_WARNING(Render_D3D12,
+                                "S26 composite witness: {} draws in {:.1f} s expo_img={}",
+                                s26_comp_count, s26_secs, s26_comp_expo_img);
+                    s26_comp_count = 0;
+                    s26_comp_window = s26_now;
+                }
+            }
             if (s15_comp_res != nullptr && (s15_final_rt || s15_has_scene_source)) {
                 // S19 (Phase 0.2 cycle 1): the composite's shader decides how the 1x1 exposure
                 // (with its alpha ~3.0) and the 240x136 blur are consumed - the missing link
