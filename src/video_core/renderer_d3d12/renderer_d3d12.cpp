@@ -54,6 +54,29 @@ struct ResourceProbe {
 
 ResourceProbe g_resource_probe;
 
+// S27 flash witness: per-present identity + content sample of the present source. The S26
+// composite witness proved the game's composition is 99% populated at the settled phase, so
+// the intermittent black flash loses the 3D content downstream (present/flinger path). This
+// readout says, per present, WHICH texture-cache image was presented and whether it was lit:
+// a black sample with a flipped source identity pins the loss to the layer selection; a black
+// sample with a stable identity pins it to the presented buffer's content (guest-side write).
+struct S27PresentWitness {
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    bool sample_armed = false; // a 16x16 copy was recorded at the previous present
+    bool have_prev_identity = false;
+    u64 last_img_id = 0;
+    u64 last_res = 0;
+    u32 last_w = 0;
+    u32 last_h = 0;
+    u64 last_tick = 0;
+    bool last_dark = false;
+    u64 samples_total = 0;
+    u64 flips_total = 0;
+    u32 flip_logs = 0;
+};
+
+S27PresentWitness g_s27_witness;
+
 bool ProbeFrameWanted() {
     const u32 frame = g_resource_probe.frames++;
     return g_resource_probe.logged < 24 && (frame < 4 || frame % 240 == 0);
@@ -1501,6 +1524,43 @@ void RendererD3D12::Composite(std::span<const Tegra::FramebufferConfig> framebuf
         PrepareBlit();
     }
 
+    // S27 flash witness: the present-path layer selection. Composite presents
+    // framebuffers.back() (the topmost layer); a structural flip of the layer list at a black
+    // flash would pin the loss to the selection, a stable list pins it to the buffer's content.
+    // Bounded: on structural change, first 8, every 600th present.
+    {
+        static u64 s27_layer_present_n = 0;
+        static u32 s27_layer_logs = 0;
+        static size_t s27_count = 0;
+        static u32 s27_w = 0;
+        static u32 s27_h = 0;
+        static u32 s27_stride = 0;
+        static u32 s27_fmt = 0;
+        ++s27_layer_present_n;
+        const Tegra::FramebufferConfig* back =
+            framebuffers.empty() ? nullptr : &framebuffers.back();
+        const bool changed =
+            back == nullptr || framebuffers.size() != s27_count || back->width != s27_w ||
+            back->height != s27_h || back->stride != s27_stride ||
+            static_cast<u32>(back->pixel_format) != s27_fmt;
+        if (back != nullptr &&
+            (changed || s27_layer_present_n % 600 == 0 || s27_layer_logs < 8)) {
+            ++s27_layer_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S27 layers #{}: n={} back(addr={:#x} off={} stride={} {}x{} fmt={})",
+                        s27_layer_present_n, framebuffers.size(), back->address, back->offset,
+                        back->stride, back->width, back->height,
+                        static_cast<u32>(back->pixel_format));
+        }
+        s27_count = framebuffers.size();
+        if (back != nullptr) {
+            s27_w = back->width;
+            s27_h = back->height;
+            s27_stride = back->stride;
+            s27_fmt = static_cast<u32>(back->pixel_format);
+        }
+    }
+
     // The present list is z-ordered; the last framebuffer is the topmost (game) frame.
     bool presented = false;
     u32 blit_width = 0;
@@ -1736,6 +1796,156 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
                                 capture_iso);
     if (capture_frame) {
         RecordFrameCapture(device.GetDevice(), command_list, info.view->Resource());
+    }
+
+    // S27 flash witness (see g_s27_witness): identity + content sample of the present source.
+    {
+        ID3D12Resource* const src_res = info.view->Resource();
+        const u64 res_key = static_cast<u64>(reinterpret_cast<uintptr_t>(src_res));
+        const u64 img_id = static_cast<u64>(info.view->image_id.index);
+        const u64 tick = info.view->modification_tick;
+        const bool identity_changed = !g_s27_witness.have_prev_identity ||
+                                      img_id != g_s27_witness.last_img_id ||
+                                      res_key != g_s27_witness.last_res ||
+                                      info.view->size.width != g_s27_witness.last_w ||
+                                      info.view->size.height != g_s27_witness.last_h;
+
+        // (a) The previous present's sample: the GPU is idle here (entry WaitForIdle), so the
+        // copy recorded last present has completed. One frame of lag, zero extra stalls.
+        if (g_s27_witness.sample_armed && g_s27_witness.readback) {
+            void* mapped = nullptr;
+            const D3D12_RANGE read_range{0, static_cast<SIZE_T>(16 * 256)};
+            if (SUCCEEDED(g_s27_witness.readback->Map(0, &read_range, &mapped)) && mapped != nullptr) {
+                const u8* rows = static_cast<const u8*>(mapped);
+                double sum = 0.0;
+                for (u32 y = 0; y < 16; ++y) {
+                    const u8* row = rows + static_cast<size_t>(y) * 256;
+                    for (u32 x = 0; x < 16; ++x) {
+                        sum += row[x * 4 + 0] + row[x * 4 + 1] + row[x * 4 + 2];
+                    }
+                }
+                g_s27_witness.readback->Unmap(0, nullptr);
+                const f32 mean = static_cast<f32>(sum / (16.0 * 16.0 * 3.0));
+                const bool dark = mean < 32.0f; // settled present source reads ~111-123; UI-on-black is far below
+                const bool flipped = dark != g_s27_witness.last_dark;
+                ++g_s27_witness.samples_total;
+                if (flipped) {
+                    ++g_s27_witness.flips_total;
+                }
+                const bool log_flip =
+                    flipped && (g_s27_witness.flip_logs < 64 || g_s27_witness.flips_total % 16 == 0);
+                if (log_flip) {
+                    ++g_s27_witness.flip_logs;
+                }
+                if (g_s27_witness.samples_total <= 16 || log_flip ||
+                    (g_s27_witness.samples_total % 240) == 0 || capture_frame) {
+                    LOG_WARNING(Render_D3D12,
+                                "S27 present #{}: sample mean={:.1f} {} img={} va={:#x} res={:#x} "
+                                "{}x{} tick={} id_change={} flips={}",
+                                capture_this, mean, dark ? "DARK" : "LIT", img_id,
+                                static_cast<u64>(info.view->gpu_addr), res_key,
+                                info.view->size.width, info.view->size.height, tick,
+                                identity_changed ? 1 : 0, g_s27_witness.flips_total);
+                }
+                g_s27_witness.last_dark = dark;
+            } else if (mapped != nullptr) {
+                g_s27_witness.readback->Unmap(0, nullptr);
+            }
+        }
+        g_s27_witness.sample_armed = false;
+
+        // (b) The source itself flipped - the stale-layer-selection discriminator.
+        static u32 s27_id_change_logs = 0;
+        if (identity_changed && (s27_id_change_logs < 24 || s27_id_change_logs % 64 == 0)) {
+            ++s27_id_change_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S27 present source changed: img={} va={:#x} res={:#x} {}x{} fmt={} "
+                        "tick={} (was img={} res={:#x} {}x{})",
+                        img_id, static_cast<u64>(info.view->gpu_addr), res_key,
+                        info.view->size.width, info.view->size.height,
+                        static_cast<u32>(info.view->format), tick, g_s27_witness.last_img_id,
+                        g_s27_witness.last_res, g_s27_witness.last_w, g_s27_witness.last_h);
+        }
+        g_s27_witness.have_prev_identity = true;
+        g_s27_witness.last_img_id = img_id;
+        g_s27_witness.last_res = res_key;
+        g_s27_witness.last_w = info.view->size.width;
+        g_s27_witness.last_h = info.view->size.height;
+        g_s27_witness.last_tick = tick;
+
+        // (c) Record this present's 16x16 center sample for the next present's readback
+        // (same COMMON->COPY_SOURCE->COMMON pattern as RecordFrameCapture, proven on console).
+        const D3D12_RESOURCE_DESC src_desc =
+            src_res != nullptr ? src_res->GetDesc() : D3D12_RESOURCE_DESC{};
+        bool fmt_ok = false;
+        if (src_res != nullptr && src_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D) {
+            switch (src_desc.Format) {
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+                fmt_ok = true;
+                break;
+            default:
+                break;
+            }
+        }
+        static bool s27_fmt_warned = false;
+        if (src_res != nullptr && fmt_ok && info.view->size.width >= 16 &&
+            info.view->size.height >= 16) {
+            if (!g_s27_witness.readback) {
+                D3D12_HEAP_PROPERTIES heap{};
+                heap.Type = D3D12_HEAP_TYPE_READBACK;
+                D3D12_RESOURCE_DESC buf{};
+                buf.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                buf.Width = 16 * 256; // 16 rows x 256-byte pitch
+                buf.Height = 1;
+                buf.DepthOrArraySize = 1;
+                buf.MipLevels = 1;
+                buf.Format = DXGI_FORMAT_UNKNOWN;
+                buf.SampleDesc.Count = 1;
+                buf.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                if (FAILED(device.GetDevice()->CreateCommittedResource(
+                        &heap, D3D12_HEAP_FLAG_NONE, &buf, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                        IID_PPV_ARGS(&g_s27_witness.readback)))) {
+                    g_s27_witness.readback.Reset();
+                }
+            }
+            if (g_s27_witness.readback) {
+                const u32 cx = info.view->size.width / 2;
+                const u32 cy = info.view->size.height / 2;
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+                fp.Offset = 0;
+                fp.Footprint.Format = src_desc.Format;
+                fp.Footprint.Width = 16;
+                fp.Footprint.Height = 16;
+                fp.Footprint.Depth = 1;
+                fp.Footprint.RowPitch = 256; // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+                D3D12_TEXTURE_COPY_LOCATION dst{};
+                dst.pResource = g_s27_witness.readback.Get();
+                dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                dst.PlacedFootprint = fp;
+                D3D12_TEXTURE_COPY_LOCATION src_loc{};
+                src_loc.pResource = src_res;
+                src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                src_loc.SubresourceIndex = 0;
+                const D3D12_BOX box{static_cast<UINT>(cx - 8), static_cast<UINT>(cy - 8), 0,
+                                    static_cast<UINT>(cx + 8), static_cast<UINT>(cy + 8), 1};
+                command_list.Transition(src_res, D3D12_RESOURCE_STATE_COMMON,
+                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+                command_list.Get()->CopyTextureRegion(&dst, 0, 0, 0, &src_loc, &box);
+                command_list.Transition(src_res, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                        D3D12_RESOURCE_STATE_COMMON);
+                g_s27_witness.sample_armed = true;
+            }
+        } else if (!fmt_ok && !s27_fmt_warned && src_res != nullptr) {
+            s27_fmt_warned = true;
+            LOG_WARNING(Render_D3D12,
+                        "S27 present sample: unsupported src fmt={} - no content sample",
+                        static_cast<u32>(src_desc.Format));
+        }
     }
 
     ID3D12Resource* back_buffer = swapchain.GetBackBuffer();
