@@ -2084,18 +2084,49 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                         continue;
                     }
                     const u32 s27b_px = s27b_sv.size.width * s27b_sv.size.height;
-                    if (s27b_px < 400000 || s27b_px > 800000) {
+                    // S27d: gameplay-phase variants reach 1456x812 (1.18M px) - the menu-phase
+                    // 400k-800k window blinded the oracle there and the run relapsed into the
+                    // sustained dark (S18D: scene inputs at 1168x655/1344x751/1456x812, ages
+                    // 17-21k). The scene family is the only big B10G11R11 family; the bank
+                    // (65k), the reduce intermediate (20k) and the blur (32k) stay excluded.
+                    if (s27b_px < 300000 || s27b_px > 4200000) {
                         continue;
                     }
                     // Only tracked scene-pool VAs participate; unknown VAs are never redirected.
                     u32 s27b_age = ~u32{0};
+                    u32 s27b_match = S23_VA_TRACK_MAX;
                     for (u32 s27b_t = 0; s27b_t < g_s23_va_track_count; ++s27b_t) {
                         if (g_s23_va_track_va[s27b_t] == static_cast<u64>(s27b_sv.GpuAddr())) {
                             s27b_age = static_cast<u32>(g_s18_guest_frames -
                                                         g_s23_va_track_gf[s27b_t]);
+                            s27b_match = s27b_t;
                         }
                     }
-                    if (s27b_age == ~u32{0} || s27b_age <= 8) {
+                    if (s27b_age == ~u32{0}) {
+                        continue;
+                    }
+                    if (s27b_age <= 8) {
+                        // S27e near-miss probe: a fresh-age scene resolve on a DIFFERENT
+                        // incarnation than the one rendered - the fresh-empty-sibling candidate
+                        // behind the residual 1-frame episodes (the 1.0.397 run had all-fresh
+                        // resolves yet ~6% episode flips). Bounded; no behavior change.
+                        if (s27b_match != S23_VA_TRACK_MAX &&
+                            g_s23_va_track_res[s27b_match] != s27b_sv.Resource()) {
+                            static u32 s27e_near_miss_logs = 0;
+                            if (s27e_near_miss_logs < 16 || s27e_near_miss_logs % 128 == 0) {
+                                LOG_WARNING(
+                                    Render_D3D12,
+                                    "S27e fresh sibling resolve: img={} va={:#x} {}x{} age={} "
+                                    "res={:#x} != rendered res={:#x} gf={} (verts={})",
+                                    s27b_sv.image_id.index,
+                                    static_cast<u64>(s27b_sv.GpuAddr()), s27b_sv.size.width,
+                                    s27b_sv.size.height, s27b_age,
+                                    reinterpret_cast<u64>(s27b_sv.Resource()),
+                                    reinterpret_cast<u64>(g_s23_va_track_res[s27b_match]),
+                                    g_s18_guest_frames, params.num_vertices);
+                            }
+                            ++s27e_near_miss_logs;
+                        }
                         continue;
                     }
                     const VideoCommon::ImageViewId s27b_old = views[s27b_i].id;
@@ -2135,7 +2166,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             if (s27c_w->Resource() != nullptr &&
                 s27c_w->format == VideoCore::Surface::PixelFormat::B10G11R11_FLOAT) {
                 const u32 s27c_px = s27c_w->size.width * s27c_w->size.height;
-                if (s27c_px >= 400000 && s27c_px <= 800000) {
+                if (s27c_px >= 300000 && s27c_px <= 4200000) {
                     const u64 s27c_va = static_cast<u64>(s27c_w->GpuAddr());
                     u32 s27c_slot = S23_VA_TRACK_MAX;
                     for (u32 s27c_i = 0; s27c_i < g_s23_va_track_count; ++s27c_i) {
