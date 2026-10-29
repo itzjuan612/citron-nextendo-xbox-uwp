@@ -949,17 +949,28 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         if (view != nullptr) {
             static u32 s24_fill_logs = 0;
             const u64 s24_fill_gpu = static_cast<u64>(view->GpuAddr());
-            if (s24_fill_logs < 32 && s24_fill_gpu >= 0x5eb340000ull &&
+            if (s24_fill_logs < 64 && s24_fill_gpu >= 0x5eb340000ull &&
                 s24_fill_gpu < 0x5eb4ee000ull + 0x56000ull) {
                 ++s24_fill_logs;
+                // S26: the mip-generation draws resolve to the bank's mip subresources
+                // correctly (the S26 RT resolve log) yet the mips read zero - log the actual
+                // D3D12 viewport/scissor the backend sets, to separate "executed but rastered
+                // nothing" (degenerate viewport / scissor) from "wrote elsewhere".
+                const D3D12_VIEWPORT s24_vp = MakeViewport(maxwell3d->regs);
+                const D3D12_RECT s24_sc = MakeScissor(maxwell3d->regs);
                 LOG_WARNING(Render_D3D12,
                             "S24 fill #{}: gpu={:#x} res=0x{:x} {}x{} fmt={:#x} att={:#x} "
-                            "verts={} depth={} slot={}",
+                            "verts={} depth={} slot={} area={}x{} vp=({},{})x({},{}) "
+                            "sc=({},{})-({},{})",
                             s24_fill_logs, s24_fill_gpu,
                             reinterpret_cast<u64>(view->Resource()), view->size.width,
                             view->size.height, static_cast<u32>(view->format),
                             stored.pipeline->State().attachments[0].raw, params.num_vertices,
-                            depth_view != nullptr ? 1 : 0, i);
+                            depth_view != nullptr ? 1 : 0, i,
+                            framebuffer ? framebuffer->RenderArea().width : 0,
+                            framebuffer ? framebuffer->RenderArea().height : 0,
+                            s24_vp.TopLeftX, s24_vp.TopLeftY, s24_vp.Width, s24_vp.Height,
+                            s24_sc.left, s24_sc.top, s24_sc.right, s24_sc.bottom);
             }
         }
         // TEMP DIAGNOSTIC (S15): wiper-window RT tracer, evaluated before the skip returns
