@@ -1741,13 +1741,60 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
             s29_pool_max_tick = std::max(s29_pool_max_tick, slot_images[id].modification_tick);
         }
         const ImageBase& s29_picked = slot_images[picked];
+        fmt::memory_buffer s29_pool_text;
+        for (const ImageId id : pool) {
+            const ImageBase& s29_candidate = slot_images[id];
+            fmt::format_to(std::back_inserter(s29_pool_text),
+                           " [{} g={:#x} c={:#x} sz={} t={} f={:#x}]", id.index,
+                           static_cast<u64>(s29_candidate.gpu_addr),
+                           static_cast<u64>(s29_candidate.cpu_addr),
+                           s29_candidate.guest_size_bytes, s29_candidate.modification_tick,
+                           static_cast<u32>(s29_candidate.flags));
+        }
         LOG_WARNING(Render_D3D12,
-                    "S29 find: addr={:#x} req={}x{} l={} fmt={:#x} ids={} exact={} pool={} "
-                    "cpu={} pick={} tick={} pool_max_tick={} pick_layers={}",
-                    s29_addr, info.size.width, info.size.height, info.resources.layers,
-                    static_cast<u32>(info.format), image_ids.size(), exact_image_ids.size(),
-                    pool.size(), cpu_ids.size(), picked.index, s29_picked.modification_tick,
-                    s29_pool_max_tick, s29_picked.info.resources.layers);
+                    "S29 find: addr={:#x} req_cpu={:#x} req={}x{} l={} fmt={:#x} ids={} exact={} "
+                    "pool={} cpu={} pick={} tick={} pool_max_tick={} pick_layers={} "
+                    "req_st={:#x} req_un={:#x} req_sp={} req_lvl={} req_cmp={}/{}/{}/{} cand{}",
+                    s29_addr, static_cast<u64>(*cpu_addr), info.size.width, info.size.height,
+                    info.resources.layers, static_cast<u32>(info.format), image_ids.size(),
+                    exact_image_ids.size(), pool.size(), cpu_ids.size(), picked.index,
+                    s29_picked.modification_tick, s29_pool_max_tick,
+                    s29_picked.info.resources.layers, info.layer_stride,
+                    info.maybe_unaligned_layer_stride, info.tile_width_spacing,
+                    info.resources.levels, info.block.width, info.block.height, info.block.depth,
+                    info.pitch, fmt::to_string(s29_pool_text));
+        // S29: every image that lives in the same allocation as the request, with its CPU
+        // backing. A page-table walk keyed on the CPU address cannot see an image whose
+        // registration used a different CPU base - this makes that visible.
+        static u32 s29_alloc_logs = 0;
+        const auto s29_alloc_it = image_allocs_table.find(gpu_addr);
+        if (s29_alloc_logs < 6 && s29_alloc_it != image_allocs_table.end()) {
+            ++s29_alloc_logs;
+            fmt::memory_buffer s29_alloc_text;
+            for (const ImageId id : slot_image_allocs[s29_alloc_it->second].images) {
+                const ImageBase& s29_member = slot_images[id];
+                const ImageInfo& s29_m = s29_member.info;
+                const auto s29_member_base = s29_member.TryFindBase(gpu_addr);
+                fmt::format_to(
+                    std::back_inserter(s29_alloc_text),
+                    " [{} g={:#x} c={:#x} sz={} l={} lvl={} fmt={:#x} f={:#x} st={:#x} "
+                    "un={:#x} sp={} blk={}/{}/{} base={} vis={} ls={} bl={}]",
+                    id.index, static_cast<u64>(s29_member.gpu_addr),
+                    static_cast<u64>(s29_member.cpu_addr), s29_member.guest_size_bytes,
+                    s29_m.resources.layers, s29_m.resources.levels,
+                    static_cast<u32>(s29_m.format), static_cast<u32>(s29_member.flags),
+                    s29_m.layer_stride, s29_m.maybe_unaligned_layer_stride,
+                    s29_m.tile_width_spacing, s29_m.block.width, s29_m.block.height,
+                    s29_m.block.depth, s29_member_base.has_value(),
+                    IsViewCompatible(s29_m.format, info.format, broken_views, native_bgr),
+                    IsLayerStrideCompatible(s29_m, info),
+                    IsBlockLinearSizeCompatible(s29_m, info, 0, 0, false));
+            }
+            LOG_WARNING(Render_D3D12, "S29 alloc: req_gpu={:#x} req_cpu={:#x} members={}{}",
+                        s29_addr, static_cast<u64>(*cpu_addr),
+                        slot_image_allocs[s29_alloc_it->second].images.size(),
+                        fmt::to_string(s29_alloc_text));
+        }
     };
     if (pool.size() <= 1) [[likely]] {
         s29_probe(pool.front());
@@ -2424,11 +2471,11 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                                      return false;
                                  });
             LOG_WARNING(Render_D3D12,
-                        "S29 join done: new={} gpu={:#x} layers={} size={} seen={} tick={} "
-                        "purged={}",
-                        new_image_id.index, s29_new_gpu, new_image.info.resources.layers,
-                        new_image.guest_size_bytes, s29_seen, new_image.modification_tick,
-                        s29_purged_views);
+                        "S29 join done: new={} gpu={:#x} cpu={:#x} layers={} size={} seen={} "
+                        "tick={} purged={}",
+                        new_image_id.index, s29_new_gpu, static_cast<u64>(new_image.cpu_addr),
+                        new_image.info.resources.layers, new_image.guest_size_bytes, s29_seen,
+                        new_image.modification_tick, s29_purged_views);
         }
     }
     return new_image_id;
