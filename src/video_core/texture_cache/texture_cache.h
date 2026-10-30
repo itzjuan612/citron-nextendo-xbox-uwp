@@ -1348,6 +1348,18 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         return;
     }
     auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+    if (!staging.buffer || staging.mapped_span.size() < image.guest_size_bytes) {
+        // S27m: commit exhaustion - an empty staging ref here used to flow into
+        // UploadMemory and memcpy to a null mapping (the 2.2 h overnight crash). The
+        // image keeps its CpuModified flag, so the upload retries once memory frees.
+        static u32 s27m_upload_skip_logs = 0;
+        if (s27m_upload_skip_logs < 8 || s27m_upload_skip_logs % 512 == 0) {
+            ++s27m_upload_skip_logs;
+            LOG_WARNING(HW_GPU, "S27m upload skipped: staging exhausted ({} bytes)",
+                        MapSizeBytes(image));
+        }
+        return;
+    }
     // TEMP DIAGNOSTIC (S15): log uploads that could clobber the 960x540 scene RT
     // (gpu 0x5103e0000, ~2073600 bytes). If a stray CPU write marks this image CpuModified,
     // RefreshContents re-uploads guest memory over the freshly GPU-rendered content; log a
@@ -1781,6 +1793,13 @@ void TextureCache<P>::TickAsyncDecode() {
         }
         Image& image = slot_images[async_decode->image_id];
         auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
+        if (!staging.buffer || staging.mapped_span.size() < async_decode->decoded_data.size()) {
+            // S27m: commit exhaustion (the 2.2 h overnight crash - staging creation failed
+            // and this memcpy wrote to a null mapping, 0xC0000005 at 0x0). Leave the decode
+            // queued; it retries once memory frees.
+            ++i;
+            continue;
+        }
         std::memcpy(staging.mapped_span.data(), async_decode->decoded_data.data(),
                     async_decode->decoded_data.size());
         image.UploadMemory(staging, async_decode->copies);

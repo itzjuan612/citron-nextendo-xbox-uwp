@@ -2210,6 +2210,41 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                     g_s23_va_track_res[s27c_slot] = s27c_w->Resource();
                     g_s23_va_track_img[s27c_slot] = s27c_w->image_id;
                 }
+            } else if (s27c_w->Resource() != nullptr) {
+                // S27l: during the sustained-black stretches the B10G11R11 pool renders stop
+                // (the oracle goes blind, the reduce input ages, exposure dies). Name the
+                // usurper: the FIRST bind per distinct (VA, format) of a variant-sized target
+                // in ANY other format, so a pool move or format change prints exactly once.
+                const u32 s27l_px = s27c_w->size.width * s27c_w->size.height;
+                if (s27l_px >= 300000 && s27l_px <= 4200000) {
+                    static u64 s27l_seen_va[24] = {};
+                    static u32 s27l_seen_fmt[24] = {};
+                    static u32 s27l_seen_count = 0;
+                    static u32 s27l_logs = 0;
+                    const u64 s27l_va = static_cast<u64>(s27c_w->GpuAddr());
+                    const u32 s27l_fmt = static_cast<u32>(s27c_w->format);
+                    bool s27l_known = false;
+                    for (u32 s27l_i = 0; s27l_i < s27l_seen_count && s27l_i < 24; ++s27l_i) {
+                        if (s27l_seen_va[s27l_i] == s27l_va && s27l_seen_fmt[s27l_i] == s27l_fmt) {
+                            s27l_known = true;
+                            break;
+                        }
+                    }
+                    if (!s27l_known && s27l_logs < 48) {
+                        if (s27l_seen_count < 24) {
+                            s27l_seen_va[s27l_seen_count] = s27l_va;
+                            s27l_seen_fmt[s27l_seen_count] = s27l_fmt;
+                            ++s27l_seen_count;
+                        }
+                        ++s27l_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S27l non-scene pool bind: va={:#x} fmt={:#x} {}x{} gf={} "
+                                    "verts={} (tracked pool entries={})",
+                                    s27l_va, s27l_fmt, s27c_w->size.width, s27c_w->size.height,
+                                    g_s18_guest_frames, params.num_vertices,
+                                    g_s23_va_track_count);
+                    }
+                }
             }
         }
         for (const auto& desc : info->image_descriptors) {
@@ -2442,25 +2477,47 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
     // Contiguous table regions: [0, num_cbv) CBV, [num_cbv, +num_res) SRV,
     // [num_cbv + num_res, +num_res) UAV. The sampler table is [0, num_res).
     const u32 heap_total = num_cbv + num_res * 2;
-    const u32 heap_base = heap_total != 0 ? m_res_heap.Allocate(heap_total) : 0;
-    const u32 sampler_base = num_res != 0 ? m_sampler_heap.Allocate(num_res) : 0;
+    u32 heap_base = heap_total != 0 ? m_res_heap.Allocate(heap_total) : 0;
+    u32 sampler_base = num_res != 0 ? m_sampler_heap.Allocate(num_res) : 0;
     if ((heap_total != 0 && heap_base == DescriptorHeap::INVALID_INDEX) ||
         (num_res != 0 && sampler_base == DescriptorHeap::INVALID_INDEX)) {
-        if (!logged_heap_exhausted) {
-            logged_heap_exhausted = true;
-            LOG_ERROR(Render_D3D12, "Descriptor heap exhausted (cbv={} res={}); draw skipped",
-                      num_cbv, num_res);
+        // S27g: recover instead of skipping. A skipped draw loses its content; for the
+        // flinger compose draw the skipped frame presents the queue buffer's CLEARED state -
+        // the 1-frame black flash (13-14% of gameplay presents; the log-silent "FLINGER skip:
+        // descriptor heap exhausted", one cap-gated line per run). Gameplay raises per-frame
+        // draw counts past the heap budget; the flush+reset+retry costs one GPU sync on
+        // exactly those frames. The recorded prefix (uploads, transitions, root sig, PSO)
+        // executes intact before the heaps reset; only root sig/PSO/heap-bind need re-issue.
+        m_command_list.Execute(m_device);
+        m_device.WaitForIdle();
+        m_command_list.Reset();
+        m_res_heap.Reset();
+        m_sampler_heap.Reset();
+        m_cbv_scratch_used = 0;
+        heap_base = heap_total != 0 ? m_res_heap.Allocate(heap_total) : 0;
+        sampler_base = num_res != 0 ? m_sampler_heap.Allocate(num_res) : 0;
+        static u32 s27g_recover_logs = 0;
+        if (s27g_recover_logs < 16 || s27g_recover_logs % 256 == 0) {
+            ++s27g_recover_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S27g heap exhaustion recovered mid-frame (cbv={} res={} flinger={} "
+                        "verts={})",
+                        num_cbv, num_res, flinger_draw ? 1 : 0, params.num_vertices);
         }
-        if (flinger_draw) {
-            static u32 fd_heap_logs = 0;
-            if (fd_heap_logs < 4) {
-                ++fd_heap_logs;
-                LOG_WARNING(Render_D3D12,
-                            "FLINGER skip: descriptor heap exhausted cbv={} res={}", num_cbv,
-                            num_res);
+        if ((heap_total != 0 && heap_base == DescriptorHeap::INVALID_INDEX) ||
+            (num_res != 0 && sampler_base == DescriptorHeap::INVALID_INDEX)) {
+            if (!logged_heap_exhausted) {
+                logged_heap_exhausted = true;
+                LOG_ERROR(Render_D3D12,
+                          "Descriptor heap exhausted twice (cbv={} res={}); draw skipped",
+                          num_cbv, num_res);
             }
+            return;
         }
-        return;
+        m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
+        m_command_list.SetPipelineState(pipeline->Get());
+        ID3D12DescriptorHeap* heaps_retry[] = {m_res_heap.Get(), m_sampler_heap.Get()};
+        m_command_list.Get()->SetDescriptorHeaps(2, heaps_retry);
     }
     const u32 cbv_slot_base = heap_base;
     const u32 srv_slot_base = heap_base + num_cbv;

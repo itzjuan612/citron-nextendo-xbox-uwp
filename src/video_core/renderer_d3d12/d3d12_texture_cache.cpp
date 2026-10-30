@@ -582,6 +582,11 @@ void Image::UploadMemory(ID3D12Resource* buffer, u64 offset,
 }
 
 void Image::UploadMemory(const StagingBufferRef& map, std::span<const BufferImageCopy> copies) {
+    if (map.mapped_span.empty()) {
+        // S27m: commit exhaustion handed back an empty ref; copying into it is the
+        // 0xC0000005-at-0x0 crash. The image's CpuModified flag stays set for a retry.
+        return;
+    }
     {
         // Diagnostic (session 12): is the CPU-side staging (guest texel data) actually
         // non-zero? Black rendering with zero staging means the guest read/upload path.
