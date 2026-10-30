@@ -32,6 +32,18 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
                                         config.a_type, config.srgb_conversion);
     num_samples = NumSamples(config.msaa_mode);
     resources.levels = config.max_mip_level + 1;
+    // S30 EXPERIMENT (kS30ProbeCubeOneLevel, DEFAULT OFF - it broke boot): forcing one stored
+    // level for the 256x256 env-probe cube makes the layout match the guest's +k*0x80000 face
+    // writes, but the console run (1.0.416.0, run_s30d) then rendered NO 3D at all - no scene
+    // draws, no AccelerateDisplay, just 110 FPS of presenting from t=238 onward. The guest does
+    // rely on the 6-level layout it declares, so this is not the route. Kept for the record.
+    static constexpr bool kS30ProbeCubeOneLevel = false;
+    if (kS30ProbeCubeOneLevel && config.max_mip_level > 0 && config.Width() == 256 &&
+        config.Height() == 256 &&
+        (config.texture_type == TextureType::TextureCubemap ||
+         config.texture_type == TextureType::TextureCubeArray)) {
+        resources.levels = 1;
+    }
     if (config.IsPitchLinear()) {
         pitch = config.Pitch();
     } else if (config.IsBlockLinear()) {

@@ -6107,6 +6107,19 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                         reinterpret_cast<u64>(s19_sv.Resource()),
                                         s19_sv.size.width, s19_sv.size.height,
                                         static_cast<u32>(s19_sv.format), params.num_vertices);
+                            // S30: one per-layer dump of the probe the bake samples. The 946xxx
+                            // band arms layers 0-5 at mip 0, so this answers "which of the six
+                            // layers does the guest actually fill" from the byte stats instead
+                            // of from the resolver.
+                            static u32 s30_layer_dumps = 0;
+                            if (s30_layer_dumps < 1 && s19_sv.size.width == 256 &&
+                                s19_sv.size.height == 256) {
+                                ++s30_layer_dumps;
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                    static_cast<u32>(s19_sv.format),
+                                    static_cast<u64>(s19_sv.GpuAddr()), 946000u, true);
+                            }
                         }
                     }
                     if (s15_post_scene_budget) {
