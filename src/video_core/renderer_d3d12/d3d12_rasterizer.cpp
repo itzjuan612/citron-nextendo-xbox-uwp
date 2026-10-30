@@ -2217,21 +2217,25 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                 // in ANY other format, so a pool move or format change prints exactly once.
                 const u32 s27l_px = s27c_w->size.width * s27c_w->size.height;
                 if (s27l_px >= 300000 && s27l_px <= 4200000) {
-                    static u64 s27l_seen_va[24] = {};
-                    static u32 s27l_seen_fmt[24] = {};
+                    // S28: the caps used to be 24 slots / 48 lines and the first 1.0.402 run
+                    // exhausted all 48 by t=791 (13 dynamic-res RGBA8 post-process VAs), so
+                    // every later non-scene bind was silent - the probe went blind exactly
+                    // when it was needed. 64 slots / 160 lines keep it alive for a whole run.
+                    static u64 s27l_seen_va[64] = {};
+                    static u32 s27l_seen_fmt[64] = {};
                     static u32 s27l_seen_count = 0;
                     static u32 s27l_logs = 0;
                     const u64 s27l_va = static_cast<u64>(s27c_w->GpuAddr());
                     const u32 s27l_fmt = static_cast<u32>(s27c_w->format);
                     bool s27l_known = false;
-                    for (u32 s27l_i = 0; s27l_i < s27l_seen_count && s27l_i < 24; ++s27l_i) {
+                    for (u32 s27l_i = 0; s27l_i < s27l_seen_count && s27l_i < 64; ++s27l_i) {
                         if (s27l_seen_va[s27l_i] == s27l_va && s27l_seen_fmt[s27l_i] == s27l_fmt) {
                             s27l_known = true;
                             break;
                         }
                     }
-                    if (!s27l_known && s27l_logs < 48) {
-                        if (s27l_seen_count < 24) {
+                    if (!s27l_known && s27l_logs < 160) {
+                        if (s27l_seen_count < 64) {
                             s27l_seen_va[s27l_seen_count] = s27l_va;
                             s27l_seen_fmt[s27l_seen_count] = s27l_fmt;
                             ++s27l_seen_count;

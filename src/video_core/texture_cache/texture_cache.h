@@ -1351,12 +1351,20 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
     if (!staging.buffer || staging.mapped_span.size() < image.guest_size_bytes) {
         // S27m: commit exhaustion - an empty staging ref here used to flow into
         // UploadMemory and memcpy to a null mapping (the 2.2 h overnight crash). The
-        // image keeps its CpuModified flag, so the upload retries once memory frees.
+        // dirty mark is cleared at the top of this function, so put it back: without
+        // this the image never retried and its content stayed zero for the whole run
+        // (1.0.402 dropped every skipped upload permanently - the first 1.0.402 run
+        // came up with several un-uploaded textures while staging was exhausted).
+        image.flags |= ImageFlagBits::CpuModified;
         static u32 s27m_upload_skip_logs = 0;
-        if (s27m_upload_skip_logs < 8 || s27m_upload_skip_logs % 512 == 0) {
+        if (s27m_upload_skip_logs < 24 || s27m_upload_skip_logs % 512 == 0) {
             ++s27m_upload_skip_logs;
-            LOG_WARNING(HW_GPU, "S27m upload skipped: staging exhausted ({} bytes)",
-                        MapSizeBytes(image));
+            LOG_WARNING(HW_GPU,
+                        "S27m upload skipped: staging exhausted ({} bytes, img={} gpu={:#x} "
+                        "{}x{} fmt={:#x})",
+                        MapSizeBytes(image), image_id.index, static_cast<u64>(image.gpu_addr),
+                        image.info.size.width, image.info.size.height,
+                        static_cast<u32>(image.info.format));
         }
         return;
     }
