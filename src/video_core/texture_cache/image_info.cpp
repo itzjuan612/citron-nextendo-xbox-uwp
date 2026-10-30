@@ -36,8 +36,21 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
     // level for the 256x256 env-probe cube makes the layout match the guest's +k*0x80000 face
     // writes, but the console run (1.0.416.0, run_s30d) then rendered NO 3D at all - no scene
     // draws, no AccelerateDisplay, just 110 FPS of presenting from t=238 onward. The guest does
-    // rely on the 6-level layout it declares, so this is not the route. Kept for the record.
+    // rely on the 6-level layout it declares for other 256x256 cubes. Kept for the record.
     static constexpr bool kS30ProbeCubeOneLevel = false;
+    // S30 A/B #2 (address-scoped, so no other cube can be touched): the two environment-probe
+    // arrays. Their dumps show layer 0 with content and layers 1-5 identically zero while the
+    // guest renders its six faces at +k*0x80000 and joins them into a 1-level stride-0x80000
+    // array - i.e. the guest's writes follow a one-level layout, not the 6-level one the TIC's
+    // max_mip_level implies. If this lights the bank, the TIC's max LOD is a clamp for this
+    // title's probe and the layout must come from the writes.
+    static constexpr bool kS30ProbeCubeOneLevelByAddress = false;
+    const u64 s30_tic_addr = static_cast<u64>(config.Address());
+    if (kS30ProbeCubeOneLevelByAddress && config.max_mip_level > 0 &&
+        config.Width() == 256 && config.Height() == 256 &&
+        (s30_tic_addr == 0x516170000ull || s30_tic_addr == 0x516480000ull)) {
+        resources.levels = 1;
+    }
     if (kS30ProbeCubeOneLevel && config.max_mip_level > 0 && config.Width() == 256 &&
         config.Height() == 256 &&
         (config.texture_type == TextureType::TextureCubemap ||
