@@ -5917,6 +5917,70 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                                 s26_mips);
                                 }
                             }
+                            // S28 DIAGNOSTIC (one-shot, logged): 1.0.402-404 all render the
+                            // "Select a style." 3D unlit - the game's own six-face bake writes
+                            // ~nothing into layer 0 (lmean 0.00019, rmax 0.021) while the scene
+                            // draws, the exposure chain and the reduce input are all proven
+                            // healthy, so every consumer of the bank samples black. Overwrite
+                            // the WHOLE cube array's mip 0 with a constant through one
+                            // Texture2DArray RTV: if the screen lights up, the lighting path is
+                            // fine and only the bank CONTENT is missing; if it stays dark, the
+                            // shading path itself is broken. Clear (not a copy) because the
+                            // copy above only propagates the zeros. The mip clamp means mips 1-5
+                            // are never sampled; revert after the run.
+                            // RESULT (1.0.405 run, console-verified): the fill works - the bank
+                            // dump reads lmean 0.508 and the scene RT went 0.00126 -> 0.0197,
+                            // the exposure 0.0012 -> 0.022 and the capture mean 3-5 -> 21-22
+                            // (a clean ~16x proportional response). So the lighting path is
+                            // correct and the game's bake content is the ONLY remaining blocker.
+                            // Kept behind this flag (default off) so it can be re-armed for any
+                            // later A/B; on it is a flat grey environment, not the game's sky.
+                            constexpr bool kS28ConstantFill = false;
+                            {
+                                static bool s28_clear_done = false;
+                                static ID3D12DescriptorHeap* s28_rtv_heap = nullptr;
+                                if (kS28ConstantFill && !s28_clear_done) {
+                                    s28_clear_done = true;
+                                    if (s28_rtv_heap == nullptr) {
+                                        D3D12_DESCRIPTOR_HEAP_DESC s28_hd{};
+                                        s28_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                                        s28_hd.NumDescriptors = 1;
+                                        m_device.GetDevice()->CreateDescriptorHeap(
+                                            &s28_hd, IID_PPV_ARGS(&s28_rtv_heap));
+                                    }
+                                    if (s28_rtv_heap != nullptr) {
+                                        const D3D12_RESOURCE_DESC s28_desc =
+                                            s24_env_sv.Resource()->GetDesc();
+                                        D3D12_RENDER_TARGET_VIEW_DESC s28_rd{};
+                                        s28_rd.Format = DXGI_FORMAT_R11G11B10_FLOAT;
+                                        s28_rd.ViewDimension =
+                                            D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+                                        s28_rd.Texture2DArray.MipSlice = 0;
+                                        s28_rd.Texture2DArray.FirstArraySlice = 0;
+                                        s28_rd.Texture2DArray.ArraySize =
+                                            s28_desc.DepthOrArraySize;
+                                        s28_rd.Texture2DArray.PlaneSlice = 0;
+                                        const D3D12_CPU_DESCRIPTOR_HANDLE s28_rtv =
+                                            s28_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+                                        m_device.GetDevice()->CreateRenderTargetView(
+                                            s24_env_sv.Resource(), &s28_rd, s28_rtv);
+                                        m_command_list.Transition(
+                                            s24_env_sv.Resource(),
+                                            D3D12_RESOURCE_STATE_COMMON,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                        const f32 s28_clear[4] = {0.55f, 0.50f, 0.45f, 1.0f};
+                                        m_command_list.ClearRenderTargetView(s28_rtv, s28_clear);
+                                        m_command_list.Transition(
+                                            s24_env_sv.Resource(),
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_COMMON);
+                                        LOG_WARNING(Render_D3D12,
+                                                    "S28 constant fill: {} layers mip0 -> "
+                                                    "(0.55,0.50,0.45)",
+                                                    s28_desc.DepthOrArraySize);
+                                    }
+                                }
+                            }
                             (void)D3D12::RecordTextureContentDump(
                                 m_device.GetDevice(), m_command_list, s24_env_sv.Resource(),
                                 static_cast<u32>(s24_env_sv.format), s24_env_gpu,
