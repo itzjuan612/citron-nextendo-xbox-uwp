@@ -577,6 +577,21 @@ ImageViewId TextureCache<P>::VisitImageView(DescriptorTable<TICEntry>& table,
     if (is_new) {
         image_view_id = FindImageView(descriptor);
     }
+    // S29 probe (bounded 8): an INDEX-level cache hit means the descriptor was unchanged since
+    // its last read, so FindImageView never runs and no view purge can reach this slot - the
+    // exact way a join's fresh incarnation loses to a boot-era view for a whole run.
+    if (!is_new) {
+        static u32 s29_index_logs = 0;
+        const u64 s29_addr = static_cast<u64>(descriptor.Address());
+        if (s29_index_logs < 8 && frame_tick > 1500 && s29_addr >= 0x516170000ull &&
+            s29_addr < 0x516180000ull && image_view_id != NULL_IMAGE_VIEW_ID) {
+            ++s29_index_logs;
+            LOG_WARNING(Render_D3D12, "S29 index cache: idx={} addr={:#x} img={} view={} flags={:#x}",
+                        index, s29_addr, slot_image_views[image_view_id].image_id.index,
+                        image_view_id.index,
+                        static_cast<u32>(slot_images[slot_image_views[image_view_id].image_id].flags));
+        }
+    }
     if (image_view_id != NULL_IMAGE_VIEW_ID) {
         PrepareImageView(image_view_id, false, false);
     }
@@ -1557,6 +1572,31 @@ ImageViewId TextureCache<P>::FindImageView(const TICEntry& config) {
     if (is_new) {
         image_view_id = CreateImageView(config);
     }
+    // S29 (one-shot, 8 lines): discriminator for the env-probe window the six-face bake samples.
+    // `hit` separates the two remaining mechanisms - the TIC-value cache re-serving a join
+    // survivor whose views the S20 purge missed, versus a fresh resolve whose freshness
+    // preference picked the stale incarnation. flags carries CpuModified(0x4)/GpuModified(0x8)
+    // of the chosen image so the pick can be read off directly.
+    {
+        static u32 s29_tic_logs = 0;
+        const u64 s29_addr = static_cast<u64>(config.Address());
+        const bool s29_probe_shape =
+            frame_tick > 1500 && s29_addr >= 0x516170000ull &&
+            s29_addr < 0x516180000ull && image_view_id != NULL_IMAGE_VIEW_ID &&
+            slot_image_views[image_view_id].size.width == 256 &&
+            slot_image_views[image_view_id].size.height == 256;
+        if (s29_tic_logs < 8 && s29_probe_shape) {
+            ++s29_tic_logs;
+            const ImageId s29_image_id = image_view_id != NULL_IMAGE_VIEW_ID
+                                             ? slot_image_views[image_view_id].image_id
+                                             : ImageId{};
+            LOG_WARNING(Render_D3D12,
+                        "S29 tic resolve: addr={:#x} hit={} img={} flags={:#x} tick={}",
+                        s29_addr, is_new ? 0 : 1, s29_image_id.index,
+                        s29_image_id ? static_cast<u32>(slot_images[s29_image_id].flags) : 0u,
+                        s29_image_id ? slot_images[s29_image_id].modification_tick : 0u);
+        }
+    }
     return image_view_id;
 }
 
@@ -1663,22 +1703,60 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     // modification tick.
     const auto& pool = (!flexible_formats && !exact_image_ids.empty()) ? exact_image_ids
                                                                        : image_ids;
-    if (pool.size() <= 1) [[likely]] {
-        return pool.front();
-    }
     boost::container::small_vector<ImageId, 8> cpu_ids;
     for (const ImageId id : pool) {
-        if (True(slot_images[id].flags & ImageFlagBits::CpuModified)) {
+        // S29: a pending guest upload only counts while it can still land. RefreshContents
+        // refuses to upload over a GpuModified image (the S15/S16 zero-wipe guard), so an image
+        // carrying BOTH flags never uploads and never sheds the mark on its own - the 1.0.404
+        // staging retry re-sets it, and nothing retries an image the game stops binding.
+        // Counting it as fresh let a stale incarnation outrank the fresh join: the six-face bake
+        // kept sampling img 4086 (0x516170000, CpuModified since a t=220 staging skip) instead
+        // of the six-layer array joined seconds earlier, whose extra layers are the only env
+        // probe content. The tick comparison below picks what the guest last wrote instead.
+        const auto id_flags = slot_images[id].flags;
+        if (True(id_flags & ImageFlagBits::CpuModified) &&
+            False(id_flags & ImageFlagBits::GpuModified)) {
             cpu_ids.push_back(id);
         }
     }
-    const auto& pick = cpu_ids.empty() ? pool : cpu_ids;
     auto image_ids_compare = [this](ImageId a, ImageId b) {
         auto& image_a = slot_images[a];
         auto& image_b = slot_images[b];
         return image_a.modification_tick < image_b.modification_tick;
     };
-    return *std::ranges::max_element(pick, image_ids_compare);
+    // S29 probe (bounded 8, gated past the boot-era resolves): the env-probe window the
+    // six-face bake samples. Names the candidate pool, its newest tick and the pick, so "the
+    // fresh join is not a candidate at all" and "the pick is wrong" separate in one line.
+    const auto s29_probe = [&](ImageId picked) {
+        static u32 s29_find_logs = 0;
+        const u64 s29_addr = static_cast<u64>(gpu_addr);
+        if (s29_find_logs >= 8 || frame_tick <= 1500 || s29_addr < 0x516170000ull ||
+            s29_addr >= 0x516180000ull || info.size.width != 256 ||
+            info.size.height != 256) {
+            return;
+        }
+        ++s29_find_logs;
+        u64 s29_pool_max_tick = 0;
+        for (const ImageId id : pool) {
+            s29_pool_max_tick = std::max(s29_pool_max_tick, slot_images[id].modification_tick);
+        }
+        const ImageBase& s29_picked = slot_images[picked];
+        LOG_WARNING(Render_D3D12,
+                    "S29 find: addr={:#x} req={}x{} l={} fmt={:#x} ids={} exact={} pool={} "
+                    "cpu={} pick={} tick={} pool_max_tick={} pick_layers={}",
+                    s29_addr, info.size.width, info.size.height, info.resources.layers,
+                    static_cast<u32>(info.format), image_ids.size(), exact_image_ids.size(),
+                    pool.size(), cpu_ids.size(), picked.index, s29_picked.modification_tick,
+                    s29_pool_max_tick, s29_picked.info.resources.layers);
+    };
+    if (pool.size() <= 1) [[likely]] {
+        s29_probe(pool.front());
+        return pool.front();
+    }
+    const auto& pick = cpu_ids.empty() ? pool : cpu_ids;
+    const ImageId s29_picked_id = *std::ranges::max_element(pick, image_ids_compare);
+    s29_probe(s29_picked_id);
+    return s29_picked_id;
 }
 
 template <class P>
@@ -2297,6 +2375,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     // at t=828 through one unresolved view). Purge the affected images' cached views and force
     // every descriptor to re-resolve on its next use, so a sample binds the image the guest
     // last wrote. Same cleanup DeleteImage performs for the views it retires.
+    size_t s29_purged_views = 0;
     {
         boost::container::small_vector<ImageViewId, 32> s20_stale_views;
         const auto s20_collect_views = [this, &s20_stale_views](ImageId id) {
@@ -2321,12 +2400,37 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         for (const auto& join_copy : join_copies_to_do) {
             s20_collect_views(join_copy.id);
         }
+        s29_purged_views = s20_stale_views.size();
         if (!s20_stale_views.empty()) {
             RemoveImageViewReferences(s20_stale_views);
             InvalidateImageTables();
         }
     }
     RegisterImage(new_image_id);
+    // S29 probe (bounded 8, array joins only): how many images the page table enumerates over
+    // the env-probe window right after a join there. `seen>=2` means the fresh array and the
+    // stale survivor coexist and the resolver has to choose; `seen==1` means the fresh join is
+    // not even a candidate for later resolves.
+    {
+        static u32 s29_join_logs = 0;
+        const u64 s29_new_gpu = static_cast<u64>(new_image.gpu_addr);
+        if (s29_join_logs < 12 &&
+            s29_new_gpu >= 0x516170000ull && s29_new_gpu < 0x516180000ull) {
+            ++s29_join_logs;
+            u32 s29_seen = 0;
+            ForEachImageInRegion(new_image.cpu_addr, new_image.guest_size_bytes,
+                                 [&s29_seen](ImageId, ImageBase&) {
+                                     ++s29_seen;
+                                     return false;
+                                 });
+            LOG_WARNING(Render_D3D12,
+                        "S29 join done: new={} gpu={:#x} layers={} size={} seen={} tick={} "
+                        "purged={}",
+                        new_image_id.index, s29_new_gpu, new_image.info.resources.layers,
+                        new_image.guest_size_bytes, s29_seen, new_image.modification_tick,
+                        s29_purged_views);
+        }
+    }
     return new_image_id;
 }
 
@@ -2814,6 +2918,20 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
 template <class P>
 void TextureCache<P>::UnregisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
+    // S29 probe (bounded 12): an image leaving the page table stops being a FindImage candidate
+    // even though it still exists - the way a fresh join can vanish from the region.
+    {
+        static u32 s29_unreg_logs = 0;
+        const u64 s29_gpu = static_cast<u64>(image.gpu_addr);
+        if (s29_unreg_logs < 12 && s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
+            ++s29_unreg_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S29 unregister: img={} gpu={:#x} {}x{} l={} fmt={:#x} flags={:#x}",
+                        image_id.index, s29_gpu, image.info.size.width, image.info.size.height,
+                        image.info.resources.layers, static_cast<u32>(image.info.format),
+                        static_cast<u32>(image.flags));
+        }
+    }
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already registered image");
     image.flags &= ~ImageFlagBits::Registered;
@@ -2958,6 +3076,18 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete,
                                   std::vector<ImageViewId>* deferred_view_refs) {
     ImageBase& image = slot_images[image_id];
+    // S29 probe (bounded 12): who retires the env-probe window's incarnations.
+    {
+        static u32 s29_del_logs = 0;
+        const u64 s29_gpu = static_cast<u64>(image.gpu_addr);
+        if (s29_del_logs < 12 && s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
+            ++s29_del_logs;
+            LOG_WARNING(Render_D3D12, "S29 delete: img={} gpu={:#x} {}x{} l={} fmt={:#x} flags={:#x}",
+                        image_id.index, s29_gpu, image.info.size.width, image.info.size.height,
+                        image.info.resources.layers, static_cast<u32>(image.info.format),
+                        static_cast<u32>(image.flags));
+        }
+    }
     if (image.HasScaled()) {
         const u64 scaled_size = GetScaledImageSizeBytes(image);
         ASSERT(total_used_memory >= scaled_size);
@@ -3126,6 +3256,19 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    // S29 probe (bounded 12): which env-probe incarnation the GPU actually writes. 4086 gaining
+    // a fresh tick while the just-joined array is gone is what the bake ends up sampling.
+    {
+        static u32 s29_mark_logs = 0;
+        const u64 s29_gpu = static_cast<u64>(image.gpu_addr);
+        if (s29_mark_logs < 12 && s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
+            ++s29_mark_logs;
+            LOG_WARNING(Render_D3D12, "S29 mark: gpu={:#x} {}x{} l={} fmt={:#x} tick={}", s29_gpu,
+                        image.info.size.width, image.info.size.height,
+                        image.info.resources.layers, static_cast<u32>(image.info.format),
+                        image.modification_tick);
+        }
+    }
 }
 
 template <class P>
