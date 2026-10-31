@@ -976,6 +976,18 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             framebuffer ? framebuffer->RenderArea().height : 0,
                             s24_vp.TopLeftX, s24_vp.TopLeftY, s24_vp.Width, s24_vp.Height,
                             s24_sc.left, s24_sc.top, s24_sc.right, s24_sc.bottom);
+                // S30: dump this fill's own output face. The copy is recorded at ConfigureDraw,
+                // so each dump shows the PREVIOUS fill's result; with six fills per bake that
+                // still covers five of the six outputs and answers "does the bake write anything
+                // into the faces at all". Band 952xxx dumps layer 0 mip 0 only.
+                static u32 s30_fill_dumps = 0;
+                if (s30_fill_dumps < 12) {
+                    ++s30_fill_dumps;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, view->Resource(),
+                        static_cast<u32>(view->format), s24_fill_gpu,
+                        952000u + s30_fill_dumps, true);
+                }
             }
         }
         // TEMP DIAGNOSTIC (S15): wiper-window RT tracer, evaluated before the skip returns
@@ -6124,6 +6136,35 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     m_device.GetDevice(), m_command_list, s19_sv.Resource(),
                                     static_cast<u32>(s19_sv.format),
                                     static_cast<u64>(s19_sv.GpuAddr()), 949000u, true);
+                            }
+                            // S30: the bake's OTHER input - the 256x4 table at 0x5d0630800. The
+                            // six fills paint nothing while their cube has content, so the
+                            // shader's table/constant inputs are the remaining suspects.
+                            static u32 s30_table_dumps = 0;
+                            if (s30_table_dumps < 2 &&
+                                static_cast<u64>(s19_sv.GpuAddr()) == 0x5d0630800ull) {
+                                ++s30_table_dumps;
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                    static_cast<u32>(s19_sv.format),
+                                    static_cast<u64>(s19_sv.GpuAddr()),
+                                    953000u + s30_table_dumps, true);
+                                // S30: is the guest memory behind the table actually empty, or did
+                                // an upload get dropped? The image is zero while the guest mapped a
+                                // 0x10000 buffer at cpu 0xbaec8000, so read the first words.
+                                u32 s30_gw[8]{};
+                                const auto s30_cpu = gpu_memory->GpuToCpuAddress(0x5d0630800ull);
+                                if (s30_cpu) {
+                                    gpu_memory->ReadBlock(*s30_cpu, s30_gw, sizeof(s30_gw),
+                                                          VideoCommon::CacheType::NoTextureCache);
+                                }
+                                LOG_WARNING(Render_D3D12,
+                                            "S30 table guest: cpu={:#x} words={:08x} {:08x} {:08x} "
+                                            "{:08x} {:08x} {:08x} {:08x} {:08x} res={:#x}",
+                                            s30_cpu ? static_cast<u64>(*s30_cpu) : 0ull, s30_gw[0],
+                                            s30_gw[1], s30_gw[2], s30_gw[3], s30_gw[4], s30_gw[5],
+                                            s30_gw[6], s30_gw[7],
+                                            reinterpret_cast<u64>(s19_sv.Resource()));
                             }
                         }
                     }

@@ -2804,6 +2804,17 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
     {
         static u32 s30_rt_logs = 0;
         const u64 s30_g = static_cast<u64>(gpu_addr);
+        if (s30_rt_logs < 16 && s30_g >= 0x5d0630000ull && s30_g < 0x5d0631000ull) {
+            ++s30_rt_logs;
+            const auto s30_tb = image.TryFindBase(gpu_addr);
+            LOG_WARNING(Render_D3D12,
+                        "S30 table RT: va={:#x} rt={}x{} lv={} lay={} -> img={} gpu={:#x} sz={} "
+                        "base=({},{})",
+                        s30_g, info.size.width, info.size.height, info.resources.levels,
+                        info.resources.layers, image_id.index,
+                        static_cast<u64>(image.gpu_addr), image.guest_size_bytes,
+                        s30_tb ? s30_tb->level : -1, s30_tb ? s30_tb->layer : -1);
+        }
         if (s30_rt_logs < 40 && s30_g > 0x516170000ull && s30_g < 0x5165c0000ull) {
             ++s30_rt_logs;
             const auto s30_base = image.TryFindBase(gpu_addr);
@@ -3441,6 +3452,18 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     {
         static u32 s29_mark_logs = 0;
         const u64 s29_gpu = static_cast<u64>(image.gpu_addr);
+        // S30: the bake's 256x4 table at 0x5d0630800 comes back empty while the six fills
+        // multiply by it, so whoever writes it (or fails to) is the remaining question.
+        static u32 s30_table_mark_logs = 0;
+        if (s30_table_mark_logs < 16 && s29_gpu >= 0x5d0630000ull && s29_gpu < 0x5d0631000ull) {
+            ++s30_table_mark_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S30 table mark: gpu={:#x} {}x{} lv={} lay={} sz={} fmt={:#x} tick={}",
+                        s29_gpu, image.info.size.width, image.info.size.height,
+                        image.info.resources.levels, image.info.resources.layers,
+                        image.guest_size_bytes, static_cast<u32>(image.info.format),
+                        image.modification_tick);
+        }
         if (s29_mark_logs < 16 && image.info.resources.layers > 1 &&
             s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
             ++s29_mark_logs;
