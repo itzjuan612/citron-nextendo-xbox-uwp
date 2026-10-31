@@ -1572,29 +1572,51 @@ ImageViewId TextureCache<P>::FindImageView(const TICEntry& config) {
     if (is_new) {
         image_view_id = CreateImageView(config);
     }
-    // S29 (one-shot, 8 lines): discriminator for the env-probe window the six-face bake samples.
-    // `hit` separates the two remaining mechanisms - the TIC-value cache re-serving a join
-    // survivor whose views the S20 purge missed, versus a fresh resolve whose freshness
-    // preference picked the stale incarnation. flags carries CpuModified(0x4)/GpuModified(0x8)
-    // of the chosen image so the pick can be read off directly.
+    // S30 TIC census (read-only, deduped by descriptor shape, bounded 24): every distinct way
+    // the guest samples the two environment-probe arrays. The bake's input resolves to a
+    // 6-level cube while the guest fills that address as a one-level six-face array, so the
+    // question is whether a SECOND, 1-level descriptor for the same address exists (and which
+    // draw uses it). Logs max_mip_level, texture type, depth, base layer, block and spacing.
     {
-        static u32 s29_tic_logs = 0;
-        const u64 s29_addr = static_cast<u64>(config.Address());
-        const bool s29_probe_shape =
-            frame_tick > 1500 && s29_addr >= 0x516170000ull &&
-            s29_addr < 0x516180000ull && image_view_id != NULL_IMAGE_VIEW_ID &&
-            slot_image_views[image_view_id].size.width == 256 &&
-            slot_image_views[image_view_id].size.height == 256;
-        if (s29_tic_logs < 8 && s29_probe_shape) {
-            ++s29_tic_logs;
-            const ImageId s29_image_id = image_view_id != NULL_IMAGE_VIEW_ID
-                                             ? slot_image_views[image_view_id].image_id
-                                             : ImageId{};
-            LOG_WARNING(Render_D3D12,
-                        "S29 tic resolve: addr={:#x} hit={} img={} flags={:#x} tick={}",
-                        s29_addr, is_new ? 0 : 1, s29_image_id.index,
-                        s29_image_id ? static_cast<u32>(slot_images[s29_image_id].flags) : 0u,
-                        s29_image_id ? slot_images[s29_image_id].modification_tick : 0u);
+        static u32 s30_census_logs = 0;
+        static std::array<u64, 24> s30_seen_keys{};
+        const u64 s30_addr = static_cast<u64>(config.Address());
+        const u32 s30_type = static_cast<u32>(config.texture_type.Value());
+        const u32 s30_mipmax = config.max_mip_level.Value();
+        const u32 s30_depth = config.Depth();
+        const u32 s30_baselayer = config.BaseLayer();
+        const u32 s30_fmt = static_cast<u32>(config.format.Value());
+        const u32 s30_bw = config.block_width.Value();
+        const u32 s30_bh = config.block_height.Value();
+        const u32 s30_bd = config.block_depth.Value();
+        const u32 s30_spacing = config.tile_width_spacing.Value();
+        const bool s30_in_window = (s30_addr >= 0x516170000ull && s30_addr < 0x516180000ull) ||
+                                   (s30_addr >= 0x516480000ull && s30_addr < 0x516490000ull);
+        if (s30_census_logs < 24 && s30_in_window) {
+            const u64 s30_key = s30_addr | (static_cast<u64>(s30_mipmax) << 40) |
+                                (static_cast<u64>(s30_type) << 44) |
+                                (static_cast<u64>(s30_depth) << 48) |
+                                (static_cast<u64>(s30_baselayer) << 52);
+            const bool s30_is_new_key =
+                std::find(s30_seen_keys.begin(), s30_seen_keys.begin() + s30_census_logs,
+                          s30_key) == s30_seen_keys.begin() + s30_census_logs;
+            if (s30_is_new_key) {
+                s30_seen_keys[s30_census_logs] = s30_key;
+                ++s30_census_logs;
+                const ImageId s30_image_id = image_view_id != NULL_IMAGE_VIEW_ID
+                                                 ? slot_image_views[image_view_id].image_id
+                                                 : ImageId{};
+                LOG_WARNING(Render_D3D12,
+                            "S30 tic census #{}: addr={:#x} type={} mipmax={} depth={} "
+                            "baselayer={} fmt={:#x} blk={}/{}/{} sp={} -> hit={} img={} "
+                            "lv={} lay={} sz={}",
+                            s30_census_logs, s30_addr, s30_type, s30_mipmax, s30_depth,
+                            s30_baselayer, s30_fmt, s30_bw, s30_bh, s30_bd, s30_spacing,
+                            is_new ? 0 : 1, s30_image_id.index,
+                            s30_image_id ? slot_images[s30_image_id].info.resources.levels : 0u,
+                            s30_image_id ? slot_images[s30_image_id].info.resources.layers : 0u,
+                            s30_image_id ? slot_images[s30_image_id].guest_size_bytes : 0u);
+            }
         }
     }
     return image_view_id;
