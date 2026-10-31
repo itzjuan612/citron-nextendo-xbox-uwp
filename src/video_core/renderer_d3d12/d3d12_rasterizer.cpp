@@ -6119,6 +6119,11 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     m_device.GetDevice(), m_command_list, s19_sv.Resource(),
                                     static_cast<u32>(s19_sv.format),
                                     static_cast<u64>(s19_sv.GpuAddr()), 946000u, true);
+                                // S30: layer 0 mips 1-5 of the same image (949xxx band).
+                                (void)D3D12::RecordTextureContentDump(
+                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                    static_cast<u32>(s19_sv.format),
+                                    static_cast<u64>(s19_sv.GpuAddr()), 949000u, true);
                             }
                         }
                     }

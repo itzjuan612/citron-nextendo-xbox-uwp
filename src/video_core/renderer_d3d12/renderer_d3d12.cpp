@@ -1502,6 +1502,21 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
             (void)arm_layer(0, 3, s26_mip_base + 3);
         }
     }
+    // S30: the 949xxx band arms layer 0's mips 1-5 of a small array. The environment-probe cube
+    // the bake samples reads its faces through a 6-level descriptor while the guest only ever
+    // renders 256x256 surfaces at +k*0x80000; if this band's mips come back non-zero the guest
+    // really does use the strided layout, if they are zero it never writes the chain at all.
+    if (image_index >= 949000u && image_index < 950000u && desc.DepthOrArraySize >= 1 &&
+        desc.Width <= 512 && desc.Height <= 512) {
+        static u32 s30_mip_dumps = 0;
+        if (s30_mip_dumps < 2) {
+            ++s30_mip_dumps;
+            const u32 s30_mip_base = image_index + s30_mip_dumps * 10u;
+            for (u32 s30_mip = 1; s30_mip < 6; ++s30_mip) {
+                (void)arm_layer(0, s30_mip, s30_mip_base + s30_mip);
+            }
+        }
+    }
     return true;
 }
 
