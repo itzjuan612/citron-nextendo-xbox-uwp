@@ -1619,6 +1619,52 @@ ImageViewId TextureCache<P>::FindImageView(const TICEntry& config) {
             }
         }
     }
+    // S30 FIX CANDIDATE (kS30FlatArrayFallback): the guest lays the environment probe out as a
+    // LEVEL-0-ONLY array - six 256x256 faces at +k*0x80000, nothing at +k*0xAC000 and nothing in
+    // the mip chain - while the sampling descriptor declares 6 levels, so the 6-level image only
+    // ever receives face 0 and the cube samples 5/6 black. When a flat, GPU-authored array with
+    // the requested layer count exists at the same base, serve the sample from it instead. The
+    // view keeps the descriptor's shape, so the shader is unchanged; only the data it reads moves.
+    static constexpr bool kS30FlatArrayFallback = true;
+    if (kS30FlatArrayFallback && image_view_id != NULL_IMAGE_VIEW_ID) {
+        const ImageInfo s30_req(config);
+        if (s30_req.resources.layers > 1 && s30_req.resources.levels > 1) {
+            const GPUVAddr s30_base =
+                config.Address() - static_cast<u64>(config.BaseLayer()) * s30_req.layer_stride;
+            const auto s30_alloc_it = image_allocs_table.find(s30_base);
+            if (s30_alloc_it != image_allocs_table.end()) {
+                for (const ImageId id : slot_image_allocs[s30_alloc_it->second].images) {
+                    const ImageBase& s30_flat = slot_images[id];
+                    if (s30_flat.gpu_addr != s30_base || s30_flat.info.resources.levels != 1 ||
+                        s30_flat.info.resources.layers < s30_req.resources.layers ||
+                        False(s30_flat.flags & ImageFlagBits::GpuModified)) {
+                        continue;
+                    }
+                    const auto s30_flat_base = s30_flat.TryFindBase(config.Address());
+                    if (!s30_flat_base.has_value()) {
+                        continue;
+                    }
+                    static u32 s30_fallback_logs = 0;
+                    if (s30_fallback_logs < 8) {
+                        ++s30_fallback_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S30 flat fallback #{}: addr={:#x} lv={} lay={} -> img={} "
+                                    "lv=1 lay={} sz={} base=({},{})",
+                                    s30_fallback_logs, static_cast<u64>(config.Address()),
+                                    s30_req.resources.levels, s30_req.resources.layers, id.index,
+                                    s30_flat.info.resources.layers, s30_flat.guest_size_bytes,
+                                    s30_flat_base->level, s30_flat_base->layer);
+                    }
+                    ImageViewInfo s30_flat_view{config, static_cast<s32>(s30_flat_base->layer)};
+                    // The flat array holds ONE level; a view advertising the descriptor's six
+                    // would be an invalid SRV (mip count beyond the resource) and removes the
+                    // device (observed 1.0.431: hr=0x887a0005 ~15 s after the first substitution).
+                    s30_flat_view.range.extent.levels = 1;
+                    return FindOrEmplaceImageView(id, s30_flat_view);
+                }
+            }
+        }
+    }
     return image_view_id;
 }
 
