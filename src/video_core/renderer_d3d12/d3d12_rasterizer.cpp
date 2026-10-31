@@ -7133,6 +7133,26 @@ void RasterizerD3D12::DispatchCompute() {
                     qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(), kind, static_cast<u64>(gpu),
                     size);
             };
+            const auto s30_compute_log = [&](const char* kind, u64 gpu, u64 size) {
+                // S30: does a dispatch write the environment-probe window? The strided cube the
+                // six-face bake samples is never filled by a draw, no blit targets it and no
+                // cache copy does either - a compute UAV write is the remaining writer class.
+                static u32 s30_probe_compute_logs = 0;
+                if (s30_probe_compute_logs >= 24) {
+                    return;
+                }
+                ++s30_probe_compute_logs;
+                LOG_WARNING(Render_D3D12,
+                            "S30 probe compute #{}: program={:#x} grid=({},{},{}) kind={} "
+                            "gpu={:#x} size={}",
+                            s30_probe_compute_logs, static_cast<u64>(qmd.program_start),
+                            qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(),
+                            qmd.grid_dim_z.Value(), kind, static_cast<u64>(gpu), size);
+            };
+            const auto s30_compute_hits = [](GPUVAddr gpu, u64 size) {
+                const u64 s30_end = gpu + (size != 0 ? size : 1);
+                return gpu < 0x5165c0000ull && s30_end > 0x516170000ull;
+            };
             // S21 cycle 11: own budget so the S15/S17 early-break cannot hide a c9 writer.
             static u32 s21_c9_compute_logs = 0;
             for (const auto& desc : info.storage_buffers_descriptors) {
@@ -7152,6 +7172,9 @@ void RasterizerD3D12::DispatchCompute() {
                 }
                 if (s17_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
                     s17_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
+                }
+                if (s30_compute_hits(s15_ssbo_gpu, s15_ssbo_size)) {
+                    s30_compute_log("ssbo", s15_ssbo_gpu, s15_ssbo_size);
                 }
                 // S21 cycle 11: does any dispatch write the character PS's c9 table?
                 {
@@ -7202,6 +7225,9 @@ void RasterizerD3D12::DispatchCompute() {
                 }
                 if (s17_compute_hits(s15_gpu, 0)) {
                     s17_compute_log("img", s15_gpu, 0);
+                }
+                if (s30_compute_hits(s15_gpu, 0)) {
+                    s30_compute_log("img", s15_gpu, 0);
                 }
                 // S17 cycle 5 (Phase 0.2): name a compute writer of the 1x1 exposure input.
                 // S18 cycle 3: widened from 1x1 to the whole exposure family - a compute pass

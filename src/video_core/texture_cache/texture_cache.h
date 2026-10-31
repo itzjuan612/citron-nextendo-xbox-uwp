@@ -1720,6 +1720,28 @@ ImageId TextureCache<P>::FindImage(const ImageInfo& info, GPUVAddr gpu_addr,
     if (image_ids.empty()) {
         return image_id;
     }
+    // S30 DISCRIMINATOR (kS30PreferFlatProbe): the environment-probe VA family holds two cubes -
+    // a 6-level 0xAC000 one (only layer 0 ever written) and a 1-level 0x80000 one that receives
+    // all six rendered faces. `IsSubresource` rejects the flat array for a 6-level request, so
+    // this scans the allocation instead of the accepted pool: it answers "is the flat array the
+    // content the bake is supposed to read". Flip to false to revert.
+    static constexpr bool kS30PreferFlatProbe = false;
+    if (kS30PreferFlatProbe) {
+        const u64 s30_family = static_cast<u64>(gpu_addr);
+        if (s30_family >= 0x516170000ull && s30_family < 0x516180000ull) {
+            const auto s30_alloc_it = image_allocs_table.find(gpu_addr);
+            if (s30_alloc_it != image_allocs_table.end()) {
+                for (const ImageId id : slot_image_allocs[s30_alloc_it->second].images) {
+                    const ImageBase& s30_flat = slot_images[id];
+                    if (s30_flat.gpu_addr == gpu_addr && s30_flat.info.resources.levels == 1 &&
+                        s30_flat.info.resources.layers > 1 &&
+                        True(s30_flat.flags & ImageFlagBits::GpuModified)) {
+                        return id;
+                    }
+                }
+            }
+        }
+    }
     // Exact-format matches win when the caller did not relax the format; among the pool, a
     // pending guest upload (CpuModified) is the freshest guest intent, then the newest GPU
     // modification tick.
@@ -2579,6 +2601,29 @@ std::optional<typename TextureCache<P>::BlitImages> TextureCache<P>::GetBlitImag
             dst_id = FindOrInsertImage(dst_info, dst_addr, RelaxedOptions{});
         } while (has_deleted_images);
     }
+    // S30 probe (bounded 32): 2D-engine blits whose destination is the environment-probe window.
+    // The flat capture cube is filled by draws while the strided env probe the bake samples stays
+    // empty, so a flat->strided transfer has to exist somewhere; if it is a 2D blit, this names
+    // the image it lands in.
+    {
+        static u32 s30_blit_logs = 0;
+        const u64 s30_blit_dst = static_cast<u64>(dst_image.gpu_addr);
+        if (s30_blit_logs < 32 && s30_blit_dst >= 0x516170000ull &&
+            s30_blit_dst < 0x5165c0000ull) {
+            ++s30_blit_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S30 blit -> probe: dst_va={:#x} req={}x{} lv={} lay={} fmt={:#x} -> "
+                        "img={} gpu={:#x} sz={} lv={} lay={} | src_va={:#x} {}x{} -> img={} "
+                        "gpu={:#x} sz={}",
+                        static_cast<u64>(dst_addr), dst_info.size.width, dst_info.size.height,
+                        dst_info.resources.levels, dst_info.resources.layers,
+                        static_cast<u32>(dst_info.format), dst_id.index, s30_blit_dst,
+                        dst_image.guest_size_bytes, dst_image.info.resources.levels,
+                        dst_image.info.resources.layers, static_cast<u64>(src_addr),
+                        src_info.size.width, src_info.size.height, src_id.index,
+                        static_cast<u64>(src_image.gpu_addr), src_image.guest_size_bytes);
+        }
+    }
     return {BlitImages{
         .dst_id = dst_id,
         .src_id = src_id,
@@ -3350,11 +3395,14 @@ void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     {
         static u32 s29_mark_logs = 0;
         const u64 s29_gpu = static_cast<u64>(image.gpu_addr);
-        if (s29_mark_logs < 12 && s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
+        if (s29_mark_logs < 16 && image.info.resources.layers > 1 &&
+            s29_gpu >= 0x516170000ull && s29_gpu < 0x516180000ull) {
             ++s29_mark_logs;
-            LOG_WARNING(Render_D3D12, "S29 mark: gpu={:#x} {}x{} l={} fmt={:#x} tick={}", s29_gpu,
+            LOG_WARNING(Render_D3D12,
+                        "S29 mark: gpu={:#x} {}x{} lv={} lay={} sz={} fmt={:#x} tick={}", s29_gpu,
                         image.info.size.width, image.info.size.height,
-                        image.info.resources.layers, static_cast<u32>(image.info.format),
+                        image.info.resources.levels, image.info.resources.layers,
+                        image.guest_size_bytes, static_cast<u32>(image.info.format),
                         image.modification_tick);
         }
     }
