@@ -6141,14 +6141,62 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             // six fills paint nothing while their cube has content, so the
                             // shader's table/constant inputs are the remaining suspects.
                             static u32 s30_table_dumps = 0;
-                            if (s30_table_dumps < 2 &&
+                            if (s30_table_dumps < 16 &&
                                 static_cast<u64>(s19_sv.GpuAddr()) == 0x5d0630800ull) {
                                 ++s30_table_dumps;
-                                (void)D3D12::RecordTextureContentDump(
-                                    m_device.GetDevice(), m_command_list, s19_sv.Resource(),
-                                    static_cast<u32>(s19_sv.format),
-                                    static_cast<u64>(s19_sv.GpuAddr()),
-                                    953000u + s30_table_dumps, true);
+                                // S30 DISCRIMINATOR (kS30ConstantTable): the six-face bake
+                                // multiplies by this 256x4 table and the table is zero, so every
+                                // fill writes zero. Fill it with 1.0 and watch the bank: if the
+                                // bank lights, the empty table IS the blocker; if it stays dark,
+                                // the bake has another defect and the table is a red herring.
+                                static constexpr bool kS30ConstantTable = true;
+                                static u32 s30_table_fills = 0;
+                                if (kS30ConstantTable && s30_table_fills < 8 &&
+                                    s19_sv.Resource() != nullptr) {
+                                    ++s30_table_fills;
+                                    static ID3D12DescriptorHeap* s30_table_heap = nullptr;
+                                    if (s30_table_heap == nullptr) {
+                                        D3D12_DESCRIPTOR_HEAP_DESC s30_hd{};
+                                        s30_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+                                        s30_hd.NumDescriptors = 1;
+                                        m_device.GetDevice()->CreateDescriptorHeap(
+                                            &s30_hd, IID_PPV_ARGS(&s30_table_heap));
+                                    }
+                                    if (s30_table_heap != nullptr) {
+                                        const D3D12_RESOURCE_DESC s30_tdesc =
+                                            s19_sv.Resource()->GetDesc();
+                                        D3D12_RENDER_TARGET_VIEW_DESC s30_trd{};
+                                        s30_trd.Format = s30_tdesc.Format;
+                                        s30_trd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                                        s30_trd.Texture2D.MipSlice = 0;
+                                        s30_trd.Texture2D.PlaneSlice = 0;
+                                        const D3D12_CPU_DESCRIPTOR_HANDLE s30_trtv =
+                                            s30_table_heap->GetCPUDescriptorHandleForHeapStart();
+                                        m_device.GetDevice()->CreateRenderTargetView(
+                                            s19_sv.Resource(), &s30_trd, s30_trtv);
+                                        m_command_list.Transition(
+                                            s19_sv.Resource(), D3D12_RESOURCE_STATE_COMMON,
+                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
+                                        const f32 s30_tclear[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+                                        m_command_list.ClearRenderTargetView(s30_trtv, s30_tclear);
+                                        m_command_list.Transition(
+                                            s19_sv.Resource(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            D3D12_RESOURCE_STATE_COMMON);
+                                        LOG_WARNING(Render_D3D12,
+                                                    "S30 constant table #{}: img={} {}x{} "
+                                                    "dxgi={:#x} -> (1,1,1,1)",
+                                                    s30_table_fills, s19_sv.image_id.index,
+                                                    s19_sv.size.width, s19_sv.size.height,
+                                                    static_cast<u32>(s30_tdesc.Format));
+                                    }
+                                }
+                                if (s30_table_dumps <= 2) {
+                                    (void)D3D12::RecordTextureContentDump(
+                                        m_device.GetDevice(), m_command_list, s19_sv.Resource(),
+                                        static_cast<u32>(s19_sv.format),
+                                        static_cast<u64>(s19_sv.GpuAddr()),
+                                        953000u + s30_table_dumps, true);
+                                }
                                 // S30: is the guest memory behind the table actually empty, or did
                                 // an upload get dropped? The image is zero while the guest mapped a
                                 // 0x10000 buffer at cpu 0xbaec8000, so read the first words.
