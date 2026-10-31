@@ -2684,6 +2684,26 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         return NULL_IMAGE_VIEW_ID;
     }
     Image& image = slot_images[image_id];
+    // S30 probe (bounded 40): which subresource the guest renders into inside the environment-
+    // probe window. Excludes the bare base VA: at boot that VA hosts a 640x360 screen target
+    // (img 3928) whose binds ate the whole budget, so this only sees OFFSET binds - the +k*0x80000
+    // face slots and the +k*0xAC000 strided layers.
+    {
+        static u32 s30_rt_logs = 0;
+        const u64 s30_g = static_cast<u64>(gpu_addr);
+        if (s30_rt_logs < 40 && s30_g > 0x516170000ull && s30_g < 0x5165c0000ull) {
+            ++s30_rt_logs;
+            const auto s30_base = image.TryFindBase(gpu_addr);
+            LOG_WARNING(Render_D3D12,
+                        "S30 RT resolve #{}: va={:#x} rt={}x{} lv={} lay={} -> img={} gpu={:#x} "
+                        "sz={} lv={} lay={} base=({},{})",
+                        s30_rt_logs, s30_g, info.size.width, info.size.height,
+                        info.resources.levels, info.resources.layers, image_id.index,
+                        static_cast<u64>(image.gpu_addr), image.guest_size_bytes,
+                        image.info.resources.levels, image.info.resources.layers,
+                        s30_base ? s30_base->level : -1, s30_base ? s30_base->layer : -1);
+        }
+    }
     // S26 DIAGNOSTIC (bounded 24): the bank's bake renders its mip chain with draws at the
     // mip-level VAs (128x128 at layer-0 mip-1's VA etc. - the fill census #7-15). The 948xxx
     // dumps proved the bank's mips stayed black, so log what each bank-window RT resolves to:
@@ -3553,6 +3573,35 @@ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<Imag
                         s22_first ? s22_first->src_offset.x : 0,
                         s22_first ? s22_first->src_offset.y : 0,
                         s22_first ? s22_first->src_offset.z : 0);
+        }
+    }
+    // S30 probe (bounded 24): cache copies INTO the exact array the six-face bake samples. The
+    // 0x516480000 array receives mip-tail copies at dst_sub=(level 6..8, layer 0..5); if this one
+    // never does, its faces 1-5 have no writer at all.
+    {
+        static u32 s30_copy_logs = 0;
+        const u64 s30_copy_dst = static_cast<u64>(dst.gpu_addr);
+        if (s30_copy_logs < 24 && s30_copy_dst == 0x516170000ull) {
+            ++s30_copy_logs;
+            const ImageCopy* s30_first = copies.empty() ? nullptr : &copies.front();
+            LOG_WARNING(Render_D3D12,
+                        "S30 copy -> probe: dst={} gpu={:#x} sz={} lv={} lay={} src={} "
+                        "gpu={:#x} {}x{} lv={} copies={} dst_off=({},{},{}) ext=({},{},{}) "
+                        "src_sub=({},{}) dst_sub=({},{})",
+                        dst_id.index, s30_copy_dst, dst.guest_size_bytes,
+                        dst.info.resources.levels, dst.info.resources.layers, src_id.index,
+                        static_cast<u64>(src.gpu_addr), src.info.size.width, src.info.size.height,
+                        src.info.resources.levels, copies.size(),
+                        s30_first ? s30_first->dst_offset.x : 0,
+                        s30_first ? s30_first->dst_offset.y : 0,
+                        s30_first ? s30_first->dst_offset.z : 0,
+                        s30_first ? s30_first->extent.width : 0,
+                        s30_first ? s30_first->extent.height : 0,
+                        s30_first ? s30_first->extent.depth : 0,
+                        s30_first ? s30_first->src_subresource.base_level : 0,
+                        s30_first ? s30_first->src_subresource.base_layer : 0,
+                        s30_first ? s30_first->dst_subresource.base_level : 0,
+                        s30_first ? s30_first->dst_subresource.base_layer : 0);
         }
     }
     // TEMP DIAGNOSTIC (S18, Phase 0.2.1): a copy with a 1x1 side is a candidate writer (alias

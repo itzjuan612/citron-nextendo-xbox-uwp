@@ -48,7 +48,7 @@ ImageInfo::ImageInfo(const TICEntry& config) noexcept {
     const u64 s30_tic_addr = static_cast<u64>(config.Address());
     if (kS30ProbeCubeOneLevelByAddress && config.max_mip_level > 0 &&
         config.Width() == 256 && config.Height() == 256 &&
-        (s30_tic_addr == 0x516170000ull || s30_tic_addr == 0x516480000ull)) {
+        s30_tic_addr == 0x516170000ull) {
         resources.levels = 1;
     }
     if (kS30ProbeCubeOneLevel && config.max_mip_level > 0 && config.Width() == 256 &&
