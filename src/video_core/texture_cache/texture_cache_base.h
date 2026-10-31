@@ -260,6 +260,11 @@ public:
     /// Prepare an image to be used
     void PrepareImage(ImageId image_id, bool is_modification, bool invalidate);
 
+    /// S30 DISCRIMINATOR: overwrite the image's guest bytes with a constant word and force a
+    /// re-upload, so "does non-zero content here change the result" can be answered without
+    /// touching GPU resource states (an in-frame RTV clear of a bound SRV removed the device).
+    void ForceConstantUpload(ImageId image_id, u32 pattern);
+
     mutable std::recursive_mutex mutex;
 
 private:

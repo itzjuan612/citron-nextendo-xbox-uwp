@@ -6154,41 +6154,15 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 if (kS30ConstantTable && s30_table_fills < 8 &&
                                     s19_sv.Resource() != nullptr) {
                                     ++s30_table_fills;
-                                    static ID3D12DescriptorHeap* s30_table_heap = nullptr;
-                                    if (s30_table_heap == nullptr) {
-                                        D3D12_DESCRIPTOR_HEAP_DESC s30_hd{};
-                                        s30_hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-                                        s30_hd.NumDescriptors = 1;
-                                        m_device.GetDevice()->CreateDescriptorHeap(
-                                            &s30_hd, IID_PPV_ARGS(&s30_table_heap));
-                                    }
-                                    if (s30_table_heap != nullptr) {
-                                        const D3D12_RESOURCE_DESC s30_tdesc =
-                                            s19_sv.Resource()->GetDesc();
-                                        D3D12_RENDER_TARGET_VIEW_DESC s30_trd{};
-                                        s30_trd.Format = s30_tdesc.Format;
-                                        s30_trd.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-                                        s30_trd.Texture2D.MipSlice = 0;
-                                        s30_trd.Texture2D.PlaneSlice = 0;
-                                        const D3D12_CPU_DESCRIPTOR_HANDLE s30_trtv =
-                                            s30_table_heap->GetCPUDescriptorHandleForHeapStart();
-                                        m_device.GetDevice()->CreateRenderTargetView(
-                                            s19_sv.Resource(), &s30_trd, s30_trtv);
-                                        m_command_list.Transition(
-                                            s19_sv.Resource(), D3D12_RESOURCE_STATE_COMMON,
-                                            D3D12_RESOURCE_STATE_RENDER_TARGET);
-                                        const f32 s30_tclear[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-                                        m_command_list.ClearRenderTargetView(s30_trtv, s30_tclear);
-                                        m_command_list.Transition(
-                                            s19_sv.Resource(), D3D12_RESOURCE_STATE_RENDER_TARGET,
-                                            D3D12_RESOURCE_STATE_COMMON);
-                                        LOG_WARNING(Render_D3D12,
-                                                    "S30 constant table #{}: img={} {}x{} "
-                                                    "dxgi={:#x} -> (1,1,1,1)",
-                                                    s30_table_fills, s19_sv.image_id.index,
-                                                    s19_sv.size.width, s19_sv.size.height,
-                                                    static_cast<u32>(s30_tdesc.Format));
-                                    }
+                                    // Guest-memory fill + forced re-upload. Clearing the resource
+                                    // directly here removed the device: it is bound as an SRV in
+                                    // the very command list being recorded.
+                                    m_texture_cache.ForceConstantUpload(s19_sv.image_id,
+                                                                        0x3F800000u);
+                                    LOG_WARNING(Render_D3D12,
+                                                "S30 constant table #{}: img={} {}x{} -> 1.0f",
+                                                s30_table_fills, s19_sv.image_id.index,
+                                                s19_sv.size.width, s19_sv.size.height);
                                 }
                                 if (s30_table_dumps <= 2) {
                                     (void)D3D12::RecordTextureContentDump(

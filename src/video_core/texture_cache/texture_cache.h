@@ -760,8 +760,42 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 }
 
 template <class P>
-void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
-    boost::container::small_vector<ImageId, 16> images;
+void TextureCache<P>::ForceConstantUpload(ImageId image_id, u32 pattern) {
+    if (!image_id) {
+        return;
+    }
+    Image& image = slot_images[image_id];
+    if (image.guest_size_bytes == 0 || image.guest_size_bytes > (4u << 20)) {
+        return;
+    }
+    std::vector<u32> words(image.guest_size_bytes / sizeof(u32), pattern);
+    gpu_memory->WriteBlock(image.gpu_addr, words.data(), words.size() * sizeof(u32),
+                           VideoCommon::CacheType::NoTextureCache);
+    u32 s30_after_write[2]{};
+    gpu_memory->ReadBlock(image.gpu_addr, s30_after_write, sizeof(s30_after_write),
+                          VideoCommon::CacheType::NoTextureCache);
+    LOG_WARNING(Render_D3D12,
+                "S30 force upload: img={} gpu={:#x} sz={} lv={} flags={:#x} words_after_write="
+                "{:08x} {:08x}",
+                image_id.index, static_cast<u64>(image.gpu_addr), image.guest_size_bytes,
+                image.info.resources.levels, static_cast<u32>(image.flags), s30_after_write[0],
+                s30_after_write[1]);
+    image.flags |= ImageFlagBits::CpuModified;
+    image.flags &= ~ImageFlagBits::GpuModified;
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    RefreshContents(image, image_id);
+    u32 s30_after_upload[2]{};
+    gpu_memory->ReadBlock(image.gpu_addr, s30_after_upload, sizeof(s30_after_upload),
+                          VideoCommon::CacheType::NoTextureCache);
+    LOG_WARNING(Render_D3D12, "S30 force upload done: img={} flags={:#x} words={:08x} {:08x}",
+                image_id.index, static_cast<u32>(image.flags), s30_after_upload[0],
+                s30_after_upload[1]);
+}
+
+template <class P>
+void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {    boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [&images](ImageId image_id, ImageBase& image) {
         if (!image.IsSafeDownload()) {
             return;
@@ -1327,6 +1361,18 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
 
 template <class P>
 void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
+    // S30: the forced constant upload for the bake's 256x4 table never took effect while the
+    // guest bytes demonstrably held 1.0f, so log the entry state of that image to see where this
+    // function bails. Bounded 8.
+    {
+        static u32 s30_refresh_logs = 0;
+        if (s30_refresh_logs < 8 && static_cast<u64>(image.gpu_addr) == 0x5d0630800ull) {
+            ++s30_refresh_logs;
+            LOG_WARNING(Render_D3D12, "S30 refresh entry: img={} flags={:#x} sz={} cpu_mod={}",
+                        image_id.index, static_cast<u32>(image.flags), image.guest_size_bytes,
+                        True(image.flags & ImageFlagBits::CpuModified) ? 1 : 0);
+        }
+    }
     if (False(image.flags & ImageFlagBits::CpuModified)) {
         // Only upload modified images
         return;
