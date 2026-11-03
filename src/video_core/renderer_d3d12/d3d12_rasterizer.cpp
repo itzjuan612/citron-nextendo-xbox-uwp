@@ -2483,6 +2483,7 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
         static u32 s31_dumps = 0;
         static std::array<u32, 16> s31_seen_ids{};
         static u32 s31_seen_count = 0;
+        static u32 s31_cb_logs = 0;
         const u64 s31_rt_gpu =
             (num_rtvs > 0 && framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr)
                 ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
@@ -2560,6 +2561,34 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                     s31_id, static_cast<u64>(s31_sv.GpuAddr()),
                                     s31_sv.size.width, s31_sv.size.height,
                                     static_cast<u32>(s31_sv.format));
+                    }
+                }
+            }
+            // S31: the character draw's lighting constants. The body reads dark while the hair is
+            // bright under the same frame, and a flat bank lights it, so the remaining suspect is
+            // a uniform the body's shader needs (key-light direction/intensity or the colour
+            // table selector). Read the guest memory the CBVs were built from; bounded 8.
+            if (s31_verts == 309 && s31_cb_logs < 8) {
+                for (size_t s31_stage = 0; s31_stage < VideoCommon::NUM_STAGES; ++s31_stage) {
+                    if (stored.infos[s31_stage] == nullptr) {
+                        continue;
+                    }
+                    for (u32 s31_idx = 0; s31_idx < 16 && s31_cb_logs < 8; ++s31_idx) {
+                        const auto [s31_dev, s31_size] =
+                            m_buffer_cache.GetGraphicsUniformBinding(s31_stage, s31_idx);
+                        if (s31_size < 32) {
+                            continue;
+                        }
+                        std::array<f32, 8> s31_vals{};
+                        gpu_memory->ReadBlock(s31_dev, s31_vals.data(), sizeof(s31_vals),
+                                              VideoCommon::CacheType::NoTextureCache);
+                        ++s31_cb_logs;
+                        LOG_WARNING(Render_D3D12,
+                                    "S31 cbv #{}: stage={} idx={} addr={:#x} size={} "
+                                    "f=({:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f})",
+                                    s31_cb_logs, s31_stage, s31_idx, s31_dev, s31_size,
+                                    s31_vals[0], s31_vals[1], s31_vals[2], s31_vals[3],
+                                    s31_vals[4], s31_vals[5], s31_vals[6], s31_vals[7]);
                     }
                 }
             }

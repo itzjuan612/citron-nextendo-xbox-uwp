@@ -232,6 +232,12 @@ public:
 
     void DisableGraphicsUniformBuffer(size_t stage, u32 index);
 
+    /// S31 diagnostic: guest-side address and declared size of a bound graphics uniform buffer.
+    /// The character draw's lighting constants are not readable through the D3D12 CBV (the
+    /// backing resource lives in a default heap), so expose the guest mapping the CBV was built
+    /// from and let the caller read the constants out of guest memory instead.
+    [[nodiscard]] std::pair<DAddr, u32> GetGraphicsUniformBinding(size_t stage, u32 index) const;
+
     void UpdateGraphicsBuffers(bool is_indexed);
 
     void UpdateComputeBuffers();

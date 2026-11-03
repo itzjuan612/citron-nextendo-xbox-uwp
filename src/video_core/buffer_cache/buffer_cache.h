@@ -342,6 +342,15 @@ void BufferCache<P>::DisableGraphicsUniformBuffer(size_t stage, u32 index) {
 }
 
 template <class P>
+std::pair<DAddr, u32> BufferCache<P>::GetGraphicsUniformBinding(size_t stage, u32 index) const {
+    if (stage >= NUM_STAGES || index >= NUM_GRAPHICS_UNIFORM_BUFFERS) {
+        return {0, 0};
+    }
+    const Binding& binding = channel_state->uniform_buffers[stage][index];
+    return {binding.device_addr, binding.size};
+}
+
+template <class P>
 void BufferCache<P>::UpdateGraphicsBuffers(bool is_indexed) {
     do {
         channel_state->has_deleted_buffers = false;
