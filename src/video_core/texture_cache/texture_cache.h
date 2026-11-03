@@ -1408,8 +1408,31 @@ void TextureCache<P>::RefreshContents(Image& image, ImageId image_id) {
         QueueAsyncDecode(image, image_id);
         return;
     }
-    auto staging = runtime.UploadStagingBuffer(MapSizeBytes(image));
-    if (!staging.buffer || staging.mapped_span.size() < image.guest_size_bytes) {
+    // S31: the staging buffer only ever holds the upload's OWN bytes - MapSizeBytes(image), the
+    // tightly packed (or converted) size - never the guest's level-aligned footprint. Comparing
+    // the mapped size against guest_size_bytes rejected every image whose aligned guest layout is
+    // larger than its packed data, and the skip path below re-sets CpuModified and untracks the
+    // image, so such an image never uploaded and retried forever. Measured on the bake's 256x4
+    // constant table (S30y/z/aa): req 4096 vs guest 8192, flags back to 0x64 after the call, no
+    // upload line, no S27m line (its 24-line budget was spent at boot) - and the resource stayed
+    // zero while the guest bytes held 1.0f. Compare against the size we actually asked for.
+    const u32 upload_size = MapSizeBytes(image);
+    auto staging = runtime.UploadStagingBuffer(upload_size);
+    {
+        // S30/S31 oracle: the same image's decision, with the three sizes that decide it. The
+        // flags here are AFTER the CpuModified clear + TrackImage above, so a successful upload
+        // must leave 0x70 (Tracked) and a skip leaves 0x64 (skip re-sets CpuModified, untracks).
+        static u32 s30_stage_logs = 0;
+        if (s30_stage_logs < 8 && static_cast<u64>(image.gpu_addr) == 0x5d0630800ull) {
+            ++s30_stage_logs;
+            LOG_WARNING(Render_D3D12,
+                        "S30 refresh staging: img={} flags={:#x} req={} guest={} have={} ok={}",
+                        image_id.index, static_cast<u32>(image.flags), upload_size,
+                        image.guest_size_bytes, staging.mapped_span.size(),
+                        (staging.buffer && staging.mapped_span.size() >= upload_size) ? 1 : 0);
+        }
+    }
+    if (!staging.buffer || staging.mapped_span.size() < upload_size) {
         // S27m: commit exhaustion - an empty staging ref here used to flow into
         // UploadMemory and memcpy to a null mapping (the 2.2 h overnight crash). The
         // dirty mark is cleared and the image tracked at the top of this function, so
