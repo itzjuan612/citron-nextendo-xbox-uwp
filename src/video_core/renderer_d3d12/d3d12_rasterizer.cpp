@@ -2488,19 +2488,26 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             (num_rtvs > 0 && framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr)
                 ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
                 : 0ull;
-        if (g_s18_guest_frames >= 4700 && g_s18_guest_frames <= 5200) {
+        // Gate on the draw's SHAPE, not on a guest-frame window: gf 4700 arrived at t=433 in one
+        // run (boot draws) and at t=833 in another, so a fixed window censuses the wrong phase and
+        // the character draw slips through. The character is the draw binding many constant
+        // buffers (skinning + material); the boot LUT passes bind 1-3.
+        if (cbv_records.size() >= 6) {
             u64 s31_first_gpu = 0;
             u32 s31_sampled = 0;
+            bool s31_samples_bank = false;
             for (const DrawSlot& s31_slot : res_slots) {
                 if (s31_slot.kind != SlotKind::Sampled) {
                     continue;
                 }
                 ++s31_sampled;
-                if (s31_first_gpu == 0) {
-                    ImageView& s31_sv0 = m_texture_cache.GetImageView(s31_slot.view);
-                    if (s31_sv0.Resource() != nullptr) {
-                        s31_first_gpu = static_cast<u64>(s31_sv0.GpuAddr());
-                    }
+                ImageView& s31_sv0 = m_texture_cache.GetImageView(s31_slot.view);
+                if (s31_sv0.Resource() != nullptr &&
+                    s31_sv0.GpuAddr() == 0x5eb340000ull) {
+                    s31_samples_bank = true;
+                }
+                if (s31_first_gpu == 0 && s31_sv0.Resource() != nullptr) {
+                    s31_first_gpu = static_cast<u64>(s31_sv0.GpuAddr());
                 }
             }
             const u32 s31_verts = params.num_vertices;
@@ -2567,29 +2574,50 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             // S31: the character draw's lighting constants. The body reads dark while the hair is
             // bright under the same frame, and a flat bank lights it, so the remaining suspect is
             // a uniform the body's shader needs (key-light direction/intensity or the colour
-            // table selector). Read the guest memory the CBVs were built from; bounded 8.
-            if (s31_verts == 309 && s31_cb_logs < 8) {
-                for (size_t s31_stage = 0; s31_stage < VideoCommon::NUM_STAGES; ++s31_stage) {
-                    if (stored.infos[s31_stage] == nullptr) {
-                        continue;
+            // table selector). The guest CPU view of these buffers reads zero (the DAddr/GPUVAddr
+            // discrepancy proven on the bake's constant table), so try the D3D12 resource the CBV
+            // was built from: an UPLOAD-heap buffer is mappable, a DEFAULT-heap one is not and
+            // says a real readback is needed. Bounded 8.
+            if (s31_samples_bank && s31_cb_logs < 24) {
+                const auto& s31_bindings = m_runtime.GetResourceBindings();
+                u32 s31_draw_cbs = 0;
+                for (const u32 s31_rec_index : cbv_records) {
+                    if (s31_draw_cbs >= 8 || s31_cb_logs >= 24 ||
+                        s31_rec_index >= s31_bindings.size()) {
+                        break;
                     }
-                    for (u32 s31_idx = 0; s31_idx < 16 && s31_cb_logs < 8; ++s31_idx) {
-                        const auto [s31_dev, s31_size] =
-                            m_buffer_cache.GetGraphicsUniformBinding(s31_stage, s31_idx);
-                        if (s31_size < 32) {
-                            continue;
+                    ++s31_draw_cbs;
+                    const auto& s31_rec = s31_bindings[s31_rec_index];
+                    u32 s31_heap_type = ~u32{0};
+                    bool s31_mapped_ok = false;
+                    std::array<f32, 8> s31_vals{};
+                    if (s31_rec.resource != nullptr && s31_rec.size >= sizeof(s31_vals)) {
+                        D3D12_HEAP_PROPERTIES s31_props{};
+                        D3D12_HEAP_FLAGS s31_flags{};
+                        s31_rec.resource->GetHeapProperties(&s31_props, &s31_flags);
+                        s31_heap_type = static_cast<u32>(s31_props.Type);
+                        void* s31_mapped = nullptr;
+                        const D3D12_RANGE s31_range{
+                            static_cast<SIZE_T>(s31_rec.offset),
+                            static_cast<SIZE_T>(s31_rec.offset + sizeof(s31_vals))};
+                        if (SUCCEEDED(s31_rec.resource->Map(0, &s31_range, &s31_mapped)) &&
+                            s31_mapped != nullptr) {
+                            std::memcpy(s31_vals.data(),
+                                        static_cast<const u8*>(s31_mapped) + s31_rec.offset,
+                                        sizeof(s31_vals));
+                            s31_rec.resource->Unmap(0, nullptr);
+                            s31_mapped_ok = true;
                         }
-                        std::array<f32, 8> s31_vals{};
-                        gpu_memory->ReadBlock(s31_dev, s31_vals.data(), sizeof(s31_vals),
-                                              VideoCommon::CacheType::NoTextureCache);
-                        ++s31_cb_logs;
-                        LOG_WARNING(Render_D3D12,
-                                    "S31 cbv #{}: stage={} idx={} addr={:#x} size={} "
-                                    "f=({:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f})",
-                                    s31_cb_logs, s31_stage, s31_idx, s31_dev, s31_size,
-                                    s31_vals[0], s31_vals[1], s31_vals[2], s31_vals[3],
-                                    s31_vals[4], s31_vals[5], s31_vals[6], s31_vals[7]);
                     }
+                    ++s31_cb_logs;
+                    LOG_WARNING(Render_D3D12,
+                                "S31 cbv2 #{}: verts={} cbvs={} first={:#x} rec={} off={} "
+                                "size={} heap={} mapped={} "
+                                "f=({:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f})",
+                                s31_cb_logs, s31_verts, s31_cbvs, s31_first_gpu, s31_rec_index,
+                                s31_rec.offset, s31_rec.size, s31_heap_type, s31_mapped_ok ? 1 : 0,
+                                s31_vals[0], s31_vals[1], s31_vals[2], s31_vals[3], s31_vals[4],
+                                s31_vals[5], s31_vals[6], s31_vals[7]);
                 }
             }
         }
