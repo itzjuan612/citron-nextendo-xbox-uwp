@@ -38,6 +38,51 @@ u32 g_s23_va_track_next = 0;
 namespace D3D12 {
 
 namespace {
+
+// S31: GPU readback of the character draw's DEFAULT-heap constant buffers. Guest memory reads
+// zero for them (the DAddr/GPUVAddr discrepancy proven on the bake's constant table), so the
+// bound resource is copied into this READBACK buffer during the draw and logged after the frame
+// executes. One shot: two buffers, first 32 floats each.
+Microsoft::WRL::ComPtr<ID3D12Resource> g_s31_cb_readback;
+bool g_s31_cb_pending = false;
+u32 g_s31_cb_bytes = 0;
+u32 g_s31_cb_which = 0;
+u32 g_s31_cb_armed = 0;
+
+} // namespace
+
+bool S31CbReadbackPending() {
+    return g_s31_cb_pending;
+}
+
+void WriteS31CbReadback() {
+    if (!g_s31_cb_pending || !g_s31_cb_readback) {
+        g_s31_cb_pending = false;
+        return;
+    }
+    g_s31_cb_pending = false;
+    void* mapped = nullptr;
+    const D3D12_RANGE range{0, g_s31_cb_bytes};
+    if (FAILED(g_s31_cb_readback->Map(0, &range, &mapped)) || mapped == nullptr) {
+        LOG_WARNING(Render_D3D12, "S31 cbread #{}: Map failed", g_s31_cb_which);
+        return;
+    }
+    const f32* f = static_cast<const f32*>(mapped);
+    const u32 floats = std::min<u32>(g_s31_cb_bytes / sizeof(f32), 32);
+    for (u32 block = 0; block * 8 < floats; ++block) {
+        f32 v[8]{};
+        for (u32 i = 0; i < 8 && block * 8 + i < floats; ++i) {
+            v[i] = f[block * 8 + i];
+        }
+        LOG_WARNING(Render_D3D12,
+                    "S31 cbread #{} f{:02}: ({:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},{:.4f},"
+                    "{:.4f})",
+                    g_s31_cb_which, block * 8, v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+    }
+    g_s31_cb_readback->Unmap(0, nullptr);
+}
+
+namespace {
 // Draws re-enabled, guards active (no-vertex skip, depth-RTV skip, all-slots-bound guard, RT-format and index/vertex range validation).
 constexpr bool kSkipDraws = false;
 
@@ -2618,6 +2663,66 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 s31_rec.offset, s31_rec.size, s31_heap_type, s31_mapped_ok ? 1 : 0,
                                 s31_vals[0], s31_vals[1], s31_vals[2], s31_vals[3], s31_vals[4],
                                 s31_vals[5], s31_vals[6], s31_vals[7]);
+                }
+            }
+            // S31: the two 64 KB DEFAULT-heap constant buffers are the only unread part of the
+            // character's uniform set. Copy the first one into a READBACK buffer here;
+            // WriteS31CbReadback logs the first 32 floats once the frame's list has executed.
+            // One shot: enough to tell a light list from padding.
+            if (s31_samples_bank && g_s31_cb_armed < 1) {
+                const auto& s31_bindings_rb = m_runtime.GetResourceBindings();
+                for (const u32 s31_rec_index : cbv_records) {
+                    if (g_s31_cb_armed >= 1 || s31_rec_index >= s31_bindings_rb.size()) {
+                        break;
+                    }
+                    const auto& s31_rec = s31_bindings_rb[s31_rec_index];
+                    if (s31_rec.resource == nullptr || s31_rec.size < 1024) {
+                        continue;
+                    }
+                    D3D12_HEAP_PROPERTIES s31_props{};
+                    s31_rec.resource->GetHeapProperties(&s31_props, nullptr);
+                    if (s31_props.Type != D3D12_HEAP_TYPE_DEFAULT) {
+                        continue;
+                    }
+                    const u64 s31_res_bytes = s31_rec.resource->GetDesc().Width;
+                    if (s31_rec.offset >= s31_res_bytes) {
+                        continue;
+                    }
+                    const u32 s31_copy = static_cast<u32>(std::min<u64>(
+                        std::min<u64>(s31_rec.size, s31_res_bytes - s31_rec.offset), 64ull * 1024ull));
+                    if (s31_copy < 1024) {
+                        continue;
+                    }
+                    if (!g_s31_cb_readback) {
+                        D3D12_HEAP_PROPERTIES s31_heap{};
+                        s31_heap.Type = D3D12_HEAP_TYPE_READBACK;
+                        D3D12_RESOURCE_DESC s31_desc{};
+                        s31_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                        s31_desc.Width = 64 * 1024;
+                        s31_desc.Height = 1;
+                        s31_desc.DepthOrArraySize = 1;
+                        s31_desc.MipLevels = 1;
+                        s31_desc.SampleDesc.Count = 1;
+                        s31_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                        if (FAILED(m_device.GetDevice()->CreateCommittedResource(
+                                &s31_heap, D3D12_HEAP_FLAG_NONE, &s31_desc,
+                                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                IID_PPV_ARGS(&g_s31_cb_readback)))) {
+                            continue;
+                        }
+                    }
+                    const std::array s31_copies{VideoCommon::BufferCopy{
+                        .src_offset = s31_rec.offset, .dst_offset = 0, .size = s31_copy}};
+                    m_runtime.CopyBuffer(g_s31_cb_readback.Get(), s31_rec.resource, s31_copies,
+                                         false, false);
+                    g_s31_cb_pending = true;
+                    g_s31_cb_bytes = s31_copy;
+                    g_s31_cb_which = ++g_s31_cb_armed;
+                    LOG_WARNING(Render_D3D12,
+                                "S31 cbread armed #{}: rec={} copy={} off={} res_bytes={} "
+                                "verts={} rt={:#x}",
+                                g_s31_cb_which, s31_rec_index, s31_copy, s31_rec.offset,
+                                s31_res_bytes, s31_verts, s31_rt_gpu);
                 }
             }
         }

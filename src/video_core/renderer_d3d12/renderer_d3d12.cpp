@@ -2105,6 +2105,12 @@ void RendererD3D12::RenderBlit(const Tegra::FramebufferConfig& framebuffer,
         device.WaitForIdle();
         WriteTextureContentDumps();
     }
+    // S31: the character draw's DEFAULT-heap constant buffers are copied into a readback while
+    // the frame is recorded; log them now that the list that carried the copy has executed.
+    if (S31CbReadbackPending()) {
+        device.WaitForIdle();
+        WriteS31CbReadback();
+    }
 }
 
 std::vector<u8> RendererD3D12::GetAppletCaptureBuffer() {

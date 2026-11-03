@@ -29,6 +29,14 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
                               u32 guest_format, u64 guest_addr, u32 image_index,
                               bool force = false);
 
+/// TEMP DIAGNOSTIC (S31): GPU readback of the character's DEFAULT-heap constant buffers. The
+/// character draw binds two 64 KB uniform buffers on the DEFAULT heap; their contents are not
+/// visible through the guest CPU mapping (the DAddr/GPUVAddr discrepancy), so they are copied
+/// into a READBACK buffer and logged on the next frame. Pending() is checked after the frame's
+/// command list has executed; Write() maps, logs the first floats and clears the flag.
+[[nodiscard]] bool S31CbReadbackPending();
+void WriteS31CbReadback();
+
 /// TEMP DIAGNOSTIC (S18, Phase 0.2.1): guest frame counter, incremented once per guest present
 /// in RasterizerD3D12::TickFrame (RendererD3D12::Composite calls it once per guest frame, while
 /// the S17 "perf" probe counts HOST presents - the two rates differ by a large factor). Every
