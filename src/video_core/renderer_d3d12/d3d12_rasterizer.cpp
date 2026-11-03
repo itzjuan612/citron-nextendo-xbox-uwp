@@ -2466,6 +2466,105 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
             }
         }
     }
+    // S31 FIDELITY (style screen), cycle 2: cycle 1 dumped the 8994-vert scene draw and got the
+    // room's sand albedo - the character is another mesh. So: census every unique draw of the
+    // style-screen window first (vert count, constant-buffer count = a skinning signal, sampled
+    // count, RT) so the character draw can be named from the log alone, and at the same time dump
+    // the sampled textures of the skinned candidates (cbvs >= 6) so one cycle answers both.
+    // Census bounded 24 lines, dumps bounded 16 images (ids 954xxx), recorded before the draw.
+    {
+        struct S31DrawKey {
+            u32 verts;
+            u32 cbvs;
+            u64 first_gpu;
+        };
+        static std::array<S31DrawKey, 24> s31_keys{};
+        static u32 s31_key_count = 0;
+        static u32 s31_dumps = 0;
+        static std::array<u32, 16> s31_seen_ids{};
+        static u32 s31_seen_count = 0;
+        const u64 s31_rt_gpu =
+            (num_rtvs > 0 && framebuffer != nullptr && framebuffer->ColorBuffers()[0] != nullptr)
+                ? static_cast<u64>(framebuffer->ColorBuffers()[0]->GpuAddr())
+                : 0ull;
+        if (g_s18_guest_frames >= 4700 && g_s18_guest_frames <= 5200) {
+            u64 s31_first_gpu = 0;
+            u32 s31_sampled = 0;
+            for (const DrawSlot& s31_slot : res_slots) {
+                if (s31_slot.kind != SlotKind::Sampled) {
+                    continue;
+                }
+                ++s31_sampled;
+                if (s31_first_gpu == 0) {
+                    ImageView& s31_sv0 = m_texture_cache.GetImageView(s31_slot.view);
+                    if (s31_sv0.Resource() != nullptr) {
+                        s31_first_gpu = static_cast<u64>(s31_sv0.GpuAddr());
+                    }
+                }
+            }
+            const u32 s31_verts = params.num_vertices;
+            const u32 s31_cbvs = static_cast<u32>(cbv_records.size());
+            bool s31_known = false;
+            for (u32 i = 0; i < s31_key_count; ++i) {
+                s31_known |= s31_keys[i].verts == s31_verts && s31_keys[i].cbvs == s31_cbvs &&
+                             s31_keys[i].first_gpu == s31_first_gpu;
+            }
+            if (!s31_known && s31_key_count < s31_keys.size()) {
+                s31_keys[s31_key_count++] = S31DrawKey{s31_verts, s31_cbvs, s31_first_gpu};
+                LOG_WARNING(Render_D3D12,
+                            "S31 draw census #{}: verts={} cbvs={} inst={} sampled={} rt={:#x} "
+                            "first={:#x}",
+                            s31_key_count, s31_verts, s31_cbvs, params.num_instances, s31_sampled,
+                            s31_rt_gpu, s31_first_gpu);
+            }
+            if (s31_cbvs >= 6) {
+                for (const DrawSlot& s31_slot : res_slots) {
+                    if (s31_slot.kind != SlotKind::Sampled || s31_dumps >= 16) {
+                        continue;
+                    }
+                    ImageView& s31_sv = m_texture_cache.GetImageView(s31_slot.view);
+                    if (s31_sv.Resource() == nullptr) {
+                        continue;
+                    }
+                    const u32 s31_id = s31_sv.image_id.index;
+                    bool s31_seen = false;
+                    for (u32 i = 0; i < s31_seen_count; ++i) {
+                        s31_seen |= s31_seen_ids[i] == s31_id;
+                    }
+                    if (s31_seen || s31_seen_count >= s31_seen_ids.size()) {
+                        continue;
+                    }
+                    s31_seen_ids[s31_seen_count++] = s31_id;
+                    ++s31_dumps;
+                    (void)D3D12::RecordTextureContentDump(
+                        m_device.GetDevice(), m_command_list, s31_sv.Resource(),
+                        static_cast<u32>(s31_sv.format), static_cast<u64>(s31_sv.GpuAddr()),
+                        954000u + s31_dumps, /*force=*/true);
+                    LOG_WARNING(Render_D3D12,
+                                "S31 char input #{}: img={} gpu={:#x} {}x{} fmt={:#x} verts={} "
+                                "cbvs={} rt={:#x}",
+                                s31_dumps, s31_id, static_cast<u64>(s31_sv.GpuAddr()),
+                                s31_sv.size.width, s31_sv.size.height,
+                                static_cast<u32>(s31_sv.format), s31_verts, s31_cbvs,
+                                s31_rt_gpu);
+                    // S31: the bank the character samples, layers 0-7 (band 956xxx). One shot.
+                    static u32 s31_bank_dumps = 0;
+                    if (s31_sv.GpuAddr() == 0x5eb340000ull && s31_bank_dumps < 1) {
+                        ++s31_bank_dumps;
+                        (void)D3D12::RecordTextureContentDump(
+                            m_device.GetDevice(), m_command_list, s31_sv.Resource(),
+                            static_cast<u32>(s31_sv.format), static_cast<u64>(s31_sv.GpuAddr()),
+                            956000u, /*force=*/true);
+                        LOG_WARNING(Render_D3D12,
+                                    "S31 bank layers: img={} gpu={:#x} {}x{} fmt={:#x}",
+                                    s31_id, static_cast<u64>(s31_sv.GpuAddr()),
+                                    s31_sv.size.width, s31_sv.size.height,
+                                    static_cast<u32>(s31_sv.format));
+                    }
+                }
+            }
+        }
+    }
     m_command_list.SetRootSignature(pipeline->GetRootSignature().Get());
     m_command_list.SetPipelineState(pipeline->Get());
     ID3D12DescriptorHeap* heaps[] = {m_res_heap.Get(), m_sampler_heap.Get()};
@@ -5947,6 +6046,10 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                             // correct and the game's bake content is the ONLY remaining blocker.
                             // Kept behind this flag (default off) so it can be re-armed for any
                             // later A/B; on it is a flat grey environment, not the game's sky.
+                            // S31 A/B (1.0.447, ANSWERED): with the bank flat at 0.55 the
+                            // character and fish light up completely, so their shading path is
+                            // sound - they read bank layers/mips that the real bake leaves
+                            // empty. Back off; the open question is which layers hold content.
                             constexpr bool kS28ConstantFill = false;
                             {
                                 static bool s28_clear_done = false;

@@ -1517,6 +1517,19 @@ bool RecordTextureContentDump(ID3D12Device* d3d, CommandList& command_list, ID3D
             }
         }
     }
+    // S31: the 956xxx band arms layers 1-7 of the 78-layer lighting bank (0x5eb340000), which the
+    // character draw samples directly (S31 draw census: verts=309 cbvs=8 rt=0x5103e0000). The
+    // constant-fill A/B lit the character with a flat bank, so the shading path works; what is
+    // open is which layers carry the bake's content. Layer 0 is always armed by the call itself.
+    if (image_index >= 956000u && image_index < 957000u && desc.DepthOrArraySize > 8 &&
+        desc.Width <= 512 && desc.Height <= 512 &&
+        !TextureFormatIsBlockCompressed(static_cast<u32>(desc.Format))) {
+        for (u32 s31_layer = 1; s31_layer < 8; ++s31_layer) {
+            if (!arm_layer(s31_layer)) {
+                break;
+            }
+        }
+    }
     return true;
 }
 
