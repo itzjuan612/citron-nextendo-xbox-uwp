@@ -6145,11 +6145,13 @@ void RasterizerD3D12::ConfigureDraw(bool is_indexed, PipelineCache::StoredPipeli
                                 static_cast<u64>(s19_sv.GpuAddr()) == 0x5d0630800ull) {
                                 ++s30_table_dumps;
                                 // S30 DISCRIMINATOR (kS30ConstantTable): the six-face bake
-                                // multiplies by this 256x4 table and the table is zero, so every
-                                // fill writes zero. Fill it with 1.0 and watch the bank: if the
-                                // bank lights, the empty table IS the blocker; if it stays dark,
-                                // the bake has another defect and the table is a red herring.
-                                static constexpr bool kS30ConstantTable = true;
+                                // multiplies by this 256x4 table. ANSWERED in S31: the fills were
+                                // zero because the staging-size guard in RefreshContents rejected
+                                // every packed-vs-aligned image, not because the table is empty -
+                                // fixing that guard lit the bank (lmean 0.00005 -> 0.10674) with
+                                // this flag still ON. Now OFF so the bake reads the game's own
+                                // constants instead of a forced 1.0f; re-arm for an A/B only.
+                                static constexpr bool kS30ConstantTable = false;
                                 static u32 s30_table_fills = 0;
                                 if (kS30ConstantTable && s30_table_fills < 8 &&
                                     s19_sv.Resource() != nullptr) {
